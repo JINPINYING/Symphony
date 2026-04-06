@@ -1067,7 +1067,7 @@ public sealed partial class CodexAgentRunner(
         string? turnId,
         string? knownSecret)
     {
-        TryExtractUsage(message, out var usage);
+        TryExtractUsage(message, eventName, out var usage);
         TryExtractRateLimitsJson(message, out var rateLimitsJson);
 
         return new AgentRunUpdate(
@@ -1083,8 +1083,14 @@ public sealed partial class CodexAgentRunner(
             DataJson: SecretRedactor.Redact(message.GetRawText(), knownSecret));
     }
 
-    private static bool TryExtractUsage(JsonElement root, out UsageSnapshot? usage)
+    private static bool TryExtractUsage(JsonElement root, string eventName, out UsageSnapshot? usage)
     {
+        if (IsAbsoluteTokenUsageEvent(eventName) &&
+            TryParseUsageObject(GetMessagePayload(root), out usage))
+        {
+            return true;
+        }
+
         foreach (var propertyName in new[] { "total_token_usage", "totalTokenUsage", "token_usage", "tokenUsage", "usage" })
         {
             if (!TryFindPropertyRecursive(root, propertyName, out var usageElement))
@@ -1100,6 +1106,28 @@ public sealed partial class CodexAgentRunner(
 
         usage = null;
         return false;
+    }
+
+    private static JsonElement GetMessagePayload(JsonElement message)
+    {
+        return message.TryGetProperty("params", out var paramsElement)
+            ? paramsElement
+            : message;
+    }
+
+    private static bool IsAbsoluteTokenUsageEvent(string eventName)
+    {
+        if (string.IsNullOrWhiteSpace(eventName))
+        {
+            return false;
+        }
+
+        var normalizedEventName = eventName.Replace("/", string.Empty, StringComparison.Ordinal)
+            .Replace("_", string.Empty, StringComparison.Ordinal);
+
+        return normalizedEventName.Contains("thread", StringComparison.OrdinalIgnoreCase) &&
+               normalizedEventName.Contains("tokenusage", StringComparison.OrdinalIgnoreCase) &&
+               normalizedEventName.Contains("updated", StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool TryExtractRateLimitsJson(JsonElement root, out string? rateLimitsJson)

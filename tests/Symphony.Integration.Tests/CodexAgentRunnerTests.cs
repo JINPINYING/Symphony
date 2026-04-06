@@ -112,6 +112,26 @@ public sealed class CodexAgentRunnerTests
     }
 
     [Fact]
+    public void CreateProtocolUpdate_ShouldReadAbsoluteTotalsFromThreadTokenUsageUpdatedPayloads()
+    {
+        var update = CreateProtocolUpdate("""
+            {
+              "method": "thread/tokenUsage/updated",
+              "params": {
+                "input_tokens": 11,
+                "output_tokens": 7,
+                "total_tokens": 18
+              }
+            }
+            """);
+
+        Assert.Equal("thread/tokenUsage/updated", update.EventType);
+        Assert.Equal(11, update.InputTokens);
+        Assert.Equal(7, update.OutputTokens);
+        Assert.Equal(18, update.TotalTokens);
+    }
+
+    [Fact]
     public void CreateProtocolUpdate_ShouldClampDerivedTotalTokensToIntMaxValue()
     {
         var update = CreateProtocolUpdate($$"""
@@ -302,6 +322,40 @@ public sealed class CodexAgentRunnerTests
     }
 
     [Fact]
+    public async Task RunIssueAsync_ShouldCaptureThreadTokenUsageUpdatedPayloads()
+    {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            return;
+        }
+
+        var updates = new List<AgentRunUpdate>();
+        var runner = CreateRunner();
+        using var harness = CreateAppServerHarness(ThreadTokenUsageUpdatedScript());
+
+        var result = await runner.RunIssueAsync(
+            CreateRequest("id-9", "#9", harness.WorkspacePath, harness.Command, 30_000),
+            (update, _) =>
+            {
+                updates.Add(update);
+                return Task.CompletedTask;
+            });
+
+        Assert.True(result.Success, result.Stderr);
+
+        var tokenUpdate = Assert.Single(updates, update =>
+            update.InputTokens == 11 &&
+            update.OutputTokens == 7 &&
+            update.TotalTokens == 18);
+
+        Assert.Equal("other_message", tokenUpdate.EventType);
+        Assert.Equal(11, tokenUpdate.InputTokens);
+        Assert.Equal(7, tokenUpdate.OutputTokens);
+        Assert.Equal(18, tokenUpdate.TotalTokens);
+        Assert.Contains(updates, update => update.EventType == "turn_completed");
+    }
+
+    [Fact]
     public void CodexProtocolValueNormalizer_ShouldNormalizeSandboxValuesForCurrentAppServerProtocol()
     {
         Assert.Equal("danger-full-access", CodexProtocolValueNormalizer.NormalizeThreadSandbox("dangerFullAccess"));
@@ -461,6 +515,22 @@ public sealed class CodexAgentRunnerTests
         }
         """;
 
+    private static string ThreadTokenUsageUpdatedScript() => """
+        while (($line = [Console]::In.ReadLine()) -ne $null) {
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            $request = $line | ConvertFrom-Json
+            if ($request.method -eq 'initialize') { @{ id = $request.id; result = @{ serverInfo = @{ name = 'fake'; version = '1.0' } } } | ConvertTo-Json -Compress; continue }
+            if ($request.method -eq 'thread/start') { @{ id = $request.id; result = @{ thread = @{ id = 'thread-1' } } } | ConvertTo-Json -Compress; continue }
+            if ($request.method -eq 'turn/start') {
+                @{ id = $request.id; result = @{ turn = @{ id = 'turn-1' } } } | ConvertTo-Json -Compress
+                @{ method = 'thread/tokenUsage/updated'; params = @{ input_tokens = 11; output_tokens = 7; total_tokens = 18 } } | ConvertTo-Json -Compress
+                @{ method = 'turn/completed'; params = @{ message = 'done' } } | ConvertTo-Json -Compress
+                continue
+            }
+            if ($request.method -eq 'shutdown') { @{ id = $request.id; result = @{ ok = $true } } | ConvertTo-Json -Compress; break }
+        }
+        """;
+
     private static string ToolFailureScript() => """
         while (($line = [Console]::In.ReadLine()) -ne $null) {
             if ([string]::IsNullOrWhiteSpace($line)) { continue }
@@ -536,8 +606,15 @@ public sealed class CodexAgentRunnerTests
         var method = typeof(CodexAgentRunner).GetMethod(
             "CreateProtocolUpdate",
             BindingFlags.NonPublic | BindingFlags.Static);
+        var eventName = document.RootElement.TryGetProperty("method", out var methodProperty) && methodProperty.ValueKind == JsonValueKind.String
+            ? methodProperty.GetString()
+            : document.RootElement.TryGetProperty("event", out var eventProperty) && eventProperty.ValueKind == JsonValueKind.String
+                ? eventProperty.GetString()
+                : document.RootElement.TryGetProperty("type", out var typeProperty) && typeProperty.ValueKind == JsonValueKind.String
+                    ? typeProperty.GetString()
+                    : "notification";
 
         Assert.NotNull(method);
-        return Assert.IsType<AgentRunUpdate>(method!.Invoke(null, [document.RootElement, "notification", null, null, null]));
+        return Assert.IsType<AgentRunUpdate>(method!.Invoke(null, [document.RootElement, eventName, null, null, null]));
     }
 }
