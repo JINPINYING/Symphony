@@ -85,6 +85,33 @@
   .glass-badge {
     @apply inline-flex items-center rounded-full border border-white/10 bg-white/5 px-2.5 py-1 text-xs font-medium uppercase tracking-[0.2em] text-slate-200;
   }
+
+  .dashboard-rail {
+    @apply xl:sticky xl:top-6 xl:max-h-[calc(100vh-3rem)] xl:overflow-y-auto xl:pr-2;
+    scrollbar-gutter: stable;
+    overscroll-behavior: contain;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(103, 232, 249, 0.28) rgba(15, 23, 42, 0.35);
+  }
+
+  .dashboard-rail::-webkit-scrollbar {
+    width: 0.7rem;
+  }
+
+  .dashboard-rail::-webkit-scrollbar-track {
+    background: rgba(15, 23, 42, 0.35);
+    border-radius: 9999px;
+  }
+
+  .dashboard-rail::-webkit-scrollbar-thumb {
+    background: linear-gradient(180deg, rgba(103, 232, 249, 0.45), rgba(45, 212, 191, 0.32));
+    border-radius: 9999px;
+    border: 2px solid rgba(15, 23, 42, 0.25);
+  }
+
+  .dashboard-rail::-webkit-scrollbar-thumb:hover {
+    background: linear-gradient(180deg, rgba(103, 232, 249, 0.58), rgba(45, 212, 191, 0.42));
+  }
 }
 
 @layer utilities {

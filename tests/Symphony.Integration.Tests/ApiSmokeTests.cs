@@ -267,7 +267,70 @@ public sealed class ApiSmokeTests
             Assert.True(exitCode == 0, stderr.ToString());
             Assert.Equal(HttpStatusCode.OK, statusCode);
             Assert.NotNull(content);
-            Assert.Contains("Symphony Control Room", content, StringComparison.OrdinalIgnoreCase);
+            var htmlContent = content!;
+            Assert.Contains("Symphony Control Room", htmlContent, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("dashboard-rail", htmlContent, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("xl:items-start", htmlContent, StringComparison.OrdinalIgnoreCase);
+
+            var issueDetailElementMatch = System.Text.RegularExpressions.Regex.Match(
+                htmlContent,
+                @"<section[^>]*id=""issue-detail""[^>]*>",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+            Assert.True(issueDetailElementMatch.Success, "Expected to find the issue-detail element.");
+
+            var issueDetailClassMatch = System.Text.RegularExpressions.Regex.Match(
+                issueDetailElementMatch.Value,
+                @"\bclass=""([^""]*)""",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+            Assert.True(issueDetailClassMatch.Success, "Expected the issue-detail element to have a class attribute.");
+
+            var issueDetailClasses = issueDetailClassMatch.Groups[1].Value.Split(
+                ' ',
+                StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+            Assert.Contains(issueDetailClasses, className => string.Equals(className, "panel", StringComparison.OrdinalIgnoreCase));
+            Assert.DoesNotContain(issueDetailClasses, className => string.Equals(className, "xl:sticky", StringComparison.OrdinalIgnoreCase));
+            Assert.DoesNotContain(issueDetailClasses, className => string.Equals(className, "xl:top-6", StringComparison.OrdinalIgnoreCase));
+        }
+        finally
+        {
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            TryDeleteFile(dbPath);
+            TryDeleteFile(workflowPath);
+        }
+    }
+
+    [Fact]
+    public async Task DashboardCssAsset_ShouldIncludeSidebarScrollStyles()
+    {
+        var workflowPath = CreateValidWorkflowPath();
+        var dbPath = Path.Combine(Path.GetTempPath(), $"symphony-int-{Guid.NewGuid():N}.db");
+        var stderr = new StringWriter();
+        string? content = null;
+
+        try
+        {
+            var exitCode = await SymphonyHostApplication.RunCliAsync(
+                [workflowPath],
+                stderr,
+                configureBuilder: builder => ConfigureTestServer(builder, dbPath),
+                configureServices: services => RegisterFakeTracker(services),
+                runApplicationAsync: async (app, cancellationToken) =>
+                {
+                    await app.StartAsync(cancellationToken);
+                    using var client = app.GetTestClient();
+                    content = await client.GetStringAsync("/assets/dashboard.css", cancellationToken);
+                    await app.StopAsync(cancellationToken);
+                });
+
+            Assert.True(exitCode == 0, stderr.ToString());
+            Assert.NotNull(content);
+            var cssContent = content!;
+            Assert.Contains(".dashboard-rail", cssContent, StringComparison.OrdinalIgnoreCase);
+            Assert.Matches(@"(?i)overflow-y\s*:\s*auto", cssContent);
+            Assert.Matches(@"(?i)max-height\s*:\s*calc\(100vh\s*-\s*3rem\)", cssContent);
         }
         finally
         {
