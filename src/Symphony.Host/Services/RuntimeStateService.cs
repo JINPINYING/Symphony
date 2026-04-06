@@ -2,6 +2,7 @@ using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Symphony.Core.Models;
 using Symphony.Infrastructure.Persistence.Sqlite;
+using Symphony.Infrastructure.Persistence.Sqlite.Entities;
 
 namespace Symphony.Host.Services;
 
@@ -38,13 +39,10 @@ public sealed class RuntimeStateService(
             .ToListAsync(cancellationToken))
             .OrderByDescending(entry => entry.UpdatedAtUtc ?? entry.CachedAtUtc)
             .ToList();
-        var recentActivity = (await dbContext.EventLog
-            .AsNoTracking()
-            .ToListAsync(cancellationToken))
-            .OrderByDescending(entry => entry.OccurredAtUtc)
-            .Where(entry => DashboardEventPresentation.ShouldInclude(entry.EventName, entry.Message))
-            .Take(24)
-            .ToList();
+        var recentActivity = await GetRecentVisibleEventLogEntriesAsync(
+            dbContext.EventLog.AsNoTracking(),
+            limit: 24,
+            cancellationToken);
         var leases = (await dbContext.InstanceLeases
             .AsNoTracking()
             .ToListAsync(cancellationToken))
@@ -205,14 +203,12 @@ public sealed class RuntimeStateService(
         var issueCache = await dbContext.IssueCache
             .AsNoTracking()
             .SingleOrDefaultAsync(entry => entry.Identifier == issueIdentifier, cancellationToken);
-        var recentEvents = (await dbContext.EventLog
-            .AsNoTracking()
-            .Where(entry => entry.IssueIdentifier == issueIdentifier)
-            .ToListAsync(cancellationToken))
-            .OrderByDescending(entry => entry.OccurredAtUtc)
-            .Where(entry => DashboardEventPresentation.ShouldInclude(entry.EventName, entry.Message))
-            .Take(20)
-            .ToList();
+        var recentEvents = await GetRecentVisibleEventLogEntriesAsync(
+            dbContext.EventLog
+                .AsNoTracking()
+                .Where(entry => entry.IssueIdentifier == issueIdentifier),
+            limit: 20,
+            cancellationToken);
 
         if (latestRun is null && workspaceRecord is null && retryEntry is null && issueCache is null && recentEvents.Count == 0)
         {
@@ -312,5 +308,57 @@ public sealed class RuntimeStateService(
 
         using var document = JsonDocument.Parse(json);
         return document.RootElement.Clone();
+    }
+
+    private static async Task<List<EventLogEntity>> GetRecentVisibleEventLogEntriesAsync(
+        IQueryable<EventLogEntity> query,
+        int limit,
+        CancellationToken cancellationToken)
+    {
+        const int minimumBatchSize = 32;
+        var batchSize = Math.Max(limit * 2, minimumBatchSize);
+        var offset = 0;
+        var visibleEntries = new List<EventLogEntity>(limit);
+
+        while (visibleEntries.Count < limit)
+        {
+            var batch = await query
+                // SQLite cannot order DateTimeOffset columns directly, so page by the
+                // append-only identity and restore timestamp ordering inside the bounded batch.
+                .OrderByDescending(entry => entry.Id)
+                .Skip(offset)
+                .Take(batchSize)
+                .ToListAsync(cancellationToken);
+
+            if (batch.Count == 0)
+            {
+                break;
+            }
+
+            foreach (var entry in batch
+                .OrderByDescending(entry => entry.OccurredAtUtc)
+                .ThenByDescending(entry => entry.Id))
+            {
+                if (!DashboardEventPresentation.ShouldInclude(entry.EventName, entry.Message))
+                {
+                    continue;
+                }
+
+                visibleEntries.Add(entry);
+                if (visibleEntries.Count == limit)
+                {
+                    break;
+                }
+            }
+
+            if (batch.Count < batchSize)
+            {
+                break;
+            }
+
+            offset += batch.Count;
+        }
+
+        return visibleEntries;
     }
 }

@@ -141,7 +141,11 @@ public sealed class ApiSmokeTests
 
         try
         {
-            await SeedIssueStateAsync(dbPath, "MT-650", includeFallbackOtherMessageEvent: true);
+            await SeedIssueStateAsync(
+                dbPath,
+                "MT-650",
+                includeFallbackOtherMessageEvent: true,
+                includeMeaningfulOtherMessageEvent: true);
 
             var exitCode = await SymphonyHostApplication.RunCliAsync(
                 [workflowPath],
@@ -159,7 +163,8 @@ public sealed class ApiSmokeTests
             Assert.True(exitCode == 0, stderr.ToString());
             Assert.NotNull(content);
 
-            using var document = JsonDocument.Parse(content);
+            var responseContent = content!;
+            using var document = JsonDocument.Parse(responseContent);
             var activity = document.RootElement
                 .GetProperty("activity")
                 .EnumerateArray()
@@ -172,7 +177,15 @@ public sealed class ApiSmokeTests
                 })
                 .ToList();
 
-            Assert.DoesNotContain(activity, entry => string.Equals(entry.Event, "other_message", StringComparison.OrdinalIgnoreCase));
+            Assert.DoesNotContain(activity, entry =>
+                string.Equals(entry.Event, "other_message", StringComparison.OrdinalIgnoreCase) &&
+                string.IsNullOrWhiteSpace(entry.Message));
+            Assert.DoesNotContain(activity, entry =>
+                string.Equals(entry.Event, "other_message", StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(entry.Message, "other_message", StringComparison.OrdinalIgnoreCase));
+            Assert.Contains(activity, entry =>
+                string.Equals(entry.Event, "other_message", StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(entry.Message, "Planner emitted a plain-text note.", StringComparison.Ordinal));
             Assert.Contains(activity, entry =>
                 string.Equals(entry.Event, "notification", StringComparison.OrdinalIgnoreCase) &&
                 string.Equals(entry.Message, "Working on tests", StringComparison.Ordinal));
@@ -313,7 +326,11 @@ public sealed class ApiSmokeTests
 
         try
         {
-            await SeedIssueStateAsync(dbPath, "MT-650", includeFallbackOtherMessageEvent: true);
+            await SeedIssueStateAsync(
+                dbPath,
+                "MT-650",
+                includeFallbackOtherMessageEvent: true,
+                includeMeaningfulOtherMessageEvent: true);
 
             var exitCode = await SymphonyHostApplication.RunCliAsync(
                 [workflowPath],
@@ -331,7 +348,8 @@ public sealed class ApiSmokeTests
             Assert.True(exitCode == 0, stderr.ToString());
             Assert.NotNull(content);
 
-            using var document = JsonDocument.Parse(content);
+            var responseContent = content!;
+            using var document = JsonDocument.Parse(responseContent);
             var recentEvents = document.RootElement
                 .GetProperty("recent_events")
                 .EnumerateArray()
@@ -344,7 +362,15 @@ public sealed class ApiSmokeTests
                 })
                 .ToList();
 
-            Assert.DoesNotContain(recentEvents, entry => string.Equals(entry.Event, "other_message", StringComparison.OrdinalIgnoreCase));
+            Assert.DoesNotContain(recentEvents, entry =>
+                string.Equals(entry.Event, "other_message", StringComparison.OrdinalIgnoreCase) &&
+                string.IsNullOrWhiteSpace(entry.Message));
+            Assert.DoesNotContain(recentEvents, entry =>
+                string.Equals(entry.Event, "other_message", StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(entry.Message, "other_message", StringComparison.OrdinalIgnoreCase));
+            Assert.Contains(recentEvents, entry =>
+                string.Equals(entry.Event, "other_message", StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(entry.Message, "Planner emitted a plain-text note.", StringComparison.Ordinal));
             Assert.Contains(recentEvents, entry =>
                 string.Equals(entry.Event, "notification", StringComparison.OrdinalIgnoreCase) &&
                 string.Equals(entry.Message, "Working on tests", StringComparison.Ordinal));
@@ -485,7 +511,8 @@ public sealed class ApiSmokeTests
     private static async Task SeedIssueStateAsync(
         string dbPath,
         string issueIdentifier,
-        bool includeFallbackOtherMessageEvent = false)
+        bool includeFallbackOtherMessageEvent = false,
+        bool includeMeaningfulOtherMessageEvent = false)
     {
         var options = new DbContextOptionsBuilder<SymphonyDbContext>()
             .UseSqlite($"Data Source={dbPath};Cache=Shared;Mode=ReadWriteCreate")
@@ -555,6 +582,22 @@ public sealed class ApiSmokeTests
                 Level = "Information",
                 Message = "other_message",
                 OccurredAtUtc = now.AddSeconds(1)
+            });
+        }
+
+        if (includeMeaningfulOtherMessageEvent)
+        {
+            dbContext.EventLog.Add(new EventLogEntity
+            {
+                IssueId = "issue-1",
+                IssueIdentifier = issueIdentifier,
+                RunId = "run-1",
+                RunAttemptId = "attempt-1",
+                SessionId = "thread-1-turn-1",
+                EventName = "other_message",
+                Level = "Information",
+                Message = "Planner emitted a plain-text note.",
+                OccurredAtUtc = now.AddSeconds(2)
             });
         }
 
