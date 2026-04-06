@@ -102,6 +102,7 @@ Symphony exposes these HTTP endpoints:
 
 The state and issue endpoints are derived from persisted orchestrator state in SQLite rather than ad hoc in-memory caches.
 For human-readable dashboard surfaces, fallback-only `other_message` protocol entries are suppressed when Codex did not emit a useful message; the durable SQLite event log remains available for deeper debugging.
+On large desktop layouts, the right-hand issue detail rail stays pinned and scrolls independently so long issue detail content does not hide instance health or rate-limit cards.
 
 ## Codex Session Behavior
 
