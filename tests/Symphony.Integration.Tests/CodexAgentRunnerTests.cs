@@ -322,7 +322,7 @@ public sealed class CodexAgentRunnerTests
     }
 
     [Fact]
-    public async Task RunIssueAsync_ShouldCaptureThreadTokenUsageUpdatedPayloads()
+    public async Task RunIssueAsync_ShouldExtractTokenCountsFromThreadTokenUsageUpdatedPayloads()
     {
         if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
@@ -612,7 +612,7 @@ public sealed class CodexAgentRunnerTests
                 ? eventProperty.GetString()
                 : document.RootElement.TryGetProperty("type", out var typeProperty) && typeProperty.ValueKind == JsonValueKind.String
                     ? typeProperty.GetString()
-                    : "notification";
+                    : "other_message";
 
         Assert.NotNull(method);
         return Assert.IsType<AgentRunUpdate>(method!.Invoke(null, [document.RootElement, eventName, null, null, null]));
