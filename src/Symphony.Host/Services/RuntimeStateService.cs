@@ -42,6 +42,7 @@ public sealed class RuntimeStateService(
             .AsNoTracking()
             .ToListAsync(cancellationToken))
             .OrderByDescending(entry => entry.OccurredAtUtc)
+            .Where(entry => DashboardEventPresentation.ShouldInclude(entry.EventName, entry.Message))
             .Take(24)
             .ToList();
         var leases = (await dbContext.InstanceLeases
@@ -85,7 +86,7 @@ public sealed class RuntimeStateService(
                     session_id = run.SessionId,
                     turn_count = run.TurnCount,
                     last_event = run.LastEvent,
-                    last_message = run.LastMessage,
+                    last_message = DashboardEventPresentation.GetVisibleMessage(run.LastEvent, run.LastMessage),
                     started_at = run.StartedAtUtc,
                     last_event_at = run.LastEventAtUtc,
                     tokens = new
@@ -151,7 +152,7 @@ public sealed class RuntimeStateService(
                 session_id = entry.SessionId,
                 level = entry.Level,
                 @event = entry.EventName,
-                message = entry.Message
+                message = DashboardEventPresentation.GetVisibleMessage(entry.EventName, entry.Message)
             }),
             coordination = new
             {
@@ -209,6 +210,7 @@ public sealed class RuntimeStateService(
             .Where(entry => entry.IssueIdentifier == issueIdentifier)
             .ToListAsync(cancellationToken))
             .OrderByDescending(entry => entry.OccurredAtUtc)
+            .Where(entry => DashboardEventPresentation.ShouldInclude(entry.EventName, entry.Message))
             .Take(20)
             .ToList();
 
@@ -254,7 +256,7 @@ public sealed class RuntimeStateService(
                     state = latestRun.State,
                     started_at = latestRun.StartedAtUtc,
                     last_event = latestRun.LastEvent,
-                    last_message = latestRun.LastMessage,
+                    last_message = DashboardEventPresentation.GetVisibleMessage(latestRun.LastEvent, latestRun.LastMessage),
                     last_event_at = latestRun.LastEventAtUtc,
                     tokens = new
                     {
@@ -281,7 +283,7 @@ public sealed class RuntimeStateService(
                 {
                     at = entry.OccurredAtUtc,
                     @event = entry.EventName,
-                    message = entry.Message
+                    message = DashboardEventPresentation.GetVisibleMessage(entry.EventName, entry.Message)
                 }),
             last_error = lastError,
             tracked = new

@@ -101,6 +101,7 @@ Symphony exposes these HTTP endpoints:
 - `POST /api/v1/refresh`: queue an immediate best-effort poll/reconcile cycle
 
 The state and issue endpoints are derived from persisted orchestrator state in SQLite rather than ad hoc in-memory caches.
+For human-readable dashboard surfaces, fallback-only `other_message` protocol entries are suppressed when Codex did not emit a useful message; the durable SQLite event log remains available for deeper debugging.
 
 ## Codex Session Behavior
 
