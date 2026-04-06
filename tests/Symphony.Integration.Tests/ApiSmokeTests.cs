@@ -1,4 +1,5 @@
 using System.Net;
+using System.Text.Json;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.EntityFrameworkCore;
@@ -131,6 +132,73 @@ public sealed class ApiSmokeTests
     }
 
     [Fact]
+    public async Task StateEndpoint_ShouldSuppressFallbackOnlyOtherMessageActivityEntries()
+    {
+        var workflowPath = CreateValidWorkflowPath();
+        var dbPath = Path.Combine(Path.GetTempPath(), $"symphony-int-{Guid.NewGuid():N}.db");
+        var stderr = new StringWriter();
+        string? content = null;
+
+        try
+        {
+            await SeedIssueStateAsync(
+                dbPath,
+                "MT-650",
+                includeFallbackOtherMessageEvent: true,
+                includeMeaningfulOtherMessageEvent: true);
+
+            var exitCode = await SymphonyHostApplication.RunCliAsync(
+                [workflowPath],
+                stderr,
+                configureBuilder: builder => ConfigureTestServer(builder, dbPath),
+                configureServices: services => RegisterFakeTracker(services),
+                runApplicationAsync: async (app, cancellationToken) =>
+                {
+                    await app.StartAsync(cancellationToken);
+                    using var client = app.GetTestClient();
+                    content = await client.GetStringAsync("/api/v1/state", cancellationToken);
+                    await app.StopAsync(cancellationToken);
+                });
+
+            Assert.True(exitCode == 0, stderr.ToString());
+            Assert.NotNull(content);
+
+            var responseContent = content!;
+            using var document = JsonDocument.Parse(responseContent);
+            var activity = document.RootElement
+                .GetProperty("activity")
+                .EnumerateArray()
+                .Select(entry => new
+                {
+                    Event = entry.GetProperty("event").GetString(),
+                    Message = entry.TryGetProperty("message", out var messageProperty) && messageProperty.ValueKind != JsonValueKind.Null
+                        ? messageProperty.GetString()
+                        : null
+                })
+                .ToList();
+
+            Assert.DoesNotContain(activity, entry =>
+                string.Equals(entry.Event, "other_message", StringComparison.OrdinalIgnoreCase) &&
+                string.IsNullOrWhiteSpace(entry.Message));
+            Assert.DoesNotContain(activity, entry =>
+                string.Equals(entry.Event, "other_message", StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(entry.Message, "other_message", StringComparison.OrdinalIgnoreCase));
+            Assert.Contains(activity, entry =>
+                string.Equals(entry.Event, "other_message", StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(entry.Message, "Planner emitted a plain-text note.", StringComparison.Ordinal));
+            Assert.Contains(activity, entry =>
+                string.Equals(entry.Event, "notification", StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(entry.Message, "Working on tests", StringComparison.Ordinal));
+        }
+        finally
+        {
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            TryDeleteFile(dbPath);
+            TryDeleteFile(workflowPath);
+        }
+    }
+
+    [Fact]
     public async Task RefreshEndpoint_ShouldQueueBestEffortPoll()
     {
         var workflowPath = CreateValidWorkflowPath();
@@ -239,6 +307,73 @@ public sealed class ApiSmokeTests
             Assert.Contains("\"issue_identifier\":\"MT-649\"", content, StringComparison.OrdinalIgnoreCase);
             Assert.Contains("\"workspace\"", content, StringComparison.OrdinalIgnoreCase);
             Assert.Contains("\"recent_events\"", content, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            TryDeleteFile(dbPath);
+            TryDeleteFile(workflowPath);
+        }
+    }
+
+    [Fact]
+    public async Task IssueEndpoint_ShouldSuppressFallbackOnlyOtherMessageRecentEvents()
+    {
+        var workflowPath = CreateValidWorkflowPath();
+        var dbPath = Path.Combine(Path.GetTempPath(), $"symphony-int-{Guid.NewGuid():N}.db");
+        var stderr = new StringWriter();
+        string? content = null;
+
+        try
+        {
+            await SeedIssueStateAsync(
+                dbPath,
+                "MT-650",
+                includeFallbackOtherMessageEvent: true,
+                includeMeaningfulOtherMessageEvent: true);
+
+            var exitCode = await SymphonyHostApplication.RunCliAsync(
+                [workflowPath],
+                stderr,
+                configureBuilder: builder => ConfigureTestServer(builder, dbPath),
+                configureServices: services => RegisterFakeTracker(services),
+                runApplicationAsync: async (app, cancellationToken) =>
+                {
+                    await app.StartAsync(cancellationToken);
+                    using var client = app.GetTestClient();
+                    content = await client.GetStringAsync("/api/v1/MT-650", cancellationToken);
+                    await app.StopAsync(cancellationToken);
+                });
+
+            Assert.True(exitCode == 0, stderr.ToString());
+            Assert.NotNull(content);
+
+            var responseContent = content!;
+            using var document = JsonDocument.Parse(responseContent);
+            var recentEvents = document.RootElement
+                .GetProperty("recent_events")
+                .EnumerateArray()
+                .Select(entry => new
+                {
+                    Event = entry.GetProperty("event").GetString(),
+                    Message = entry.TryGetProperty("message", out var messageProperty) && messageProperty.ValueKind != JsonValueKind.Null
+                        ? messageProperty.GetString()
+                        : null
+                })
+                .ToList();
+
+            Assert.DoesNotContain(recentEvents, entry =>
+                string.Equals(entry.Event, "other_message", StringComparison.OrdinalIgnoreCase) &&
+                string.IsNullOrWhiteSpace(entry.Message));
+            Assert.DoesNotContain(recentEvents, entry =>
+                string.Equals(entry.Event, "other_message", StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(entry.Message, "other_message", StringComparison.OrdinalIgnoreCase));
+            Assert.Contains(recentEvents, entry =>
+                string.Equals(entry.Event, "other_message", StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(entry.Message, "Planner emitted a plain-text note.", StringComparison.Ordinal));
+            Assert.Contains(recentEvents, entry =>
+                string.Equals(entry.Event, "notification", StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(entry.Message, "Working on tests", StringComparison.Ordinal));
         }
         finally
         {
@@ -373,7 +508,11 @@ public sealed class ApiSmokeTests
         services.AddSingleton<IGitHubTrackerClient>(trackerClient);
     }
 
-    private static async Task SeedIssueStateAsync(string dbPath, string issueIdentifier)
+    private static async Task SeedIssueStateAsync(
+        string dbPath,
+        string issueIdentifier,
+        bool includeFallbackOtherMessageEvent = false,
+        bool includeMeaningfulOtherMessageEvent = false)
     {
         var options = new DbContextOptionsBuilder<SymphonyDbContext>()
             .UseSqlite($"Data Source={dbPath};Cache=Shared;Mode=ReadWriteCreate")
@@ -381,6 +520,7 @@ public sealed class ApiSmokeTests
 
         await using var dbContext = new SymphonyDbContext(options);
         await dbContext.Database.MigrateAsync();
+        var now = DateTimeOffset.UtcNow;
 
         dbContext.Runs.Add(new RunEntity
         {
@@ -393,8 +533,8 @@ public sealed class ApiSmokeTests
             SessionId = "thread-1-turn-1",
             LastEvent = "notification",
             LastMessage = "Working on tests",
-            StartedAtUtc = DateTimeOffset.UtcNow.AddMinutes(-1),
-            LastEventAtUtc = DateTimeOffset.UtcNow,
+            StartedAtUtc = now.AddMinutes(-1),
+            LastEventAtUtc = now,
             TurnCount = 2,
             InputTokens = 10,
             OutputTokens = 5,
@@ -406,7 +546,7 @@ public sealed class ApiSmokeTests
             RunId = "run-1",
             IssueId = "issue-1",
             Status = RunStatusNames.Running,
-            StartedAtUtc = DateTimeOffset.UtcNow.AddMinutes(-1)
+            StartedAtUtc = now.AddMinutes(-1)
         });
         dbContext.WorkspaceRecords.Add(new WorkspaceRecordEntity
         {
@@ -414,7 +554,7 @@ public sealed class ApiSmokeTests
             IssueIdentifier = issueIdentifier,
             WorkspacePath = @"C:\tmp\MT-649",
             BranchName = "feature/mt-649",
-            LastPreparedAtUtc = DateTimeOffset.UtcNow.AddMinutes(-2)
+            LastPreparedAtUtc = now.AddMinutes(-2)
         });
         dbContext.EventLog.Add(new EventLogEntity
         {
@@ -426,8 +566,41 @@ public sealed class ApiSmokeTests
             EventName = "notification",
             Level = "Information",
             Message = "Working on tests",
-            OccurredAtUtc = DateTimeOffset.UtcNow
+            OccurredAtUtc = now
         });
+
+        if (includeFallbackOtherMessageEvent)
+        {
+            dbContext.EventLog.Add(new EventLogEntity
+            {
+                IssueId = "issue-1",
+                IssueIdentifier = issueIdentifier,
+                RunId = "run-1",
+                RunAttemptId = "attempt-1",
+                SessionId = "thread-1-turn-1",
+                EventName = "other_message",
+                Level = "Information",
+                Message = "other_message",
+                OccurredAtUtc = now.AddSeconds(1)
+            });
+        }
+
+        if (includeMeaningfulOtherMessageEvent)
+        {
+            dbContext.EventLog.Add(new EventLogEntity
+            {
+                IssueId = "issue-1",
+                IssueIdentifier = issueIdentifier,
+                RunId = "run-1",
+                RunAttemptId = "attempt-1",
+                SessionId = "thread-1-turn-1",
+                EventName = "other_message",
+                Level = "Information",
+                Message = "Planner emitted a plain-text note.",
+                OccurredAtUtc = now.AddSeconds(2)
+            });
+        }
+
         dbContext.IssueCache.Add(new IssueCacheEntity
         {
             IssueId = "issue-1",
@@ -439,16 +612,16 @@ public sealed class ApiSmokeTests
             LabelsJson = "[\"dashboard\",\"ui\"]",
             PullRequestsJson = "[]",
             BlockedByJson = "[]",
-            CachedAtUtc = DateTimeOffset.UtcNow,
-            UpdatedAtUtc = DateTimeOffset.UtcNow
+            CachedAtUtc = now,
+            UpdatedAtUtc = now
         });
         dbContext.InstanceLeases.Add(new InstanceLeaseEntity
         {
             LeaseName = "poll-dispatch",
             OwnerInstanceId = "instance-1",
-            AcquiredAtUtc = DateTimeOffset.UtcNow.AddMinutes(-1),
-            UpdatedAtUtc = DateTimeOffset.UtcNow,
-            ExpiresAtUtc = DateTimeOffset.UtcNow.AddMinutes(10)
+            AcquiredAtUtc = now.AddMinutes(-1),
+            UpdatedAtUtc = now,
+            ExpiresAtUtc = now.AddMinutes(10)
         });
 
         await dbContext.SaveChangesAsync();
