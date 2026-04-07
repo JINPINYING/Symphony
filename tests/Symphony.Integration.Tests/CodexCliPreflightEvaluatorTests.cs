@@ -11,14 +11,13 @@ public sealed class CodexCliPreflightEvaluatorTests
 
         try
         {
-            await File.WriteAllTextAsync(Path.Combine(codexHome, "auth.json"), "{}");
+            await File.WriteAllTextAsync(Path.Combine(codexHome, "auth.json"), CreateLoginAuthJson());
 
             var result = await CodexCliPreflightEvaluator.CheckAsync(
                 CreateRunner(new Dictionary<string, CodexCliCommandResult>(StringComparer.Ordinal)
                 {
                     ["codex --version"] = new(0, "codex-cli 0.114.0", string.Empty),
-                    ["npm view @openai/codex version"] = new(0, "0.114.0", string.Empty),
-                    ["codex login status"] = new(0, "Logged in using ChatGPT", string.Empty)
+                    ["npm view @openai/codex version"] = new(0, "0.114.0", string.Empty)
                 }),
                 codexHome,
                 TimeSpan.FromSeconds(1),
@@ -29,7 +28,37 @@ public sealed class CodexCliPreflightEvaluatorTests
             Assert.Equal("0.114.0", result.LatestVersion);
             Assert.True(result.LatestVersionVerified);
             Assert.True(result.HasAuthJson);
-            Assert.True(result.LoginConfigured);
+            Assert.True(result.AuthenticationConfigured);
+            Assert.Equal("chatgpt", result.AuthenticationMode);
+        }
+        finally
+        {
+            TryDeleteDirectory(codexHome);
+        }
+    }
+
+    [Fact]
+    public async Task CheckAsync_ShouldAcceptApiKeyAuthFile()
+    {
+        var codexHome = CreateTempDirectory("codex-home");
+
+        try
+        {
+            await File.WriteAllTextAsync(Path.Combine(codexHome, "auth.json"), CreateApiKeyAuthJson());
+
+            var result = await CodexCliPreflightEvaluator.CheckAsync(
+                CreateRunner(new Dictionary<string, CodexCliCommandResult>(StringComparer.Ordinal)
+                {
+                    ["codex --version"] = new(0, "codex-cli 0.114.0", string.Empty),
+                    ["npm view @openai/codex version"] = new(0, "0.114.0", string.Empty)
+                }),
+                codexHome,
+                TimeSpan.FromSeconds(1),
+                CancellationToken.None);
+
+            Assert.True(result.IsReadyToStart);
+            Assert.True(result.AuthenticationConfigured);
+            Assert.Equal("api_key", result.AuthenticationMode);
         }
         finally
         {
@@ -44,14 +73,13 @@ public sealed class CodexCliPreflightEvaluatorTests
 
         try
         {
-            await File.WriteAllTextAsync(Path.Combine(codexHome, "auth.json"), "{}");
+            await File.WriteAllTextAsync(Path.Combine(codexHome, "auth.json"), CreateLoginAuthJson());
 
             var result = await CodexCliPreflightEvaluator.CheckAsync(
                 CreateRunner(new Dictionary<string, CodexCliCommandResult>(StringComparer.Ordinal)
                 {
                     ["codex --version"] = new(0, "codex-cli 0.113.0", string.Empty),
-                    ["npm view @openai/codex version"] = new(0, "0.114.0", string.Empty),
-                    ["codex login status"] = new(0, "Logged in using ChatGPT", string.Empty)
+                    ["npm view @openai/codex version"] = new(0, "0.114.0", string.Empty)
                 }),
                 codexHome,
                 TimeSpan.FromSeconds(1),
@@ -79,8 +107,7 @@ public sealed class CodexCliPreflightEvaluatorTests
                 CreateRunner(new Dictionary<string, CodexCliCommandResult>(StringComparer.Ordinal)
                 {
                     ["codex --version"] = new(0, "codex-cli 0.114.0", string.Empty),
-                    ["npm view @openai/codex version"] = new(0, "0.114.0", string.Empty),
-                    ["codex login status"] = new(0, "Logged in using ChatGPT", string.Empty)
+                    ["npm view @openai/codex version"] = new(0, "0.114.0", string.Empty)
                 }),
                 codexHome,
                 TimeSpan.FromSeconds(1),
@@ -104,7 +131,7 @@ public sealed class CodexCliPreflightEvaluatorTests
 
         try
         {
-            await File.WriteAllTextAsync(Path.Combine(codexHome, "auth.json"), "{}");
+            await File.WriteAllTextAsync(Path.Combine(codexHome, "auth.json"), CreateLoginAuthJson());
             await File.WriteAllTextAsync(
                 Path.Combine(codexHome, "version.json"),
                 """
@@ -117,8 +144,7 @@ public sealed class CodexCliPreflightEvaluatorTests
                 CreateRunner(new Dictionary<string, CodexCliCommandResult>(StringComparer.Ordinal)
                 {
                     ["codex --version"] = new(0, "codex-cli 0.114.0", string.Empty),
-                    ["npm view @openai/codex version"] = new(1, string.Empty, "npm unavailable"),
-                    ["codex login status"] = new(0, "Logged in using ChatGPT", string.Empty)
+                    ["npm view @openai/codex version"] = new(1, string.Empty, "npm unavailable")
                 }),
                 codexHome,
                 TimeSpan.FromSeconds(1),
@@ -130,6 +156,46 @@ public sealed class CodexCliPreflightEvaluatorTests
             Assert.Contains(
                 result.Warnings,
                 warning => warning.Contains("local Codex version cache", StringComparison.OrdinalIgnoreCase));
+        }
+        finally
+        {
+            TryDeleteDirectory(codexHome);
+        }
+    }
+
+    [Fact]
+    public async Task CheckAsync_ShouldBlockWhenAuthJsonHasNoUsableCredentials()
+    {
+        var codexHome = CreateTempDirectory("codex-home");
+
+        try
+        {
+            await File.WriteAllTextAsync(
+                Path.Combine(codexHome, "auth.json"),
+                """
+                {
+                  "auth_mode": "chatgpt",
+                  "tokens": {}
+                }
+                """);
+
+            var result = await CodexCliPreflightEvaluator.CheckAsync(
+                CreateRunner(new Dictionary<string, CodexCliCommandResult>(StringComparer.Ordinal)
+                {
+                    ["codex --version"] = new(0, "codex-cli 0.114.0", string.Empty),
+                    ["npm view @openai/codex version"] = new(0, "0.114.0", string.Empty)
+                }),
+                codexHome,
+                TimeSpan.FromSeconds(1),
+                CancellationToken.None);
+
+            Assert.False(result.IsReadyToStart);
+            Assert.Contains(
+                result.BlockingIssues,
+                issue => issue.Contains("usable authentication record", StringComparison.OrdinalIgnoreCase));
+            Assert.Contains(
+                result.Warnings,
+                warning => warning.Contains("reusable login token set or API key", StringComparison.OrdinalIgnoreCase));
         }
         finally
         {
@@ -158,7 +224,7 @@ public sealed class CodexCliPreflightEvaluatorTests
 
         try
         {
-            await File.WriteAllTextAsync(Path.Combine(codexHome, "auth.json"), "{}");
+            await File.WriteAllTextAsync(Path.Combine(codexHome, "auth.json"), CreateLoginAuthJson());
             await File.WriteAllTextAsync(
                 Path.Combine(codexHome, "version.json"),
                 """
@@ -173,7 +239,6 @@ public sealed class CodexCliPreflightEvaluatorTests
                     : Task.FromResult(command switch
                     {
                         "codex --version" => new CodexCliCommandResult(0, "codex-cli 0.114.0", string.Empty),
-                        "codex login status" => new CodexCliCommandResult(0, "Logged in using ChatGPT", string.Empty),
                         _ => throw new InvalidOperationException($"Unexpected command '{command}'.")
                     }),
                 codexHome,
@@ -202,6 +267,32 @@ public sealed class CodexCliPreflightEvaluatorTests
 
             return Task.FromResult(response);
         };
+    }
+
+    private static string CreateLoginAuthJson()
+    {
+        return """
+            {
+              "auth_mode": "chatgpt",
+              "tokens": {
+                "id_token": "id-token",
+                "access_token": "access-token",
+                "refresh_token": "refresh-token",
+                "account_id": "account-id"
+              },
+              "last_refresh": "2026-04-08T00:00:00Z"
+            }
+            """;
+    }
+
+    private static string CreateApiKeyAuthJson()
+    {
+        return """
+            {
+              "OPENAI_API_KEY": "sk-test",
+              "last_refresh": "2026-04-08T00:00:00Z"
+            }
+            """;
     }
 
     private static string CreateTempDirectory(string prefix)

@@ -40,10 +40,10 @@ Before the installer auto-starts Symphony, it also checks the local Codex CLI:
 
 - `codex --version` must be present and at least the Symphony-validated version
 - if npm can be reached, the installed CLI must not be behind the latest `@openai/codex` version
-- Codex authentication must succeed via `codex login status`
 - `auth.json` must exist under `~/.codex/` (or `CODEX_HOME` when set)
+- the auth file must contain either a reusable login token set or `OPENAI_API_KEY`
 
-If one of those checks fails, the installer pauses and tells you what to fix before the first start. With `--no-launch`, installation still completes, but the installer prints the Codex prerequisites you need to fix before running the instance later.
+The installer validates the auth file directly and does not call `codex login status`, so the preflight stays non-interactive and avoids triggering external login flows such as Azure CLI auth. If one of those checks fails, the installer pauses and tells you what to fix before the first start. With `--no-launch`, installation still completes, but the installer prints the Codex prerequisites you need to fix before running the instance later.
 
 It then creates an isolated instance with:
 

@@ -260,7 +260,8 @@ public sealed class InstallCommandTests
                 LatestVersionVerified: true,
                 AuthJsonPath: Path.Combine(Path.GetTempPath(), ".codex", "auth.json"),
                 HasAuthJson: true,
-                LoginConfigured: true,
+                AuthenticationConfigured: true,
+                AuthenticationMode: "chatgpt",
                 BlockingIssues: [],
                 Warnings: [],
                 RemediationSteps: [])
@@ -272,7 +273,8 @@ public sealed class InstallCommandTests
                 LatestVersionVerified: true,
                 AuthJsonPath: Path.Combine(Path.GetTempPath(), ".codex", "auth.json"),
                 HasAuthJson: false,
-                LoginConfigured: false,
+                AuthenticationConfigured: false,
+                AuthenticationMode: null,
                 BlockingIssues:
                 [
                     "Codex CLI 0.113.0 is older than the Symphony-validated version 0.114.0.",
@@ -282,7 +284,7 @@ public sealed class InstallCommandTests
                 RemediationSteps:
                 [
                     "Update Codex CLI with `npm install -g @openai/codex@0.114.0`.",
-                    "Run `codex login` in another terminal, finish the sign-in flow, then return here."
+                    "Run `codex login` in another terminal or configure Codex API-key auth, then return here."
                 ]);
     }
 
