@@ -1,4 +1,5 @@
 using System.Net;
+using System.Net.Http.Json;
 using System.Text.Json;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.TestHost;
@@ -11,6 +12,7 @@ using Symphony.Host;
 using Symphony.Infrastructure.Persistence.Sqlite;
 using Symphony.Infrastructure.Persistence.Sqlite.Entities;
 using Symphony.Infrastructure.Tracker.GitHub;
+using Symphony.Infrastructure.Workflows;
 
 namespace Symphony.Integration.Tests;
 
@@ -271,6 +273,7 @@ public sealed class ApiSmokeTests
             Assert.Contains("Symphony Control Room", htmlContent, StringComparison.OrdinalIgnoreCase);
             Assert.Contains("dashboard-shell", htmlContent, StringComparison.OrdinalIgnoreCase);
             Assert.Contains("dashboard-rail", htmlContent, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("workflow-editor", htmlContent, StringComparison.OrdinalIgnoreCase);
             Assert.Contains("xl:items-start", htmlContent, StringComparison.OrdinalIgnoreCase);
             Assert.DoesNotContain("max-w-7xl", htmlContent, StringComparison.OrdinalIgnoreCase);
 
@@ -416,6 +419,245 @@ public sealed class ApiSmokeTests
         }
         finally
         {
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            TryDeleteFile(dbPath);
+            TryDeleteFile(workflowPath);
+        }
+    }
+
+    [Fact]
+    public async Task DashboardJavaScriptAsset_ShouldIncludeWorkflowEditorActions()
+    {
+        var workflowPath = CreateValidWorkflowPath();
+        var dbPath = Path.Combine(Path.GetTempPath(), $"symphony-int-{Guid.NewGuid():N}.db");
+        var stderr = new StringWriter();
+        string? content = null;
+
+        try
+        {
+            var exitCode = await SymphonyHostApplication.RunCliAsync(
+                [workflowPath],
+                stderr,
+                configureBuilder: builder => ConfigureTestServer(builder, dbPath),
+                configureServices: services => RegisterFakeTracker(services),
+                runApplicationAsync: async (app, cancellationToken) =>
+                {
+                    await app.StartAsync(cancellationToken);
+                    using var client = app.GetTestClient();
+                    content = await client.GetStringAsync("/assets/dashboard.js", cancellationToken);
+                    await app.StopAsync(cancellationToken);
+                });
+
+            Assert.True(exitCode == 0, stderr.ToString());
+            Assert.NotNull(content);
+
+            var javascriptContent = content!;
+            Assert.Contains("/api/v1/workflow", javascriptContent, StringComparison.Ordinal);
+            Assert.Contains("data-action='save-workflow'", javascriptContent, StringComparison.Ordinal);
+            Assert.Contains("data-action='reload-workflow'", javascriptContent, StringComparison.Ordinal);
+            Assert.Contains("data-workflow-field=\"frontMatterText\"", javascriptContent, StringComparison.Ordinal);
+            Assert.Contains("data-workflow-field=\"promptTemplate\"", javascriptContent, StringComparison.Ordinal);
+            Assert.Contains("function syncWorkflowEditorChrome()", javascriptContent, StringComparison.Ordinal);
+            Assert.Contains("data-workflow-status", javascriptContent, StringComparison.Ordinal);
+        }
+        finally
+        {
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            TryDeleteFile(dbPath);
+            TryDeleteFile(workflowPath);
+        }
+    }
+
+    [Fact]
+    public async Task WorkflowEndpoint_ShouldReturnStructuredErrorWhenWorkflowFileDisappears()
+    {
+        var workflowPath = CreateValidWorkflowPath();
+        var dbPath = Path.Combine(Path.GetTempPath(), $"symphony-int-{Guid.NewGuid():N}.db");
+        var stderr = new StringWriter();
+        HttpStatusCode? statusCode = null;
+        string? content = null;
+
+        try
+        {
+            var exitCode = await SymphonyHostApplication.RunCliAsync(
+                [workflowPath],
+                stderr,
+                configureBuilder: builder => ConfigureTestServer(builder, dbPath),
+                configureServices: services => RegisterFakeTracker(services),
+                runApplicationAsync: async (app, cancellationToken) =>
+                {
+                    await app.StartAsync(cancellationToken);
+                    TryDeleteFile(workflowPath);
+                    using var client = app.GetTestClient();
+                    var response = await client.GetAsync("/api/v1/workflow", cancellationToken);
+                    statusCode = response.StatusCode;
+                    content = await response.Content.ReadAsStringAsync(cancellationToken);
+                    await app.StopAsync(cancellationToken);
+                });
+
+            Assert.True(exitCode == 0, stderr.ToString());
+            Assert.Equal(HttpStatusCode.BadRequest, statusCode);
+            Assert.NotNull(content);
+            Assert.Contains("\"code\":\"missing_workflow_file\"", content, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("\"message\"", content, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            TryDeleteFile(dbPath);
+            TryDeleteFile(workflowPath);
+        }
+    }
+
+    [Fact]
+    public async Task WorkflowEndpoint_ShouldMaskInlineTrackerApiKeysAndPersistEdits()
+    {
+        var workflowPath = CreateWorkflowPath("""
+            ---
+            tracker:
+              kind: github
+              endpoint: https://api.github.com/graphql
+              api_key: inline-secret-token
+              owner: released
+              repo: symphony
+            polling:
+              interval_ms: 600000
+            agent:
+              max_concurrent_agents: 5
+            ---
+            Prompt body.
+            """);
+        var dbPath = Path.Combine(Path.GetTempPath(), $"symphony-int-{Guid.NewGuid():N}.db");
+        var stderr = new StringWriter();
+        WorkflowEditorDocument? workflowDocument = null;
+        HttpStatusCode? saveStatusCode = null;
+        string? runtimeContent = null;
+
+        try
+        {
+            var exitCode = await SymphonyHostApplication.RunCliAsync(
+                [workflowPath],
+                stderr,
+                configureBuilder: builder => ConfigureTestServer(builder, dbPath),
+                configureServices: services => RegisterFakeTracker(services),
+                runApplicationAsync: async (app, cancellationToken) =>
+                {
+                    await app.StartAsync(cancellationToken);
+                    using var client = app.GetTestClient();
+
+                    workflowDocument = await client.GetFromJsonAsync<WorkflowEditorDocument>("/api/v1/workflow", cancellationToken);
+                    Assert.NotNull(workflowDocument);
+                    Assert.True(workflowDocument!.HasMaskedTrackerApiKey);
+                    Assert.Contains(WorkflowEditorService.TrackerApiKeyPlaceholder, workflowDocument.FrontMatterText, StringComparison.Ordinal);
+
+                    var updatedDocument = workflowDocument with
+                    {
+                        FrontMatterText = workflowDocument.FrontMatterText.Replace("owner: released", "owner: updated-owner", StringComparison.Ordinal),
+                        PromptTemplate = "Updated prompt body."
+                    };
+
+                    var saveResponse = await client.PutAsJsonAsync("/api/v1/workflow", updatedDocument, cancellationToken);
+                    saveStatusCode = saveResponse.StatusCode;
+                    runtimeContent = await client.GetStringAsync("/api/v1/runtime", cancellationToken);
+                    await app.StopAsync(cancellationToken);
+                });
+
+            Assert.True(exitCode == 0, stderr.ToString());
+            Assert.Equal(HttpStatusCode.OK, saveStatusCode);
+            Assert.NotNull(runtimeContent);
+            Assert.Contains("\"owner\":\"updated-owner\"", runtimeContent, StringComparison.OrdinalIgnoreCase);
+
+            var persistedContent = await File.ReadAllTextAsync(workflowPath);
+            Assert.Contains("api_key: inline-secret-token", persistedContent, StringComparison.Ordinal);
+            Assert.DoesNotContain(WorkflowEditorService.TrackerApiKeyPlaceholder, persistedContent, StringComparison.Ordinal);
+            Assert.Contains("owner: updated-owner", persistedContent, StringComparison.Ordinal);
+            Assert.Contains("Updated prompt body.", persistedContent, StringComparison.Ordinal);
+        }
+        finally
+        {
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            TryDeleteFile(dbPath);
+            TryDeleteFile(workflowPath);
+        }
+    }
+
+    [Fact]
+    public async Task WorkflowEndpoint_ShouldRejectTrackerPlaceholderWhenNoInlineSecretCanBeRestored()
+    {
+        var apiKeyEnvVar = $"SYMPHONY_TEST_GITHUB_TOKEN_{Guid.NewGuid():N}";
+        Environment.SetEnvironmentVariable(apiKeyEnvVar, "test-token");
+        var workflowPath = CreateWorkflowPath($$"""
+            ---
+            tracker:
+              kind: github
+              endpoint: https://api.github.com/graphql
+              api_key: ${{apiKeyEnvVar}}
+              owner: released
+              repo: symphony
+            polling:
+              interval_ms: 600000
+            agent:
+              max_concurrent_agents: 5
+            codex:
+              command: codex app-server
+              turn_timeout_ms: 3600000
+              approval_policy: never
+              thread_sandbox: danger-full-access
+              turn_sandbox_policy: danger-full-access
+              read_timeout_ms: 5000
+              stall_timeout_ms: 300000
+            workspace:
+              root: ./workspaces
+              shared_clone_path: ./workspaces/repo
+              worktrees_root: ./workspaces/worktrees
+              base_branch: main
+            hooks:
+              timeout_ms: 60000
+            ---
+            Prompt body.
+            """);
+        var dbPath = Path.Combine(Path.GetTempPath(), $"symphony-int-{Guid.NewGuid():N}.db");
+        var stderr = new StringWriter();
+        HttpStatusCode? statusCode = null;
+        string? content = null;
+
+        try
+        {
+            var exitCode = await SymphonyHostApplication.RunCliAsync(
+                [workflowPath],
+                stderr,
+                configureBuilder: builder => ConfigureTestServer(builder, dbPath),
+                configureServices: services => RegisterFakeTracker(services),
+                runApplicationAsync: async (app, cancellationToken) =>
+                {
+                    await app.StartAsync(cancellationToken);
+                    using var client = app.GetTestClient();
+
+                    var workflowDocument = await client.GetFromJsonAsync<WorkflowEditorDocument>("/api/v1/workflow", cancellationToken);
+                    Assert.NotNull(workflowDocument);
+
+                    var updatedDocument = workflowDocument! with
+                    {
+                        FrontMatterText = workflowDocument.FrontMatterText.Replace(
+                            $"api_key: ${apiKeyEnvVar}",
+                            $"api_key: {WorkflowEditorService.TrackerApiKeyPlaceholder}",
+                            StringComparison.Ordinal)
+                    };
+
+                    var response = await client.PutAsJsonAsync("/api/v1/workflow", updatedDocument, cancellationToken);
+                    statusCode = response.StatusCode;
+                    content = await response.Content.ReadAsStringAsync(cancellationToken);
+                    await app.StopAsync(cancellationToken);
+                });
+
+            Assert.True(exitCode == 0, stderr.ToString());
+            Assert.Equal(HttpStatusCode.BadRequest, statusCode);
+            Assert.NotNull(content);
+            Assert.Contains(WorkflowEditorService.InvalidTrackerApiKeyPlaceholderCode, content, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(apiKeyEnvVar, null);
             Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
             TryDeleteFile(dbPath);
             TryDeleteFile(workflowPath);

@@ -70,6 +70,117 @@ public sealed class WorkflowLoaderTests
     }
 
     [Fact]
+    public async Task WorkflowEditorService_ShouldMaskAndPreserveInlineTrackerApiKeyOnSave()
+    {
+        var workflowPath = CreateWorkflowPath();
+        await File.WriteAllTextAsync(workflowPath, """
+            ---
+            tracker:
+              kind: github
+              endpoint: https://api.github.com/graphql
+              api_key: inline-secret-token
+              owner: released
+              repo: symphony
+            polling:
+              interval_ms: 600000
+            ---
+            Prompt A
+            """);
+
+        try
+        {
+            var editorService = CreateEditorService(workflowPath);
+            var document = await editorService.GetCurrentAsync();
+
+            Assert.True(document.HasMaskedTrackerApiKey);
+            Assert.Contains(WorkflowEditorService.TrackerApiKeyPlaceholder, document.FrontMatterText, StringComparison.Ordinal);
+
+            var updated = document with
+            {
+                FrontMatterText = document.FrontMatterText.Replace("owner: released", "owner: updated-owner", StringComparison.Ordinal),
+                PromptTemplate = "Prompt B updated"
+            };
+
+            var saved = await editorService.SaveAsync(updated);
+            var rawContent = await File.ReadAllTextAsync(workflowPath);
+
+            Assert.Contains("api_key: inline-secret-token", rawContent, StringComparison.Ordinal);
+            Assert.DoesNotContain(WorkflowEditorService.TrackerApiKeyPlaceholder, rawContent, StringComparison.Ordinal);
+            Assert.Contains("owner: updated-owner", rawContent, StringComparison.Ordinal);
+            Assert.Contains("Prompt B updated", rawContent, StringComparison.Ordinal);
+            Assert.Equal("Prompt B updated", saved.PromptTemplate);
+        }
+        finally
+        {
+            File.Delete(workflowPath);
+        }
+    }
+
+    [Fact]
+    public async Task WorkflowEditorService_ShouldSurfaceValidationErrorsForBrokenWorkflowText()
+    {
+        var workflowPath = CreateWorkflowPath();
+        await File.WriteAllTextAsync(workflowPath, """
+            ---
+            tracker:
+              kind: github
+              owner: released
+            """);
+
+        try
+        {
+            var editorService = CreateEditorService(workflowPath);
+            var document = await editorService.GetCurrentAsync();
+
+            Assert.NotNull(document.ValidationError);
+            Assert.Contains("tracker:", document.FrontMatterText, StringComparison.Ordinal);
+            Assert.Equal(string.Empty, document.PromptTemplate);
+        }
+        finally
+        {
+            File.Delete(workflowPath);
+        }
+    }
+
+    [Fact]
+    public async Task WorkflowEditorService_ShouldRejectSavingTrackerPlaceholderWithoutInlineSecretToRestore()
+    {
+        var workflowPath = CreateWorkflowPath();
+        await File.WriteAllTextAsync(workflowPath, """
+            ---
+            tracker:
+              kind: github
+              endpoint: https://api.github.com/graphql
+              api_key: $GITHUB_TOKEN
+              owner: released
+              repo: symphony
+            ---
+            Prompt body.
+            """);
+
+        try
+        {
+            var editorService = CreateEditorService(workflowPath);
+            var document = await editorService.GetCurrentAsync();
+
+            var updated = document with
+            {
+                FrontMatterText = document.FrontMatterText.Replace(
+                    "$GITHUB_TOKEN",
+                    WorkflowEditorService.TrackerApiKeyPlaceholder,
+                    StringComparison.Ordinal)
+            };
+
+            var ex = await Assert.ThrowsAsync<WorkflowLoadException>(() => editorService.SaveAsync(updated));
+            Assert.Equal(WorkflowEditorService.InvalidTrackerApiKeyPlaceholderCode, ex.Code);
+        }
+        finally
+        {
+            File.Delete(workflowPath);
+        }
+    }
+
+    [Fact]
     public async Task Provider_ShouldReloadWhenWorkflowChanges()
     {
         var workflowPath = CreateWorkflowPath();
@@ -477,5 +588,12 @@ public sealed class WorkflowLoaderTests
             new WorkflowLoader(),
             Options.Create(new WorkflowLoaderOptions { Path = workflowPath }),
             NullLogger<WorkflowDefinitionProvider>.Instance);
+    }
+
+    private static WorkflowEditorService CreateEditorService(string workflowPath)
+    {
+        return new WorkflowEditorService(
+            new WorkflowLoader(),
+            Options.Create(new WorkflowLoaderOptions { Path = workflowPath }));
     }
 }
