@@ -305,7 +305,7 @@ public sealed class ApiSmokeTests
     }
 
     [Fact]
-    public async Task DashboardCssAsset_ShouldIncludeSidebarScrollStyles()
+    public async Task DashboardCssAsset_ShouldIncludeFullWidthShellStyles()
     {
         var workflowPath = CreateValidWorkflowPath();
         var dbPath = Path.Combine(Path.GetTempPath(), $"symphony-int-{Guid.NewGuid():N}.db");
@@ -331,8 +331,43 @@ public sealed class ApiSmokeTests
             Assert.NotNull(content);
             var cssContent = content!;
             Assert.Contains(".dashboard-shell", cssContent, StringComparison.OrdinalIgnoreCase);
-            Assert.Contains(".dashboard-rail", cssContent, StringComparison.OrdinalIgnoreCase);
             Assert.Matches(@"(?i)\.dashboard-shell\s*\{[^}]*width\s*:\s*100%", cssContent);
+        }
+        finally
+        {
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            TryDeleteFile(dbPath);
+            TryDeleteFile(workflowPath);
+        }
+    }
+
+    [Fact]
+    public async Task DashboardCssAsset_ShouldIncludeSidebarScrollStyles()
+    {
+        var workflowPath = CreateValidWorkflowPath();
+        var dbPath = Path.Combine(Path.GetTempPath(), $"symphony-int-{Guid.NewGuid():N}.db");
+        var stderr = new StringWriter();
+        string? content = null;
+
+        try
+        {
+            var exitCode = await SymphonyHostApplication.RunCliAsync(
+                [workflowPath],
+                stderr,
+                configureBuilder: builder => ConfigureTestServer(builder, dbPath),
+                configureServices: services => RegisterFakeTracker(services),
+                runApplicationAsync: async (app, cancellationToken) =>
+                {
+                    await app.StartAsync(cancellationToken);
+                    using var client = app.GetTestClient();
+                    content = await client.GetStringAsync("/assets/dashboard.css", cancellationToken);
+                    await app.StopAsync(cancellationToken);
+                });
+
+            Assert.True(exitCode == 0, stderr.ToString());
+            Assert.NotNull(content);
+            var cssContent = content!;
+            Assert.Contains(".dashboard-rail", cssContent, StringComparison.OrdinalIgnoreCase);
             Assert.Matches(@"(?i)overflow-y\s*:\s*auto", cssContent);
             Assert.Matches(@"(?i)max-height\s*:\s*calc\(100vh\s*-\s*3rem\)", cssContent);
         }
