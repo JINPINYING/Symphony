@@ -28,6 +28,7 @@ const state = {
   selectedIssue: null,
   workflowDocument: null,
   workflowDraft: null,
+  workflowEditorExpanded: false,
   workflowDirty: false,
   workflowSaving: false,
   workflowError: null,
@@ -53,6 +54,12 @@ document.addEventListener("click", async event => {
 
   if (event.target.closest("[data-action='reload-workflow']")) {
     await reloadWorkflowEditor();
+    return;
+  }
+
+  if (event.target.closest("[data-action='toggle-workflow-editor']")) {
+    state.workflowEditorExpanded = !state.workflowEditorExpanded;
+    renderWorkflowEditorSection(true);
     return;
   }
 
@@ -188,11 +195,7 @@ function render() {
   updateDocumentTitle();
   elements.heroPanel.innerHTML = renderHeroPanel();
   elements.alert.innerHTML = renderAlert();
-  if (!state.workflowDirty || state.workflowSaving || state.workflowError || !elements.workflowEditor.innerHTML) {
-    elements.workflowEditor.innerHTML = renderWorkflowEditor();
-  } else {
-    syncWorkflowEditorChrome();
-  }
+  renderWorkflowEditorSection();
   elements.metricGrid.innerHTML = renderMetricCards();
   elements.liveRuns.innerHTML = renderLiveRuns();
   elements.issueDistribution.innerHTML = renderIssueDistribution();
@@ -211,6 +214,29 @@ function render() {
       render();
     };
   }
+}
+
+function renderWorkflowEditorSection(force = false) {
+  const desiredMode = !state.workflowDraft
+    ? "unavailable"
+    : state.workflowEditorExpanded
+      ? "expanded"
+      : "collapsed";
+
+  if (
+    force ||
+    !state.workflowDirty ||
+    state.workflowSaving ||
+    state.workflowError ||
+    !elements.workflowEditor.innerHTML ||
+    elements.workflowEditor.dataset.renderMode !== desiredMode
+  ) {
+    elements.workflowEditor.innerHTML = renderWorkflowEditor();
+    elements.workflowEditor.dataset.renderMode = desiredMode;
+    return;
+  }
+
+  syncWorkflowEditorChrome();
 }
 
 function renderHeroPanel() {
@@ -312,6 +338,23 @@ function renderWorkflowEditor() {
       </div>`;
   }
 
+  const toggleLabel = state.workflowEditorExpanded ? "Minimize editor" : "Expand editor";
+  const summaryCards = `
+    <div class="mt-6 grid gap-4 lg:grid-cols-3">
+      <div class="workflow-summary-card">
+        <div class="text-xs uppercase tracking-[0.22em] text-slate-400">Editor state</div>
+        <div class="mt-2 text-sm leading-6 text-slate-300">The workflow editor is minimized by default to keep the control room focused. Expand it when you want to adjust YAML settings or the prompt template.</div>
+      </div>
+      <div class="workflow-summary-card">
+        <div class="text-xs uppercase tracking-[0.22em] text-slate-400">Workflow file</div>
+        <div class="mt-2 break-all text-sm text-slate-200">${escapeHtml(draft.sourcePath || "Unavailable")}</div>
+      </div>
+      <div class="workflow-summary-card">
+        <div class="text-xs uppercase tracking-[0.22em] text-slate-400">Last valid load</div>
+        <div class="mt-2 text-sm text-slate-200">${escapeHtml(draft.loadedAtUtc ? formatRelativeTime(draft.loadedAtUtc) : "Validation pending")}</div>
+      </div>
+    </div>`;
+
   return `
     <div class="panel-body p-6 sm:p-8">
       <div class="flex flex-wrap items-start justify-between gap-4">
@@ -326,6 +369,14 @@ function renderWorkflowEditor() {
           <span class="glass-badge" data-workflow-status>${escapeHtml(getWorkflowEditorStatusLabel())}</span>
           <button
             type="button"
+            data-action="toggle-workflow-editor"
+            class="workflow-button"
+            ${state.workflowSaving ? "disabled" : ""}>
+            ${escapeHtml(toggleLabel)}
+          </button>
+          ${state.workflowEditorExpanded ? `
+          <button
+            type="button"
             data-action="reload-workflow"
             class="workflow-button"
             ${state.workflowSaving ? "disabled" : ""}>
@@ -338,11 +389,13 @@ function renderWorkflowEditor() {
             ${state.workflowSaving ? "disabled" : ""}>
             ${escapeHtml(state.workflowSaving ? "Saving..." : "Save WORKFLOW.md")}
           </button>
+          ` : ""}
         </div>
       </div>
 
       <div data-workflow-feedback class="mt-6">${renderWorkflowEditorFeedback(draft)}</div>
 
+      ${!state.workflowEditorExpanded ? summaryCards : `
       <div class="mt-6 grid gap-6 xl:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
         <label class="workflow-field">
           <span class="workflow-label">Workflow YAML front matter</span>
@@ -378,6 +431,7 @@ function renderWorkflowEditor() {
           <div class="mt-2 text-sm leading-6 text-slate-300">Auto-refresh leaves this panel alone while you have unsaved edits, so the rest of the dashboard can continue updating without clobbering your draft.</div>
         </div>
       </div>
+      `}
     </div>`;
 }
 

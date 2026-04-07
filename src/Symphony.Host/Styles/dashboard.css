@@ -139,6 +139,10 @@
     @apply border-rose-400/25 bg-rose-500/10 text-rose-50;
   }
 
+  .workflow-summary-card {
+    @apply rounded-3xl border border-white/10 bg-white/[0.035] p-4;
+  }
+
   .dashboard-shell {
     @apply w-full px-4 py-6 sm:px-6 lg:px-8;
   }
