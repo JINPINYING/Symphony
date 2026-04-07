@@ -143,6 +143,44 @@ public sealed class WorkflowLoaderTests
     }
 
     [Fact]
+    public async Task WorkflowEditorService_ShouldRejectSavingTrackerPlaceholderWithoutInlineSecretToRestore()
+    {
+        var workflowPath = CreateWorkflowPath();
+        await File.WriteAllTextAsync(workflowPath, """
+            ---
+            tracker:
+              kind: github
+              endpoint: https://api.github.com/graphql
+              api_key: $GITHUB_TOKEN
+              owner: released
+              repo: symphony
+            ---
+            Prompt body.
+            """);
+
+        try
+        {
+            var editorService = CreateEditorService(workflowPath);
+            var document = await editorService.GetCurrentAsync();
+
+            var updated = document with
+            {
+                FrontMatterText = document.FrontMatterText.Replace(
+                    "$GITHUB_TOKEN",
+                    WorkflowEditorService.TrackerApiKeyPlaceholder,
+                    StringComparison.Ordinal)
+            };
+
+            var ex = await Assert.ThrowsAsync<WorkflowLoadException>(() => editorService.SaveAsync(updated));
+            Assert.Equal(WorkflowEditorService.InvalidTrackerApiKeyPlaceholderCode, ex.Code);
+        }
+        finally
+        {
+            File.Delete(workflowPath);
+        }
+    }
+
+    [Fact]
     public async Task Provider_ShouldReloadWhenWorkflowChanges()
     {
         var workflowPath = CreateWorkflowPath();

@@ -340,8 +340,22 @@ internal static class SymphonyHostApplication
             WorkflowEditorService workflowEditorService,
             CancellationToken cancellationToken) =>
         {
-            var payload = await workflowEditorService.GetCurrentAsync(cancellationToken);
-            return Results.Ok(payload);
+            try
+            {
+                var payload = await workflowEditorService.GetCurrentAsync(cancellationToken);
+                return Results.Ok(payload);
+            }
+            catch (WorkflowLoadException ex)
+            {
+                return Results.BadRequest(new
+                {
+                    error = new
+                    {
+                        code = ex.Code,
+                        message = ex.Message
+                    }
+                });
+            }
         });
 
         app.MapPut("/api/v1/workflow", async (

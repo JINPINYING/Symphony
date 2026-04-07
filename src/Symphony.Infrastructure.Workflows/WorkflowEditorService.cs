@@ -10,6 +10,7 @@ public sealed partial class WorkflowEditorService(
     IOptions<WorkflowLoaderOptions> options)
 {
     public const string TrackerApiKeyPlaceholder = "__SYMPHONY_KEEP_EXISTING_SECRET__";
+    public const string InvalidTrackerApiKeyPlaceholderCode = "invalid_workflow_editor_tracker_api_key_placeholder";
 
     public async Task<WorkflowEditorDocument> GetCurrentAsync(CancellationToken cancellationToken = default)
     {
@@ -65,6 +66,13 @@ public sealed partial class WorkflowEditorService(
             frontMatterText.Contains(TrackerApiKeyPlaceholder, StringComparison.Ordinal))
         {
             frontMatterText = ReplaceTrackerApiKey(frontMatterText, existingTrackerApiKey);
+        }
+
+        if (frontMatterText.Contains(TrackerApiKeyPlaceholder, StringComparison.Ordinal))
+        {
+            throw new WorkflowLoadException(
+                InvalidTrackerApiKeyPlaceholderCode,
+                "The tracker API key placeholder cannot be saved. Replace it with a real API key or remove it before saving.");
         }
 
         var promptTemplate = NormalizeLineEndings(document.PromptTemplate);

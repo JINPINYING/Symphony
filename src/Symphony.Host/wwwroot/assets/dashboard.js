@@ -76,6 +76,7 @@ document.addEventListener("input", event => {
   state.workflowDirty = true;
   state.workflowNotice = null;
   state.workflowError = null;
+  syncWorkflowEditorChrome();
 });
 
 window.addEventListener("hashchange", () => {
@@ -189,6 +190,8 @@ function render() {
   elements.alert.innerHTML = renderAlert();
   if (!state.workflowDirty || state.workflowSaving || state.workflowError || !elements.workflowEditor.innerHTML) {
     elements.workflowEditor.innerHTML = renderWorkflowEditor();
+  } else {
+    syncWorkflowEditorChrome();
   }
   elements.metricGrid.innerHTML = renderMetricCards();
   elements.liveRuns.innerHTML = renderLiveRuns();
@@ -297,12 +300,6 @@ function renderAlert() {
 
 function renderWorkflowEditor() {
   const draft = state.workflowDraft;
-  const validationError = draft?.validationError;
-  const statusLabel = state.workflowSaving
-    ? "Saving"
-    : state.workflowDirty
-      ? "Unsaved edits"
-      : "In sync";
 
   if (!draft) {
     return `
@@ -326,7 +323,7 @@ function renderWorkflowEditor() {
           </p>
         </div>
         <div class="workflow-actions">
-          <span class="glass-badge">${escapeHtml(statusLabel)}</span>
+          <span class="glass-badge" data-workflow-status>${escapeHtml(getWorkflowEditorStatusLabel())}</span>
           <button
             type="button"
             data-action="reload-workflow"
@@ -344,10 +341,7 @@ function renderWorkflowEditor() {
         </div>
       </div>
 
-      ${state.workflowNotice ? `<div class="workflow-banner workflow-banner-success mt-6">${escapeHtml(state.workflowNotice)}</div>` : ""}
-      ${state.workflowError ? `<div class="workflow-banner workflow-banner-error mt-6">${escapeHtml(state.workflowError)}</div>` : ""}
-      ${validationError ? `<div class="workflow-banner workflow-banner-warning mt-6">Current file validation: ${escapeHtml(validationError.message)}</div>` : ""}
-      ${draft.hasMaskedTrackerApiKey ? `<div class="workflow-banner workflow-banner-info mt-6">Inline tracker.api_key is masked as ${escapeHtml(draft.trackerApiKeyPlaceholder)}. Leave that placeholder unchanged to keep the current secret, or replace it with a new literal or $ENV_VAR reference.</div>` : ""}
+      <div data-workflow-feedback class="mt-6">${renderWorkflowEditorFeedback(draft)}</div>
 
       <div class="mt-6 grid gap-6 xl:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
         <label class="workflow-field">
@@ -385,6 +379,28 @@ function renderWorkflowEditor() {
         </div>
       </div>
     </div>`;
+}
+
+function renderWorkflowEditorFeedback(draft) {
+  const banners = [];
+
+  if (state.workflowNotice) {
+    banners.push(`<div class="workflow-banner workflow-banner-success">${escapeHtml(state.workflowNotice)}</div>`);
+  }
+
+  if (state.workflowError) {
+    banners.push(`<div class="workflow-banner workflow-banner-error">${escapeHtml(state.workflowError)}</div>`);
+  }
+
+  if (draft?.validationError) {
+    banners.push(`<div class="workflow-banner workflow-banner-warning">Current file validation: ${escapeHtml(draft.validationError.message)}</div>`);
+  }
+
+  if (draft?.hasMaskedTrackerApiKey) {
+    banners.push(`<div class="workflow-banner workflow-banner-info">Inline tracker.api_key is masked as ${escapeHtml(draft.trackerApiKeyPlaceholder)}. Leave that placeholder unchanged to keep the current secret, or replace it with a new literal or $ENV_VAR reference.</div>`);
+  }
+
+  return banners.length ? `<div class="space-y-4">${banners.join("")}</div>` : "";
 }
 
 function renderMetricCards() {
@@ -907,6 +923,26 @@ function formatRetryCountdown(value) {
   const diffSeconds = getRelativeDiffSeconds(value);
   if (diffSeconds === null) return "unavailable";
   return formatRelativeDiff(Math.max(diffSeconds, 0));
+}
+
+function getWorkflowEditorStatusLabel() {
+  return state.workflowSaving
+    ? "Saving"
+    : state.workflowDirty
+      ? "Unsaved edits"
+      : "In sync";
+}
+
+function syncWorkflowEditorChrome() {
+  const status = elements.workflowEditor.querySelector("[data-workflow-status]");
+  if (status) {
+    status.textContent = getWorkflowEditorStatusLabel();
+  }
+
+  const feedback = elements.workflowEditor.querySelector("[data-workflow-feedback]");
+  if (feedback) {
+    feedback.innerHTML = renderWorkflowEditorFeedback(state.workflowDraft);
+  }
 }
 
 async function reloadWorkflowEditor() {
