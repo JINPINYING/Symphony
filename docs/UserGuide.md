@@ -81,6 +81,8 @@ Important settings:
 - `hooks.*`: lifecycle hooks and timeout
 - `server.port`: optional HTTP bind override
 
+The dashboard includes a workflow editor for `WORKFLOW.md`, so operators can edit the YAML front matter and prompt template in the browser and save them back to disk without restarting the host. If `tracker.api_key` is an inline literal instead of an `$ENV_VAR` reference, the editor masks it with a placeholder and preserves the existing value unless you replace it explicitly.
+
 `tracker.api_key` supports `$ENV_VAR` indirection. Symphony validates that required secrets exist without logging their values.
 
 If you see `missing_tracker_api_key`, the workflow value usually looks correct and the problem is that the current host process does not have the referenced environment variable. This often happens when:
@@ -96,6 +98,8 @@ Symphony exposes these HTTP endpoints:
 - `GET /`: dashboard for host health, workload, tokens, activity, leases, and issue drill-down
 - `GET /api/v1/health`: liveness/health checks
 - `GET /api/v1/runtime`: current workflow/config snapshot
+- `GET /api/v1/workflow`: editable `WORKFLOW.md` source view for the dashboard editor
+- `PUT /api/v1/workflow`: validate and save edited `WORKFLOW.md` contents
 - `GET /api/v1/state`: running sessions, retry queue, tracked issue distribution, recent activity, lease state, token totals, runtime totals, and latest rate limits
 - `GET /api/v1/<issue_identifier>`: issue-specific runtime/debug view
 - `POST /api/v1/refresh`: queue an immediate best-effort poll/reconcile cycle
@@ -106,6 +110,7 @@ For human-readable dashboard surfaces, fallback-only `other_message` protocol en
 On large desktop layouts, the right-hand issue detail rail stays pinned and scrolls independently so long issue detail content does not hide instance health or rate-limit cards.
 The dashboard shell uses the full viewport width on large screens instead of staying capped inside a centered content column.
 Retry queue surfaces show time until the next attempt, and any overdue retry is shown as ready now instead of appearing to be scheduled in the past.
+The workflow editor writes back to `WORKFLOW.md` after validating the updated YAML and prompt body, so broken edits are rejected before they replace the on-disk workflow file.
 
 ## Codex Session Behavior
 

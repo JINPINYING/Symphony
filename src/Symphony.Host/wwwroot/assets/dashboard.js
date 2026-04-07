@@ -1,6 +1,7 @@
 const elements = {
   heroPanel: document.getElementById("hero-panel"),
   alert: document.getElementById("dashboard-alert"),
+  workflowEditor: document.getElementById("workflow-editor"),
   metricGrid: document.getElementById("metric-grid"),
   liveRuns: document.getElementById("live-runs"),
   issueDistribution: document.getElementById("issue-distribution"),
@@ -25,6 +26,12 @@ const state = {
   health: null,
   issueDetail: null,
   selectedIssue: null,
+  workflowDocument: null,
+  workflowDraft: null,
+  workflowDirty: false,
+  workflowSaving: false,
+  workflowError: null,
+  workflowNotice: null,
   loading: false,
   refreshQueued: false,
   autoRefresh: true,
@@ -44,9 +51,31 @@ document.addEventListener("click", async event => {
     return;
   }
 
+  if (event.target.closest("[data-action='reload-workflow']")) {
+    await reloadWorkflowEditor();
+    return;
+  }
+
+  if (event.target.closest("[data-action='save-workflow']")) {
+    await saveWorkflowEditor();
+    return;
+  }
+
   if (event.target.closest("[data-action='refresh']")) {
     await loadDashboard({ queueRefresh: true });
   }
+});
+
+document.addEventListener("input", event => {
+  const field = event.target.closest("[data-workflow-field]");
+  if (!field?.dataset.workflowField || !state.workflowDraft) {
+    return;
+  }
+
+  state.workflowDraft[field.dataset.workflowField] = field.value;
+  state.workflowDirty = true;
+  state.workflowNotice = null;
+  state.workflowError = null;
 });
 
 window.addEventListener("hashchange", () => {
@@ -74,10 +103,11 @@ async function loadDashboard({ queueRefresh = false } = {}) {
       await fetch("/api/v1/refresh", { method: "POST" });
     }
 
-    const [healthResult, runtimeResult, stateResult] = await Promise.allSettled([
+    const [healthResult, runtimeResult, stateResult, workflowResult] = await Promise.allSettled([
       fetchHealth(),
       fetchJson("/api/v1/runtime"),
-      fetchJson("/api/v1/state")
+      fetchJson("/api/v1/state"),
+      fetchJson("/api/v1/workflow")
     ]);
 
     if (runtimeResult.status !== "fulfilled") {
@@ -98,6 +128,23 @@ async function loadDashboard({ queueRefresh = false } = {}) {
     state.runtime = runtimeResult.value;
     state.snapshot = stateResult.value;
     state.lastLoadedAt = new Date().toISOString();
+
+    if (workflowResult?.status === "fulfilled") {
+      state.workflowDocument = workflowResult.value;
+      if (!state.workflowDirty || !state.workflowDraft) {
+        state.workflowDraft = cloneValue(workflowResult.value);
+      }
+
+      if (!state.workflowDirty) {
+        state.workflowError = null;
+      }
+    } else if (!state.workflowDirty) {
+      state.workflowDocument = null;
+      state.workflowDraft = null;
+      state.workflowError = workflowResult?.reason instanceof Error
+        ? workflowResult.reason.message
+        : "Workflow editor could not be loaded.";
+    }
 
     const preferredIssue = getIssueFromHash() || state.selectedIssue || collectIssueIdentifiers(state.snapshot)[0] || null;
     if (preferredIssue) {
@@ -140,6 +187,9 @@ function render() {
   updateDocumentTitle();
   elements.heroPanel.innerHTML = renderHeroPanel();
   elements.alert.innerHTML = renderAlert();
+  if (!state.workflowDirty || state.workflowSaving || state.workflowError || !elements.workflowEditor.innerHTML) {
+    elements.workflowEditor.innerHTML = renderWorkflowEditor();
+  }
   elements.metricGrid.innerHTML = renderMetricCards();
   elements.liveRuns.innerHTML = renderLiveRuns();
   elements.issueDistribution.innerHTML = renderIssueDistribution();
@@ -240,6 +290,98 @@ function renderAlert() {
         <div>
           <div class="font-medium">Dashboard refresh failed</div>
           <div class="mt-1 text-rose-100/80">${escapeHtml(state.error)}</div>
+        </div>
+      </div>
+    </div>`;
+}
+
+function renderWorkflowEditor() {
+  const draft = state.workflowDraft;
+  const validationError = draft?.validationError;
+  const statusLabel = state.workflowSaving
+    ? "Saving"
+    : state.workflowDirty
+      ? "Unsaved edits"
+      : "In sync";
+
+  if (!draft) {
+    return `
+      <div class="panel-body p-6 sm:p-8">
+        <div class="section-kicker">Workflow editor</div>
+        <h2 class="section-title">WORKFLOW.md</h2>
+        <div class="mt-6">
+          ${renderEmptyState("Workflow editor unavailable.", state.workflowError || "The workflow document could not be loaded.")}
+        </div>
+      </div>`;
+  }
+
+  return `
+    <div class="panel-body p-6 sm:p-8">
+      <div class="flex flex-wrap items-start justify-between gap-4">
+        <div>
+          <div class="section-kicker">Workflow editor</div>
+          <h2 class="section-title">WORKFLOW.md</h2>
+          <p class="mt-3 max-w-3xl text-sm leading-6 text-slate-300">
+            Edit the YAML front matter and prompt template that define Symphony's repository workflow. Saving writes back to WORKFLOW.md and the host reloads the updated workflow on the next access.
+          </p>
+        </div>
+        <div class="workflow-actions">
+          <span class="glass-badge">${escapeHtml(statusLabel)}</span>
+          <button
+            type="button"
+            data-action="reload-workflow"
+            class="workflow-button"
+            ${state.workflowSaving ? "disabled" : ""}>
+            Reload file
+          </button>
+          <button
+            type="button"
+            data-action="save-workflow"
+            class="workflow-button workflow-button-primary"
+            ${state.workflowSaving ? "disabled" : ""}>
+            ${escapeHtml(state.workflowSaving ? "Saving..." : "Save WORKFLOW.md")}
+          </button>
+        </div>
+      </div>
+
+      ${state.workflowNotice ? `<div class="workflow-banner workflow-banner-success mt-6">${escapeHtml(state.workflowNotice)}</div>` : ""}
+      ${state.workflowError ? `<div class="workflow-banner workflow-banner-error mt-6">${escapeHtml(state.workflowError)}</div>` : ""}
+      ${validationError ? `<div class="workflow-banner workflow-banner-warning mt-6">Current file validation: ${escapeHtml(validationError.message)}</div>` : ""}
+      ${draft.hasMaskedTrackerApiKey ? `<div class="workflow-banner workflow-banner-info mt-6">Inline tracker.api_key is masked as ${escapeHtml(draft.trackerApiKeyPlaceholder)}. Leave that placeholder unchanged to keep the current secret, or replace it with a new literal or $ENV_VAR reference.</div>` : ""}
+
+      <div class="mt-6 grid gap-6 xl:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
+        <label class="workflow-field">
+          <span class="workflow-label">Workflow YAML front matter</span>
+          <span class="workflow-help">Edit the YAML only. Symphony adds the surrounding --- delimiters when it saves.</span>
+          <textarea
+            data-workflow-field="frontMatterText"
+            class="workflow-textarea workflow-textarea-code"
+            spellcheck="false"
+            rows="22">${escapeHtml(draft.frontMatterText || "")}</textarea>
+        </label>
+
+        <label class="workflow-field">
+          <span class="workflow-label">Prompt template</span>
+          <span class="workflow-help">This markdown body is passed to the Codex worker for each issue run.</span>
+          <textarea
+            data-workflow-field="promptTemplate"
+            class="workflow-textarea"
+            rows="22">${escapeHtml(draft.promptTemplate || "")}</textarea>
+        </label>
+      </div>
+
+      <div class="mt-6 grid gap-4 lg:grid-cols-3">
+        <div class="rounded-3xl border border-white/10 bg-white/[0.035] p-4">
+          <div class="text-xs uppercase tracking-[0.22em] text-slate-400">Workflow file</div>
+          <div class="mt-2 break-all text-sm text-slate-200">${escapeHtml(draft.sourcePath || "Unavailable")}</div>
+        </div>
+        <div class="rounded-3xl border border-white/10 bg-white/[0.035] p-4">
+          <div class="text-xs uppercase tracking-[0.22em] text-slate-400">Last valid load</div>
+          <div class="mt-2 text-sm text-slate-200">${escapeHtml(draft.loadedAtUtc ? formatRelativeTime(draft.loadedAtUtc) : "Validation pending")}</div>
+        </div>
+        <div class="rounded-3xl border border-white/10 bg-white/[0.035] p-4">
+          <div class="text-xs uppercase tracking-[0.22em] text-slate-400">Editor behavior</div>
+          <div class="mt-2 text-sm leading-6 text-slate-300">Auto-refresh leaves this panel alone while you have unsaved edits, so the rest of the dashboard can continue updating without clobbering your draft.</div>
         </div>
       </div>
     </div>`;
@@ -629,13 +771,23 @@ function getIssueFromHash() {
   return hash.startsWith("#issue/") ? decodeURIComponent(hash.slice(7)) : null;
 }
 
-async function fetchJson(url) {
-  const response = await fetch(url, { cache: "no-store" });
+async function fetchJson(url, options = {}) {
+  const response = await fetch(url, { cache: "no-store", ...options });
+  const contentType = response.headers.get("content-type") || "";
+  const payload = response.status === 204
+    ? null
+    : contentType.includes("application/json")
+      ? await response.json()
+      : await response.text();
+
   if (!response.ok) {
-    throw new Error(`Request to ${url} failed with ${response.status}.`);
+    const errorMessage = payload && typeof payload === "object"
+      ? payload.error?.message || payload.title
+      : null;
+    throw new Error(errorMessage || `Request to ${url} failed with ${response.status}.`);
   }
 
-  return response.json();
+  return payload;
 }
 
 async function fetchHealth() {
@@ -755,6 +907,68 @@ function formatRetryCountdown(value) {
   const diffSeconds = getRelativeDiffSeconds(value);
   if (diffSeconds === null) return "unavailable";
   return formatRelativeDiff(Math.max(diffSeconds, 0));
+}
+
+async function reloadWorkflowEditor() {
+  if (state.workflowSaving) {
+    return;
+  }
+
+  try {
+    state.workflowError = null;
+    state.workflowNotice = null;
+    const [workflowDocument, runtime] = await Promise.all([
+      fetchJson("/api/v1/workflow"),
+      fetchJson("/api/v1/runtime")
+    ]);
+    state.workflowDocument = workflowDocument;
+    state.workflowDraft = cloneValue(workflowDocument);
+    state.workflowDirty = false;
+    state.runtime = runtime;
+  } catch (error) {
+    state.workflowError = error instanceof Error ? error.message : "Workflow editor could not be reloaded.";
+  }
+
+  render();
+}
+
+async function saveWorkflowEditor() {
+  if (!state.workflowDraft || state.workflowSaving) {
+    return;
+  }
+
+  state.workflowSaving = true;
+  state.workflowError = null;
+  state.workflowNotice = null;
+  render();
+
+  try {
+    const savedWorkflow = await fetchJson("/api/v1/workflow", {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(state.workflowDraft)
+    });
+
+    state.workflowDocument = savedWorkflow;
+    state.workflowDraft = cloneValue(savedWorkflow);
+    state.workflowDirty = false;
+    state.runtime = await fetchJson("/api/v1/runtime");
+    state.lastLoadedAt = new Date().toISOString();
+    state.workflowNotice = "WORKFLOW.md saved successfully. Updated runtime settings are now live on the next workflow access.";
+  } catch (error) {
+    state.workflowError = error instanceof Error ? error.message : "WORKFLOW.md could not be saved.";
+  } finally {
+    state.workflowSaving = false;
+    render();
+  }
+}
+
+function cloneValue(value) {
+  return value === null || value === undefined
+    ? value
+    : JSON.parse(JSON.stringify(value));
 }
 
 function escapeHtml(value) {

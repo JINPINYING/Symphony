@@ -336,6 +336,37 @@ internal static class SymphonyHostApplication
             });
         });
 
+        app.MapGet("/api/v1/workflow", async (
+            WorkflowEditorService workflowEditorService,
+            CancellationToken cancellationToken) =>
+        {
+            var payload = await workflowEditorService.GetCurrentAsync(cancellationToken);
+            return Results.Ok(payload);
+        });
+
+        app.MapPut("/api/v1/workflow", async (
+            WorkflowEditorDocument document,
+            WorkflowEditorService workflowEditorService,
+            CancellationToken cancellationToken) =>
+        {
+            try
+            {
+                var payload = await workflowEditorService.SaveAsync(document, cancellationToken);
+                return Results.Ok(payload);
+            }
+            catch (WorkflowLoadException ex)
+            {
+                return Results.BadRequest(new
+                {
+                    error = new
+                    {
+                        code = ex.Code,
+                        message = ex.Message
+                    }
+                });
+            }
+        });
+
         app.MapGet("/api/v1/state", async (
             RuntimeStateService runtimeStateService,
             CancellationToken cancellationToken) =>

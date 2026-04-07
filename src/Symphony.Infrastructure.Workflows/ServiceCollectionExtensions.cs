@@ -13,6 +13,7 @@ public static class ServiceCollectionExtensions
             .Bind(configuration.GetSection(WorkflowLoaderOptions.SectionName));
 
         services.AddSingleton<WorkflowLoader>();
+        services.AddSingleton<WorkflowEditorService>();
         services.AddSingleton<IWorkflowDefinitionProvider, WorkflowDefinitionProvider>();
         services.AddSingleton<IWorkflowPromptRenderer, WorkflowPromptRenderer>();
 

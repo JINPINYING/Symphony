@@ -86,6 +86,59 @@
     @apply inline-flex items-center rounded-full border border-white/10 bg-white/5 px-2.5 py-1 text-xs font-medium uppercase tracking-[0.2em] text-slate-200;
   }
 
+  .workflow-actions {
+    @apply flex flex-wrap items-center gap-3;
+  }
+
+  .workflow-button {
+    @apply inline-flex items-center rounded-full border border-white/10 bg-white/5 px-4 py-2 text-sm font-medium text-slate-100 transition hover:border-cyan-200/30 hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-60;
+  }
+
+  .workflow-button-primary {
+    @apply border-cyan-300/25 bg-cyan-300/10 text-cyan-100 hover:border-cyan-200/40 hover:bg-cyan-300/15;
+  }
+
+  .workflow-field {
+    @apply flex min-w-0 flex-col;
+  }
+
+  .workflow-label {
+    @apply text-sm font-medium text-white;
+  }
+
+  .workflow-help {
+    @apply mt-2 text-sm leading-6 text-slate-400;
+  }
+
+  .workflow-textarea {
+    @apply mt-4 min-h-[24rem] w-full rounded-[28px] border border-white/10 bg-slate-950/70 px-4 py-4 text-sm leading-6 text-slate-100 shadow-inner outline-none transition placeholder:text-slate-500 focus:border-cyan-200/40 focus:ring-2 focus:ring-cyan-300/20;
+    resize: vertical;
+  }
+
+  .workflow-textarea-code {
+    font-family: Consolas, "SFMono-Regular", ui-monospace, monospace;
+  }
+
+  .workflow-banner {
+    @apply rounded-3xl border px-5 py-4 text-sm leading-6;
+  }
+
+  .workflow-banner-info {
+    @apply border-cyan-400/25 bg-cyan-400/10 text-cyan-50;
+  }
+
+  .workflow-banner-success {
+    @apply border-emerald-400/25 bg-emerald-400/10 text-emerald-50;
+  }
+
+  .workflow-banner-warning {
+    @apply border-amber-400/25 bg-amber-400/10 text-amber-50;
+  }
+
+  .workflow-banner-error {
+    @apply border-rose-400/25 bg-rose-500/10 text-rose-50;
+  }
+
   .dashboard-shell {
     @apply w-full px-4 py-6 sm:px-6 lg:px-8;
   }
