@@ -204,6 +204,41 @@ public sealed class CodexCliPreflightEvaluatorTests
     }
 
     [Fact]
+    public async Task CheckAsync_ShouldSurfaceInvalidAuthJsonAsBlockingIssue()
+    {
+        var codexHome = CreateTempDirectory("codex-home");
+
+        try
+        {
+            await File.WriteAllTextAsync(
+                Path.Combine(codexHome, "auth.json"),
+                "{ this is not valid json");
+
+            var result = await CodexCliPreflightEvaluator.CheckAsync(
+                CreateRunner(new Dictionary<string, CodexCliCommandResult>(StringComparer.Ordinal)
+                {
+                    ["codex --version"] = new(0, "codex-cli 0.114.0", string.Empty),
+                    ["npm view @openai/codex version"] = new(0, "0.114.0", string.Empty)
+                }),
+                codexHome,
+                TimeSpan.FromSeconds(1),
+                CancellationToken.None);
+
+            Assert.False(result.IsReadyToStart);
+            Assert.Contains(
+                result.BlockingIssues,
+                issue => issue.Contains("not valid JSON", StringComparison.OrdinalIgnoreCase));
+            Assert.DoesNotContain(
+                result.Warnings,
+                warning => warning.Contains("not valid JSON", StringComparison.OrdinalIgnoreCase));
+        }
+        finally
+        {
+            TryDeleteDirectory(codexHome);
+        }
+    }
+
+    [Fact]
     public async Task CheckAsync_ShouldPropagateCallerCancellation()
     {
         using var cancellationTokenSource = new CancellationTokenSource();

@@ -39,10 +39,7 @@ internal static class CodexCliPreflightEvaluator
         var authenticationMode = authInspection.Mode;
         CodexCliVersion installedVersion = default;
 
-        if (!string.IsNullOrWhiteSpace(authInspection.Warning))
-        {
-            warnings.Add(authInspection.Warning);
-        }
+        string? authenticationBlockingIssue = null;
 
         var installedVersionResult = await SafeRunAsync(
             runCommandAsync,
@@ -107,13 +104,22 @@ internal static class CodexCliPreflightEvaluator
 
         if (!authenticationConfigured)
         {
-            blockingIssues.Add(
-                hasAuthJson
-                    ? $"Codex auth file '{authJsonPath}' does not contain a usable authentication record."
-                    : $"Codex auth file is missing: '{authJsonPath}'.");
+            authenticationBlockingIssue = !hasAuthJson
+                ? $"Codex auth file is missing: '{authJsonPath}'."
+                : !string.IsNullOrWhiteSpace(authInspection.Warning)
+                    ? authInspection.Warning
+                    : $"Codex auth file '{authJsonPath}' does not contain a usable authentication record.";
+
+            blockingIssues.Add(authenticationBlockingIssue);
             AddUnique(
                 remediationSteps,
                 "Run `codex login` in another terminal or configure Codex API-key auth, then return here.");
+        }
+
+        if (!string.IsNullOrWhiteSpace(authInspection.Warning) &&
+            !string.Equals(authenticationBlockingIssue, authInspection.Warning, StringComparison.Ordinal))
+        {
+            warnings.Add(authInspection.Warning);
         }
 
         if (!hasAuthJson)
@@ -262,6 +268,14 @@ internal static class CodexCliPreflightEvaluator
                 "Codex auth file exists but is not valid JSON.");
         }
         catch (IOException)
+        {
+            return new CodexCliAuthInspection(
+                true,
+                false,
+                null,
+                "Codex auth file exists but could not be read.");
+        }
+        catch (UnauthorizedAccessException)
         {
             return new CodexCliAuthInspection(
                 true,
