@@ -269,8 +269,10 @@ public sealed class ApiSmokeTests
             Assert.NotNull(content);
             var htmlContent = content!;
             Assert.Contains("Symphony Control Room", htmlContent, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("dashboard-shell", htmlContent, StringComparison.OrdinalIgnoreCase);
             Assert.Contains("dashboard-rail", htmlContent, StringComparison.OrdinalIgnoreCase);
             Assert.Contains("xl:items-start", htmlContent, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("max-w-7xl", htmlContent, StringComparison.OrdinalIgnoreCase);
 
             var issueDetailElementMatch = System.Text.RegularExpressions.Regex.Match(
                 htmlContent,
@@ -328,7 +330,9 @@ public sealed class ApiSmokeTests
             Assert.True(exitCode == 0, stderr.ToString());
             Assert.NotNull(content);
             var cssContent = content!;
+            Assert.Contains(".dashboard-shell", cssContent, StringComparison.OrdinalIgnoreCase);
             Assert.Contains(".dashboard-rail", cssContent, StringComparison.OrdinalIgnoreCase);
+            Assert.Matches(@"(?i)\.dashboard-shell\s*\{[^}]*width\s*:\s*100%", cssContent);
             Assert.Matches(@"(?i)overflow-y\s*:\s*auto", cssContent);
             Assert.Matches(@"(?i)max-height\s*:\s*calc\(100vh\s*-\s*3rem\)", cssContent);
         }

@@ -104,6 +104,7 @@ The state and issue endpoints are derived from persisted orchestrator state in S
 Dashboard and `/api/v1/state` token totals are derived from absolute Codex usage snapshots such as `thread/tokenUsage/updated` and `total_token_usage`. Delta-only payloads like `last_token_usage` are ignored to avoid double-counting, so totals only advance when Codex emits a new absolute snapshot.
 For human-readable dashboard surfaces, fallback-only `other_message` protocol entries are suppressed when Codex did not emit a useful message; the durable SQLite event log remains available for deeper debugging.
 On large desktop layouts, the right-hand issue detail rail stays pinned and scrolls independently so long issue detail content does not hide instance health or rate-limit cards.
+The dashboard shell uses the full viewport width on large screens instead of staying capped inside a centered content column.
 
 ## Codex Session Behavior
 
