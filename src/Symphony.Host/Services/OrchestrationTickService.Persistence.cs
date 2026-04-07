@@ -134,6 +134,85 @@ public sealed partial class OrchestrationTickService
         await dbContext.SaveChangesAsync(cancellationToken);
     }
 
+    private async Task RefreshTrackedIssueCacheStatesAsync(
+        WorkflowDefinition workflowDefinition,
+        string apiKey,
+        CancellationToken cancellationToken)
+    {
+        var cachedIssues = await dbContext.IssueCache.ToListAsync(cancellationToken);
+        if (cachedIssues.Count == 0)
+        {
+            return;
+        }
+
+        var refreshedStates = await TryFetchIssueStatesByIdsAsync(
+            workflowDefinition,
+            apiKey,
+            cachedIssues.Select(issue => issue.IssueId).ToList(),
+            "Tracked issue cache state refresh failed; dashboard issue-state summaries may be stale.",
+            cancellationToken);
+        if (refreshedStates is null)
+        {
+            return;
+        }
+
+        var refreshedById = refreshedStates.ToDictionary(state => state.Id, StringComparer.OrdinalIgnoreCase);
+        var hasChanges = false;
+        var refreshedAtUtc = timeProvider.GetUtcNow();
+
+        foreach (var cachedIssue in cachedIssues)
+        {
+            if (!refreshedById.TryGetValue(cachedIssue.IssueId, out var refreshedState))
+            {
+                continue;
+            }
+
+            if (string.Equals(cachedIssue.State, refreshedState.State, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            cachedIssue.State = refreshedState.State;
+            cachedIssue.CachedAtUtc = refreshedAtUtc;
+            hasChanges = true;
+        }
+
+        if (hasChanges)
+        {
+            await dbContext.SaveChangesAsync(cancellationToken);
+        }
+    }
+
+    private async Task<IReadOnlyList<IssueStateSnapshot>?> TryFetchIssueStatesByIdsAsync(
+        WorkflowDefinition workflowDefinition,
+        string apiKey,
+        IReadOnlyList<string> issueIds,
+        string failureMessage,
+        CancellationToken cancellationToken)
+    {
+        if (issueIds.Count == 0)
+        {
+            return [];
+        }
+
+        try
+        {
+            return await trackerClient.FetchIssueStatesByIdsAsync(
+                BuildTrackerQuery(workflowDefinition, apiKey),
+                issueIds,
+                cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "{FailureMessage}", failureMessage);
+            return null;
+        }
+    }
+
     private async Task UpdateWorkspaceCleanupRecordAsync(
         NormalizedIssue issue,
         string reason,
