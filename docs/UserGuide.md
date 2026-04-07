@@ -81,7 +81,7 @@ Important settings:
 - `hooks.*`: lifecycle hooks and timeout
 - `server.port`: optional HTTP bind override
 
-The dashboard includes a workflow editor for `WORKFLOW.md`, so operators can edit the YAML front matter and prompt template in the browser and save them back to disk without restarting the host. If `tracker.api_key` is an inline literal instead of an `$ENV_VAR` reference, the editor masks it with a placeholder and preserves the existing value unless you replace it explicitly.
+The dashboard includes a workflow editor for `WORKFLOW.md`, so operators can edit the YAML front matter and prompt template in the browser and save them back to disk without restarting the host. The editor starts minimized by default and can be expanded or minimized from the panel header. If `tracker.api_key` is an inline literal instead of an `$ENV_VAR` reference, the editor masks it with a placeholder and preserves the existing value unless you replace it explicitly.
 
 `tracker.api_key` supports `$ENV_VAR` indirection. Symphony validates that required secrets exist without logging their values.
 

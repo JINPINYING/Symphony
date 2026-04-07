@@ -455,10 +455,52 @@ public sealed class ApiSmokeTests
             Assert.Contains("/api/v1/workflow", javascriptContent, StringComparison.Ordinal);
             Assert.Contains("data-action='save-workflow'", javascriptContent, StringComparison.Ordinal);
             Assert.Contains("data-action='reload-workflow'", javascriptContent, StringComparison.Ordinal);
+            Assert.Contains("data-action='toggle-workflow-editor'", javascriptContent, StringComparison.Ordinal);
             Assert.Contains("data-workflow-field=\"frontMatterText\"", javascriptContent, StringComparison.Ordinal);
             Assert.Contains("data-workflow-field=\"promptTemplate\"", javascriptContent, StringComparison.Ordinal);
+            Assert.Matches(@"workflowEditorExpanded\s*:\s*false", javascriptContent);
             Assert.Contains("function syncWorkflowEditorChrome()", javascriptContent, StringComparison.Ordinal);
+            Assert.Contains("function renderWorkflowEditorSection", javascriptContent, StringComparison.Ordinal);
             Assert.Contains("data-workflow-status", javascriptContent, StringComparison.Ordinal);
+            Assert.Contains("Expand editor", javascriptContent, StringComparison.Ordinal);
+            Assert.Contains("Minimize editor", javascriptContent, StringComparison.Ordinal);
+        }
+        finally
+        {
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            TryDeleteFile(dbPath);
+            TryDeleteFile(workflowPath);
+        }
+    }
+
+    [Fact]
+    public async Task DashboardCssAsset_ShouldIncludeWorkflowEditorSummaryCardStyles()
+    {
+        var workflowPath = CreateValidWorkflowPath();
+        var dbPath = Path.Combine(Path.GetTempPath(), $"symphony-int-{Guid.NewGuid():N}.db");
+        var stderr = new StringWriter();
+        string? content = null;
+
+        try
+        {
+            var exitCode = await SymphonyHostApplication.RunCliAsync(
+                [workflowPath],
+                stderr,
+                configureBuilder: builder => ConfigureTestServer(builder, dbPath),
+                configureServices: services => RegisterFakeTracker(services),
+                runApplicationAsync: async (app, cancellationToken) =>
+                {
+                    await app.StartAsync(cancellationToken);
+                    using var client = app.GetTestClient();
+                    content = await client.GetStringAsync("/assets/dashboard.css", cancellationToken);
+                    await app.StopAsync(cancellationToken);
+                });
+
+            Assert.True(exitCode == 0, stderr.ToString());
+            Assert.NotNull(content);
+            var cssContent = content!;
+            Assert.Contains(".workflow-summary-card", cssContent, StringComparison.OrdinalIgnoreCase);
+            Assert.Matches(@"(?i)\.workflow-summary-card\s*\{[^}]*border", cssContent);
         }
         finally
         {
