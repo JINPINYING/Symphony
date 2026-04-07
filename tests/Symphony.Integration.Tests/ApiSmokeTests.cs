@@ -269,8 +269,10 @@ public sealed class ApiSmokeTests
             Assert.NotNull(content);
             var htmlContent = content!;
             Assert.Contains("Symphony Control Room", htmlContent, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("dashboard-shell", htmlContent, StringComparison.OrdinalIgnoreCase);
             Assert.Contains("dashboard-rail", htmlContent, StringComparison.OrdinalIgnoreCase);
             Assert.Contains("xl:items-start", htmlContent, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("max-w-7xl", htmlContent, StringComparison.OrdinalIgnoreCase);
 
             var issueDetailElementMatch = System.Text.RegularExpressions.Regex.Match(
                 htmlContent,
@@ -293,6 +295,43 @@ public sealed class ApiSmokeTests
             Assert.Contains(issueDetailClasses, className => string.Equals(className, "panel", StringComparison.OrdinalIgnoreCase));
             Assert.DoesNotContain(issueDetailClasses, className => string.Equals(className, "xl:sticky", StringComparison.OrdinalIgnoreCase));
             Assert.DoesNotContain(issueDetailClasses, className => string.Equals(className, "xl:top-6", StringComparison.OrdinalIgnoreCase));
+        }
+        finally
+        {
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            TryDeleteFile(dbPath);
+            TryDeleteFile(workflowPath);
+        }
+    }
+
+    [Fact]
+    public async Task DashboardCssAsset_ShouldIncludeFullWidthShellStyles()
+    {
+        var workflowPath = CreateValidWorkflowPath();
+        var dbPath = Path.Combine(Path.GetTempPath(), $"symphony-int-{Guid.NewGuid():N}.db");
+        var stderr = new StringWriter();
+        string? content = null;
+
+        try
+        {
+            var exitCode = await SymphonyHostApplication.RunCliAsync(
+                [workflowPath],
+                stderr,
+                configureBuilder: builder => ConfigureTestServer(builder, dbPath),
+                configureServices: services => RegisterFakeTracker(services),
+                runApplicationAsync: async (app, cancellationToken) =>
+                {
+                    await app.StartAsync(cancellationToken);
+                    using var client = app.GetTestClient();
+                    content = await client.GetStringAsync("/assets/dashboard.css", cancellationToken);
+                    await app.StopAsync(cancellationToken);
+                });
+
+            Assert.True(exitCode == 0, stderr.ToString());
+            Assert.NotNull(content);
+            var cssContent = content!;
+            Assert.Contains(".dashboard-shell", cssContent, StringComparison.OrdinalIgnoreCase);
+            Assert.Matches(@"(?i)\.dashboard-shell\s*\{[^}]*width\s*:\s*100%", cssContent);
         }
         finally
         {
