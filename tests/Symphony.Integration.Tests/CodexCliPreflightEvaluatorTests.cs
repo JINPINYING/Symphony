@@ -192,8 +192,8 @@ public sealed class CodexCliPreflightEvaluatorTests
             Assert.False(result.IsReadyToStart);
             Assert.Contains(
                 result.BlockingIssues,
-                issue => issue.Contains("usable authentication record", StringComparison.OrdinalIgnoreCase));
-            Assert.Contains(
+                warning => warning.Contains("reusable login token set or API key", StringComparison.OrdinalIgnoreCase));
+            Assert.DoesNotContain(
                 result.Warnings,
                 warning => warning.Contains("reusable login token set or API key", StringComparison.OrdinalIgnoreCase));
         }
