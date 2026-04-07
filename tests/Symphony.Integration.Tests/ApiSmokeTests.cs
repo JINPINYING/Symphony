@@ -406,13 +406,13 @@ public sealed class ApiSmokeTests
             Assert.NotNull(content);
 
             var javascriptContent = content!;
-            Assert.Contains("function formatRetryCountdown", javascriptContent, StringComparison.Ordinal);
-            Assert.Contains("Math.max(diffSeconds, 0)", javascriptContent, StringComparison.Ordinal);
-            Assert.Contains("Next retry ${formatRetryCountdown(snapshot.retrying[0].due_at)}", javascriptContent, StringComparison.Ordinal);
-            Assert.Contains("Next retry ${formatRetryCountdown(retry.due_at)}", javascriptContent, StringComparison.Ordinal);
-            Assert.Contains("${escapeHtml(formatRetryCountdown(retry.due_at))}", javascriptContent, StringComparison.Ordinal);
-            Assert.DoesNotContain("formatRelativeTime(snapshot.retrying[0].due_at)", javascriptContent, StringComparison.Ordinal);
-            Assert.DoesNotContain("formatRelativeTime(retry.due_at)", javascriptContent, StringComparison.Ordinal);
+            Assert.Matches(@"function\s+formatRetryCountdown\b", javascriptContent);
+            Assert.Matches(@"Math\.max\(\s*diffSeconds\s*,\s*0\s*\)", javascriptContent);
+            Assert.Matches(@"Next retry \$\{formatRetryCountdown\(\s*snapshot\.retrying\[0\]\.due_at\s*\)\}", javascriptContent);
+            Assert.Matches(@"Next retry \$\{formatRetryCountdown\(\s*retry\.due_at\s*\)\}", javascriptContent);
+            Assert.Matches(@"\$\{escapeHtml\(formatRetryCountdown\(\s*retry\.due_at\s*\)\)\}", javascriptContent);
+            Assert.DoesNotMatch(@"formatRelativeTime\(\s*snapshot\.retrying\[0\]\.due_at\s*\)", javascriptContent);
+            Assert.DoesNotMatch(@"formatRelativeTime\(\s*retry\.due_at\s*\)", javascriptContent);
         }
         finally
         {
