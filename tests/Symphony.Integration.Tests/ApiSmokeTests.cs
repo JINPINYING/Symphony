@@ -458,7 +458,7 @@ public sealed class ApiSmokeTests
             Assert.Contains("data-action='toggle-workflow-editor'", javascriptContent, StringComparison.Ordinal);
             Assert.Contains("data-workflow-field=\"frontMatterText\"", javascriptContent, StringComparison.Ordinal);
             Assert.Contains("data-workflow-field=\"promptTemplate\"", javascriptContent, StringComparison.Ordinal);
-            Assert.Contains("workflowEditorExpanded: false", javascriptContent, StringComparison.Ordinal);
+            Assert.Matches(@"workflowEditorExpanded\s*:\s*false", javascriptContent);
             Assert.Contains("function syncWorkflowEditorChrome()", javascriptContent, StringComparison.Ordinal);
             Assert.Contains("function renderWorkflowEditorSection", javascriptContent, StringComparison.Ordinal);
             Assert.Contains("data-workflow-status", javascriptContent, StringComparison.Ordinal);
