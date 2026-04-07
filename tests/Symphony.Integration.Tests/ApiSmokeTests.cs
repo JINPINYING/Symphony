@@ -201,6 +201,60 @@ public sealed class ApiSmokeTests
     }
 
     [Fact]
+    public async Task StateEndpoint_ShouldReturnTrackedIssueDistributionIncludingClosedIssues()
+    {
+        var workflowPath = CreateValidWorkflowPath();
+        var dbPath = Path.Combine(Path.GetTempPath(), $"symphony-int-{Guid.NewGuid():N}.db");
+        var stderr = new StringWriter();
+        string? content = null;
+
+        try
+        {
+            await SeedTrackedIssueCacheAsync(
+                dbPath,
+                ("issue-1", "MT-651", "Close stale worktree", "Closed"),
+                ("issue-2", "MT-652", "Keep polling active items", "Open"),
+                ("issue-3", "MT-653", "Archive completed lease rows", "Closed"));
+
+            var exitCode = await SymphonyHostApplication.RunCliAsync(
+                [workflowPath],
+                stderr,
+                configureBuilder: builder => ConfigureTestServer(builder, dbPath),
+                configureServices: services => RegisterFakeTracker(services),
+                runApplicationAsync: async (app, cancellationToken) =>
+                {
+                    await app.StartAsync(cancellationToken);
+                    using var client = app.GetTestClient();
+                    content = await client.GetStringAsync("/api/v1/state", cancellationToken);
+                    await app.StopAsync(cancellationToken);
+                });
+
+            Assert.True(exitCode == 0, stderr.ToString());
+            Assert.NotNull(content);
+
+            using var document = JsonDocument.Parse(content!);
+            var groupsByState = document.RootElement
+                .GetProperty("tracked")
+                .GetProperty("by_state")
+                .EnumerateArray()
+                .ToDictionary(
+                    group => group.GetProperty("state").GetString() ?? string.Empty,
+                    group => group.GetProperty("count").GetInt32(),
+                    StringComparer.OrdinalIgnoreCase);
+
+            Assert.Equal(3, document.RootElement.GetProperty("counts").GetProperty("tracked").GetInt32());
+            Assert.Equal(2, groupsByState["Closed"]);
+            Assert.Equal(1, groupsByState["Open"]);
+        }
+        finally
+        {
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            TryDeleteFile(dbPath);
+            TryDeleteFile(workflowPath);
+        }
+    }
+
+    [Fact]
     public async Task RefreshEndpoint_ShouldQueueBestEffortPoll()
     {
         var workflowPath = CreateValidWorkflowPath();
@@ -416,6 +470,45 @@ public sealed class ApiSmokeTests
             Assert.Matches(@"\$\{escapeHtml\(formatRetryCountdown\(\s*retry\.due_at\s*\)\)\}", javascriptContent);
             Assert.DoesNotMatch(@"formatRelativeTime\(\s*snapshot\.retrying\[0\]\.due_at\s*\)", javascriptContent);
             Assert.DoesNotMatch(@"formatRelativeTime\(\s*retry\.due_at\s*\)", javascriptContent);
+        }
+        finally
+        {
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            TryDeleteFile(dbPath);
+            TryDeleteFile(workflowPath);
+        }
+    }
+
+    [Fact]
+    public async Task DashboardJavaScriptAsset_ShouldRenderTrackedIssueStateLabelsFromCache()
+    {
+        var workflowPath = CreateValidWorkflowPath();
+        var dbPath = Path.Combine(Path.GetTempPath(), $"symphony-int-{Guid.NewGuid():N}.db");
+        var stderr = new StringWriter();
+        string? content = null;
+
+        try
+        {
+            var exitCode = await SymphonyHostApplication.RunCliAsync(
+                [workflowPath],
+                stderr,
+                configureBuilder: builder => ConfigureTestServer(builder, dbPath),
+                configureServices: services => RegisterFakeTracker(services),
+                runApplicationAsync: async (app, cancellationToken) =>
+                {
+                    await app.StartAsync(cancellationToken);
+                    using var client = app.GetTestClient();
+                    content = await client.GetStringAsync("/assets/dashboard.js", cancellationToken);
+                    await app.StopAsync(cancellationToken);
+                });
+
+            Assert.True(exitCode == 0, stderr.ToString());
+            Assert.NotNull(content);
+
+            var javascriptContent = content!;
+            Assert.Matches(@"const\s+trackedState\s*=\s*issue\.state\s*\|\|\s*""Unknown state"";", javascriptContent);
+            Assert.Matches(@"<div class=""shrink-0 self-center text-xs uppercase tracking-\[0\.22em\] text-slate-400"">\$\{escapeHtml\(trackedState\)\}</div>", javascriptContent);
+            Assert.DoesNotContain("text-slate-400\">Open</div>", javascriptContent, StringComparison.Ordinal);
         }
         finally
         {
@@ -1052,6 +1145,37 @@ public sealed class ApiSmokeTests
             UpdatedAtUtc = now,
             ExpiresAtUtc = now.AddMinutes(10)
         });
+
+        await dbContext.SaveChangesAsync();
+    }
+
+    private static async Task SeedTrackedIssueCacheAsync(
+        string dbPath,
+        params (string IssueId, string IssueIdentifier, string Title, string State)[] issues)
+    {
+        var options = new DbContextOptionsBuilder<SymphonyDbContext>()
+            .UseSqlite($"Data Source={dbPath};Cache=Shared;Mode=ReadWriteCreate")
+            .Options;
+
+        await using var dbContext = new SymphonyDbContext(options);
+        await dbContext.Database.MigrateAsync();
+        var now = DateTimeOffset.UtcNow;
+
+        foreach (var issue in issues)
+        {
+            dbContext.IssueCache.Add(new IssueCacheEntity
+            {
+                IssueId = issue.IssueId,
+                Identifier = issue.IssueIdentifier,
+                Title = issue.Title,
+                State = issue.State,
+                LabelsJson = "[]",
+                PullRequestsJson = "[]",
+                BlockedByJson = "[]",
+                CachedAtUtc = now,
+                UpdatedAtUtc = now
+            });
+        }
 
         await dbContext.SaveChangesAsync();
     }

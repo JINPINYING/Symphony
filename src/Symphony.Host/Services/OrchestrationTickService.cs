@@ -126,6 +126,10 @@ public sealed partial class OrchestrationTickService
         {
             await RecoverOrphanedStateAsync(instanceId, workflowDefinition, cancellationToken);
             await ReconcileRunningIssuesAsync(workflowDefinition, apiKey, preflightError, instanceId, cancellationToken);
+            if (preflightError is null && !string.IsNullOrWhiteSpace(apiKey))
+            {
+                await RefreshTrackedIssueCacheStatesAsync(workflowDefinition, apiKey, cancellationToken);
+            }
 
             if (preflightError is not null || string.IsNullOrWhiteSpace(apiKey))
             {

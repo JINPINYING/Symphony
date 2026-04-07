@@ -114,6 +114,25 @@ public sealed class OrchestrationTickServiceTests
     }
 
     [Fact]
+    public async Task RunTickAsync_ShouldRefreshTrackedIssueCacheStateForClosedIssues()
+    {
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: new FakeTrackerClient([], issueStatesById: new Dictionary<string, string>
+            {
+                ["issue-1"] = "Closed"
+            }),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await harness.InsertIssueCacheAsync("issue-1", "#1", "Open");
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var cachedIssue = await harness.DbContext.IssueCache.SingleAsync();
+        Assert.Equal("Closed", cachedIssue.State);
+    }
+
+    [Fact]
     public async Task RunTickAsync_ShouldStopNonActiveRunsWithoutCleanup()
     {
         await using var harness = await TestHarness.CreateAsync(
@@ -366,6 +385,25 @@ public sealed class OrchestrationTickServiceTests
                 AcquiredAtUtc = expiresAtUtc.AddMinutes(-5),
                 ExpiresAtUtc = expiresAtUtc,
                 UpdatedAtUtc = expiresAtUtc.AddMinutes(-1)
+            });
+
+            await DbContext.SaveChangesAsync();
+        }
+
+        public async Task InsertIssueCacheAsync(string issueId, string identifier, string state)
+        {
+            var nowUtc = DateTimeOffset.UtcNow;
+            DbContext.IssueCache.Add(new IssueCacheEntity
+            {
+                IssueId = issueId,
+                Identifier = identifier,
+                Title = $"Issue {identifier}",
+                State = state,
+                LabelsJson = "[]",
+                PullRequestsJson = "[]",
+                BlockedByJson = "[]",
+                CachedAtUtc = nowUtc,
+                UpdatedAtUtc = nowUtc
             });
 
             await DbContext.SaveChangesAsync();

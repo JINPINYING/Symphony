@@ -134,6 +134,60 @@ public sealed partial class OrchestrationTickService
         await dbContext.SaveChangesAsync(cancellationToken);
     }
 
+    private async Task RefreshTrackedIssueCacheStatesAsync(
+        WorkflowDefinition workflowDefinition,
+        string apiKey,
+        CancellationToken cancellationToken)
+    {
+        var cachedIssues = await dbContext.IssueCache.ToListAsync(cancellationToken);
+        if (cachedIssues.Count == 0)
+        {
+            return;
+        }
+
+        IReadOnlyList<IssueStateSnapshot> refreshedStates;
+        try
+        {
+            refreshedStates = await trackerClient.FetchIssueStatesByIdsAsync(
+                BuildTrackerQuery(workflowDefinition, apiKey),
+                cachedIssues.Select(issue => issue.IssueId).ToList(),
+                cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Tracked issue cache state refresh failed; dashboard issue-state summaries may be stale.");
+            return;
+        }
+
+        var refreshedById = refreshedStates.ToDictionary(state => state.Id, StringComparer.OrdinalIgnoreCase);
+        var hasChanges = false;
+
+        foreach (var cachedIssue in cachedIssues)
+        {
+            if (!refreshedById.TryGetValue(cachedIssue.IssueId, out var refreshedState))
+            {
+                continue;
+            }
+
+            if (string.Equals(cachedIssue.State, refreshedState.State, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            cachedIssue.State = refreshedState.State;
+            hasChanges = true;
+        }
+
+        if (hasChanges)
+        {
+            await dbContext.SaveChangesAsync(cancellationToken);
+        }
+    }
+
     private async Task UpdateWorkspaceCleanupRecordAsync(
         NormalizedIssue issue,
         string reason,

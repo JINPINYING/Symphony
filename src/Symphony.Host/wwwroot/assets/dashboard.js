@@ -650,6 +650,7 @@ function renderTrackedIssues() {
 }
 
 function renderTrackedIssue(issue) {
+  const trackedState = issue.state || "Unknown state";
   return `
     <button type="button" data-issue-identifier="${escapeHtml(issue.issue_identifier)}" class="issue-row ${issue.issue_identifier === state.selectedIssue ? "issue-row-selected" : ""}">
       <div class="min-w-0 flex-1">
@@ -659,12 +660,12 @@ function renderTrackedIssue(issue) {
         </div>
         <div class="mt-2 text-sm text-slate-200">${escapeHtml(issue.title || "Untitled issue")}</div>
         <div class="mt-3 flex flex-wrap gap-2 text-xs text-slate-400">
-          <span>${escapeHtml(issue.state || "Unknown state")}</span>
+          <span>${escapeHtml(trackedState)}</span>
           ${issue.milestone ? `<span>Milestone ${escapeHtml(issue.milestone)}</span>` : ""}
           <span>Updated ${escapeHtml(formatRelativeTime(issue.updated_at))}</span>
         </div>
       </div>
-      <div class="shrink-0 self-center text-xs uppercase tracking-[0.22em] text-slate-400">Open</div>
+      <div class="shrink-0 self-center text-xs uppercase tracking-[0.22em] text-slate-400">${escapeHtml(trackedState)}</div>
     </button>`;
 }
 
