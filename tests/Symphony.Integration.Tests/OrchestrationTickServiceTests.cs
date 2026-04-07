@@ -124,12 +124,14 @@ public sealed class OrchestrationTickServiceTests
             }),
             coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
 
-        await harness.InsertIssueCacheAsync("issue-1", "#1", "Open");
+        var initialCachedAtUtc = DateTimeOffset.UtcNow.AddMinutes(-5);
+        await harness.InsertIssueCacheAsync("issue-1", "#1", "Open", initialCachedAtUtc);
 
         await harness.Service.RunTickAsync(CancellationToken.None);
 
         var cachedIssue = await harness.DbContext.IssueCache.SingleAsync();
         Assert.Equal("Closed", cachedIssue.State);
+        Assert.True(cachedIssue.CachedAtUtc > initialCachedAtUtc);
     }
 
     [Fact]
@@ -390,9 +392,13 @@ public sealed class OrchestrationTickServiceTests
             await DbContext.SaveChangesAsync();
         }
 
-        public async Task InsertIssueCacheAsync(string issueId, string identifier, string state)
+        public async Task InsertIssueCacheAsync(
+            string issueId,
+            string identifier,
+            string state,
+            DateTimeOffset? cachedAtUtc = null)
         {
-            var nowUtc = DateTimeOffset.UtcNow;
+            var nowUtc = cachedAtUtc ?? DateTimeOffset.UtcNow;
             DbContext.IssueCache.Add(new IssueCacheEntity
             {
                 IssueId = issueId,

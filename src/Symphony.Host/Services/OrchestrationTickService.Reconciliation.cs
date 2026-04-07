@@ -126,21 +126,14 @@ public sealed partial class OrchestrationTickService
             return;
         }
 
-        IReadOnlyList<IssueStateSnapshot> refreshedStates;
-        try
+        var refreshedStates = await TryFetchIssueStatesByIdsAsync(
+            workflowDefinition,
+            apiKey,
+            runningIssues.Select(run => run.IssueId).ToList(),
+            "Running issue reconciliation failed; active runs will continue.",
+            cancellationToken);
+        if (refreshedStates is null)
         {
-            refreshedStates = await trackerClient.FetchIssueStatesByIdsAsync(
-                BuildTrackerQuery(workflowDefinition, apiKey),
-                runningIssues.Select(run => run.IssueId).ToList(),
-                cancellationToken);
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            logger.LogWarning(ex, "Running issue reconciliation failed; active runs will continue.");
             return;
         }
 

@@ -145,26 +145,20 @@ public sealed partial class OrchestrationTickService
             return;
         }
 
-        IReadOnlyList<IssueStateSnapshot> refreshedStates;
-        try
+        var refreshedStates = await TryFetchIssueStatesByIdsAsync(
+            workflowDefinition,
+            apiKey,
+            cachedIssues.Select(issue => issue.IssueId).ToList(),
+            "Tracked issue cache state refresh failed; dashboard issue-state summaries may be stale.",
+            cancellationToken);
+        if (refreshedStates is null)
         {
-            refreshedStates = await trackerClient.FetchIssueStatesByIdsAsync(
-                BuildTrackerQuery(workflowDefinition, apiKey),
-                cachedIssues.Select(issue => issue.IssueId).ToList(),
-                cancellationToken);
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            logger.LogWarning(ex, "Tracked issue cache state refresh failed; dashboard issue-state summaries may be stale.");
             return;
         }
 
         var refreshedById = refreshedStates.ToDictionary(state => state.Id, StringComparer.OrdinalIgnoreCase);
         var hasChanges = false;
+        var refreshedAtUtc = timeProvider.GetUtcNow();
 
         foreach (var cachedIssue in cachedIssues)
         {
@@ -179,12 +173,43 @@ public sealed partial class OrchestrationTickService
             }
 
             cachedIssue.State = refreshedState.State;
+            cachedIssue.CachedAtUtc = refreshedAtUtc;
             hasChanges = true;
         }
 
         if (hasChanges)
         {
             await dbContext.SaveChangesAsync(cancellationToken);
+        }
+    }
+
+    private async Task<IReadOnlyList<IssueStateSnapshot>?> TryFetchIssueStatesByIdsAsync(
+        WorkflowDefinition workflowDefinition,
+        string apiKey,
+        IReadOnlyList<string> issueIds,
+        string failureMessage,
+        CancellationToken cancellationToken)
+    {
+        if (issueIds.Count == 0)
+        {
+            return [];
+        }
+
+        try
+        {
+            return await trackerClient.FetchIssueStatesByIdsAsync(
+                BuildTrackerQuery(workflowDefinition, apiKey),
+                issueIds,
+                cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "{FailureMessage}", failureMessage);
+            return null;
         }
     }
 
