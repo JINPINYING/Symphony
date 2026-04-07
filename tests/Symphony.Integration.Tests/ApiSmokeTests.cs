@@ -380,6 +380,49 @@ public sealed class ApiSmokeTests
     }
 
     [Fact]
+    public async Task DashboardJavaScriptAsset_ShouldClampRetryCountdownsToNow()
+    {
+        var workflowPath = CreateValidWorkflowPath();
+        var dbPath = Path.Combine(Path.GetTempPath(), $"symphony-int-{Guid.NewGuid():N}.db");
+        var stderr = new StringWriter();
+        string? content = null;
+
+        try
+        {
+            var exitCode = await SymphonyHostApplication.RunCliAsync(
+                [workflowPath],
+                stderr,
+                configureBuilder: builder => ConfigureTestServer(builder, dbPath),
+                configureServices: services => RegisterFakeTracker(services),
+                runApplicationAsync: async (app, cancellationToken) =>
+                {
+                    await app.StartAsync(cancellationToken);
+                    using var client = app.GetTestClient();
+                    content = await client.GetStringAsync("/assets/dashboard.js", cancellationToken);
+                    await app.StopAsync(cancellationToken);
+                });
+
+            Assert.True(exitCode == 0, stderr.ToString());
+            Assert.NotNull(content);
+
+            var javascriptContent = content!;
+            Assert.Matches(@"function\s+formatRetryCountdown\b", javascriptContent);
+            Assert.Matches(@"Math\.max\(\s*diffSeconds\s*,\s*0\s*\)", javascriptContent);
+            Assert.Matches(@"Next retry \$\{formatRetryCountdown\(\s*snapshot\.retrying\[0\]\.due_at\s*\)\}", javascriptContent);
+            Assert.Matches(@"Next retry \$\{formatRetryCountdown\(\s*retry\.due_at\s*\)\}", javascriptContent);
+            Assert.Matches(@"\$\{escapeHtml\(formatRetryCountdown\(\s*retry\.due_at\s*\)\)\}", javascriptContent);
+            Assert.DoesNotMatch(@"formatRelativeTime\(\s*snapshot\.retrying\[0\]\.due_at\s*\)", javascriptContent);
+            Assert.DoesNotMatch(@"formatRelativeTime\(\s*retry\.due_at\s*\)", javascriptContent);
+        }
+        finally
+        {
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            TryDeleteFile(dbPath);
+            TryDeleteFile(workflowPath);
+        }
+    }
+
+    [Fact]
     public async Task IssueEndpoint_ShouldReturnTrackedIssueDetails()
     {
         var workflowPath = CreateValidWorkflowPath();
