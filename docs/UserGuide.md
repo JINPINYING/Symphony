@@ -105,6 +105,7 @@ Dashboard and `/api/v1/state` token totals are derived from absolute Codex usage
 For human-readable dashboard surfaces, fallback-only `other_message` protocol entries are suppressed when Codex did not emit a useful message; the durable SQLite event log remains available for deeper debugging.
 On large desktop layouts, the right-hand issue detail rail stays pinned and scrolls independently so long issue detail content does not hide instance health or rate-limit cards.
 The dashboard shell uses the full viewport width on large screens instead of staying capped inside a centered content column.
+Retry queue surfaces show time until the next attempt, and any overdue retry is shown as ready now instead of appearing to be scheduled in the past.
 
 ## Codex Session Behavior
 

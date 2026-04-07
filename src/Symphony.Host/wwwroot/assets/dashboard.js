@@ -252,7 +252,7 @@ function renderMetricCards() {
   const utilization = maxConcurrent > 0 && snapshot ? Math.round((snapshot.counts.running / maxConcurrent) * 100) : 0;
   const metrics = [
     ["Running agents", formatNumber(snapshot?.counts.running || 0), maxConcurrent ? `${utilization}% of ${maxConcurrent} slots occupied` : "No capacity configured"],
-    ["Retry queue", formatNumber(snapshot?.counts.retrying || 0), snapshot?.retrying?.length ? `Next retry ${formatRelativeTime(snapshot.retrying[0].due_at)}` : "No delayed work scheduled"],
+    ["Retry queue", formatNumber(snapshot?.counts.retrying || 0), snapshot?.retrying?.length ? `Next retry ${formatRetryCountdown(snapshot.retrying[0].due_at)}` : "No delayed work scheduled"],
     ["Tracked issues", formatNumber(snapshot?.counts.tracked || 0), snapshot?.tracked?.by_state?.length ? `${snapshot.tracked.by_state.length} state buckets` : "No cached issue state yet"],
     ["Total tokens", formatNumber(snapshot?.codex_totals?.total_tokens || 0), `${formatNumber(snapshot?.codex_totals?.input_tokens || 0)} in / ${formatNumber(snapshot?.codex_totals?.output_tokens || 0)} out`],
     ["Codex runtime", formatSeconds(snapshot?.codex_totals?.seconds_running || 0), state.health?.detail || "No health detail available"],
@@ -355,7 +355,7 @@ function renderRetryRow(retry) {
       </div>
       <div class="shrink-0 text-right text-sm text-slate-300">
         <div>Attempt ${escapeHtml(String(retry.attempt || 0))}</div>
-        <div class="mt-1 text-xs uppercase tracking-[0.22em] text-slate-400">${escapeHtml(formatRelativeTime(retry.due_at))}</div>
+        <div class="mt-1 text-xs uppercase tracking-[0.22em] text-slate-400">${escapeHtml(formatRetryCountdown(retry.due_at))}</div>
       </div>
     </button>`;
 }
@@ -502,7 +502,7 @@ function renderIssueDetail() {
         <div class="rounded-3xl border border-white/10 bg-slate-950/55 p-4">
           <div class="text-xs uppercase tracking-[0.22em] text-slate-400">Retry state</div>
           <div class="mt-2 text-sm text-slate-200">${escapeHtml(retry ? `Attempt ${retry.attempt}` : "No retry scheduled")}</div>
-          <div class="mt-3 text-xs text-slate-400">${escapeHtml(retry ? `Due ${formatRelativeTime(retry.due_at)}` : "Queue is clear")}</div>
+          <div class="mt-3 text-xs text-slate-400">${escapeHtml(retry ? `Next retry ${formatRetryCountdown(retry.due_at)}` : "Queue is clear")}</div>
         </div>
       </div>
 
@@ -727,11 +727,14 @@ function formatDurationFromMilliseconds(value) {
   return formatSeconds(Number(value || 0) / 1000);
 }
 
-function formatRelativeTime(value) {
-  if (!value) return "unavailable";
+function getRelativeDiffSeconds(value) {
+  if (!value) return null;
   const timestamp = new Date(value).getTime();
-  if (Number.isNaN(timestamp)) return "unavailable";
-  const diffSeconds = Math.round((timestamp - Date.now()) / 1000);
+  if (Number.isNaN(timestamp)) return null;
+  return Math.round((timestamp - Date.now()) / 1000);
+}
+
+function formatRelativeDiff(diffSeconds) {
   const absoluteSeconds = Math.abs(diffSeconds);
   const formatter = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
   if (absoluteSeconds < 60) return formatter.format(diffSeconds, "second");
@@ -740,6 +743,18 @@ function formatRelativeTime(value) {
   const diffHours = Math.round(diffMinutes / 60);
   if (Math.abs(diffHours) < 48) return formatter.format(diffHours, "hour");
   return formatter.format(Math.round(diffHours / 24), "day");
+}
+
+function formatRelativeTime(value) {
+  const diffSeconds = getRelativeDiffSeconds(value);
+  if (diffSeconds === null) return "unavailable";
+  return formatRelativeDiff(diffSeconds);
+}
+
+function formatRetryCountdown(value) {
+  const diffSeconds = getRelativeDiffSeconds(value);
+  if (diffSeconds === null) return "unavailable";
+  return formatRelativeDiff(Math.max(diffSeconds, 0));
 }
 
 function escapeHtml(value) {
