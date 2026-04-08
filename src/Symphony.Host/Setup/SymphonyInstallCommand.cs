@@ -290,8 +290,7 @@ internal static class SymphonyInstallCommand
         await output.WriteLineAsync($"- Latest available version: {FormatLatestVersion(preflight)}");
         await output.WriteLineAsync($"- Auth file: {preflight.AuthJsonPath}");
         await output.WriteLineAsync($"- Auth file present: {(preflight.HasAuthJson ? "yes" : "no")}");
-        await output.WriteLineAsync($"- Auth mode: {preflight.AuthenticationMode ?? "unknown"}");
-        await output.WriteLineAsync($"- Authentication status: {(preflight.AuthenticationConfigured ? "ready" : "not ready")}");
+        await output.WriteLineAsync($"- Login status: {(preflight.LoginConfigured ? "ready" : "not ready")}");
 
         if (preflight.Warnings.Count > 0)
         {

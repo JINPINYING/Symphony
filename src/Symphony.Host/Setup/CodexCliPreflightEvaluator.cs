@@ -27,19 +27,15 @@ internal static class CodexCliPreflightEvaluator
         var warnings = new List<string>();
         var remediationSteps = new List<string>();
         var authJsonPath = Path.Combine(codexHomePath, AuthFileName);
-        var authInspection = await InspectAuthConfigurationAsync(authJsonPath, cancellationToken);
-        var hasAuthJson = authInspection.Exists;
+        var hasAuthJson = File.Exists(authJsonPath);
         var validatedVersion = CodexCliVersion.Parse(ValidatedNpmVersion);
 
         string? installedVersionText = null;
         string? latestVersionText = null;
         string? latestVersionSource = null;
         var latestVersionVerified = false;
-        var authenticationConfigured = authInspection.IsConfigured;
-        var authenticationMode = authInspection.Mode;
+        var loginConfigured = false;
         CodexCliVersion installedVersion = default;
-
-        string? authenticationBlockingIssue = null;
 
         var installedVersionResult = await SafeRunAsync(
             runCommandAsync,
@@ -100,30 +96,24 @@ internal static class CodexCliPreflightEvaluator
                     "Could not verify the latest Codex CLI version from npm or the local Codex version cache.");
             }
 
-        }
-
-        if (!authenticationConfigured)
-        {
-            authenticationBlockingIssue = !hasAuthJson
-                ? $"Codex auth file is missing: '{authJsonPath}'."
-                : !string.IsNullOrWhiteSpace(authInspection.Warning)
-                    ? authInspection.Warning
-                    : $"Codex auth file '{authJsonPath}' does not contain a usable authentication record.";
-
-            blockingIssues.Add(authenticationBlockingIssue);
-            AddUnique(
-                remediationSteps,
-                "Run `codex login` in another terminal or configure Codex API-key auth, then return here.");
-        }
-
-        if (!string.IsNullOrWhiteSpace(authInspection.Warning) &&
-            !string.Equals(authenticationBlockingIssue, authInspection.Warning, StringComparison.Ordinal))
-        {
-            warnings.Add(authInspection.Warning);
+            var loginStatus = await SafeRunAsync(
+                runCommandAsync,
+                "codex login status",
+                probeTimeout,
+                cancellationToken);
+            loginConfigured = loginStatus is { ExitCode: 0 };
+            if (!loginConfigured)
+            {
+                blockingIssues.Add("Codex authentication is not configured or `codex login status` failed.");
+                AddUnique(
+                    remediationSteps,
+                    "Run `codex login` in another terminal, finish the sign-in flow, then return here.");
+            }
         }
 
         if (!hasAuthJson)
         {
+            blockingIssues.Add($"Codex auth file is missing: '{authJsonPath}'.");
             AddUnique(
                 remediationSteps,
                 $"Make sure Codex writes credentials to '{authJsonPath}' before starting Symphony.");
@@ -137,8 +127,7 @@ internal static class CodexCliPreflightEvaluator
             latestVersionVerified,
             authJsonPath,
             hasAuthJson,
-            authenticationConfigured,
-            authenticationMode,
+            loginConfigured,
             blockingIssues,
             warnings,
             remediationSteps);
@@ -211,80 +200,6 @@ internal static class CodexCliPreflightEvaluator
         return (null, null);
     }
 
-    private static async Task<CodexCliAuthInspection> InspectAuthConfigurationAsync(
-        string authJsonPath,
-        CancellationToken cancellationToken)
-    {
-        if (!File.Exists(authJsonPath))
-        {
-            return new CodexCliAuthInspection(false, false, null, null);
-        }
-
-        try
-        {
-            await using var authStream = File.OpenRead(authJsonPath);
-            using var document = await JsonDocument.ParseAsync(authStream, cancellationToken: cancellationToken);
-            var root = document.RootElement;
-            if (root.ValueKind != JsonValueKind.Object)
-            {
-                return new CodexCliAuthInspection(
-                    true,
-                    false,
-                    null,
-                    "Codex auth file exists but is not a JSON object.");
-            }
-
-            var authMode = GetOptionalString(root, "auth_mode");
-            var hasApiKey = HasNonEmptyString(root, "OPENAI_API_KEY");
-            var hasReusableTokens = TryGetProperty(root, "tokens", out var tokensElement) &&
-                                    tokensElement.ValueKind is JsonValueKind.Object &&
-                                    (HasNonEmptyString(tokensElement, "access_token") ||
-                                     HasNonEmptyString(tokensElement, "refresh_token") ||
-                                     HasNonEmptyString(tokensElement, "id_token"));
-
-            if (string.IsNullOrWhiteSpace(authMode))
-            {
-                authMode = hasApiKey
-                    ? "api_key"
-                    : hasReusableTokens
-                        ? "login"
-                        : null;
-            }
-
-            return new CodexCliAuthInspection(
-                true,
-                hasApiKey || hasReusableTokens,
-                authMode,
-                hasApiKey || hasReusableTokens
-                    ? null
-                    : "Codex auth file exists but does not contain a reusable login token set or API key.");
-        }
-        catch (JsonException)
-        {
-            return new CodexCliAuthInspection(
-                true,
-                false,
-                null,
-                "Codex auth file exists but is not valid JSON.");
-        }
-        catch (IOException)
-        {
-            return new CodexCliAuthInspection(
-                true,
-                false,
-                null,
-                "Codex auth file exists but could not be read.");
-        }
-        catch (UnauthorizedAccessException)
-        {
-            return new CodexCliAuthInspection(
-                true,
-                false,
-                null,
-                "Codex auth file exists but could not be read.");
-        }
-    }
-
     private static async Task<CodexCliCommandResult> RunCommandAsync(string command, CancellationToken cancellationToken)
     {
         using var process = new Process
@@ -352,37 +267,6 @@ internal static class CodexCliPreflightEvaluator
         return Path.Combine(Environment.CurrentDirectory, ".codex");
     }
 
-    private static bool HasNonEmptyString(JsonElement element, string propertyName)
-    {
-        return TryGetProperty(element, propertyName, out var property) &&
-               property.ValueKind is JsonValueKind.String &&
-               !string.IsNullOrWhiteSpace(property.GetString());
-    }
-
-    private static string? GetOptionalString(JsonElement element, string propertyName)
-    {
-        return TryGetProperty(element, propertyName, out var property) &&
-               property.ValueKind is JsonValueKind.String
-            ? property.GetString()
-            : null;
-    }
-
-    private static bool TryGetProperty(JsonElement element, string propertyName, out JsonElement property)
-    {
-        foreach (var candidate in element.EnumerateObject())
-        {
-            if (candidate.NameEquals(propertyName) ||
-                candidate.Name.Equals(propertyName, StringComparison.OrdinalIgnoreCase))
-            {
-                property = candidate.Value;
-                return true;
-            }
-        }
-
-        property = default;
-        return false;
-    }
-
     private static void AddUnique(ICollection<string> items, string value)
     {
         if (!items.Contains(value))
@@ -400,20 +284,13 @@ internal sealed record CodexCliPreflightResult(
     bool LatestVersionVerified,
     string AuthJsonPath,
     bool HasAuthJson,
-    bool AuthenticationConfigured,
-    string? AuthenticationMode,
+    bool LoginConfigured,
     IReadOnlyList<string> BlockingIssues,
     IReadOnlyList<string> Warnings,
     IReadOnlyList<string> RemediationSteps)
 {
     public bool IsReadyToStart => BlockingIssues.Count == 0;
 }
-
-internal sealed record CodexCliAuthInspection(
-    bool Exists,
-    bool IsConfigured,
-    string? Mode,
-    string? Warning);
 
 internal sealed record CodexCliCommandResult(
     int ExitCode,
