@@ -137,6 +137,7 @@ public sealed partial class OrchestrationTickService
     private async Task RefreshTrackedIssueCacheStatesAsync(
         WorkflowDefinition workflowDefinition,
         string apiKey,
+        string instanceId,
         CancellationToken cancellationToken)
     {
         var cachedIssues = await dbContext.IssueCache.ToListAsync(cancellationToken);
@@ -167,20 +168,138 @@ public sealed partial class OrchestrationTickService
                 continue;
             }
 
-            if (string.Equals(cachedIssue.State, refreshedState.State, StringComparison.OrdinalIgnoreCase))
+            var isTerminal = MatchesTerminalState(
+                refreshedState.State,
+                workflowDefinition.Runtime.Tracker.TerminalStates);
+
+            if (!string.Equals(cachedIssue.State, refreshedState.State, StringComparison.OrdinalIgnoreCase))
             {
-                continue;
+                cachedIssue.State = refreshedState.State;
+                cachedIssue.CachedAtUtc = refreshedAtUtc;
+                hasChanges = true;
             }
 
-            cachedIssue.State = refreshedState.State;
-            cachedIssue.CachedAtUtc = refreshedAtUtc;
-            hasChanges = true;
+            if (isTerminal)
+            {
+                await CleanupTerminalTrackedIssueWorkspaceAsync(
+                    cachedIssue,
+                    workflowDefinition,
+                    instanceId,
+                    cancellationToken);
+            }
         }
 
         if (hasChanges)
         {
             await dbContext.SaveChangesAsync(cancellationToken);
         }
+    }
+
+    private async Task CleanupTerminalTrackedIssueWorkspaceAsync(
+        IssueCacheEntity cachedIssue,
+        WorkflowDefinition workflowDefinition,
+        string instanceId,
+        CancellationToken cancellationToken)
+    {
+        var hasRunningRun = await dbContext.Runs.AnyAsync(
+            run => run.IssueId == cachedIssue.IssueId && run.Status == RunStatusNames.Running,
+            cancellationToken);
+        if (hasRunningRun)
+        {
+            return;
+        }
+
+        var workspaceRecord = await dbContext.WorkspaceRecords.SingleOrDefaultAsync(
+            record => record.IssueId == cachedIssue.IssueId,
+            cancellationToken);
+
+        var releasedRetryState = await ReleaseTerminalRetryStateAsync(cachedIssue, instanceId, cancellationToken);
+        if (workspaceRecord is null && !releasedRetryState)
+        {
+            return;
+        }
+
+        if (workspaceRecord is not null &&
+            workspaceRecord.LastCleanedAtUtc.HasValue &&
+            string.Equals(workspaceRecord.LastCleanupReason, RunStopReasons.Terminal, StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        try
+        {
+            var cleanupResult = await workspaceManager.CleanupIssueWorkspaceAsync(
+                new WorkspaceCleanupRequest(
+                    cachedIssue.Identifier,
+                    workflowDefinition.Runtime.Workspace.Root,
+                    workflowDefinition.Runtime.Workspace.SharedClonePath,
+                    workflowDefinition.Runtime.Workspace.WorktreesRoot,
+                    workflowDefinition.Runtime.Hooks.BeforeRemove,
+                    workflowDefinition.Runtime.Hooks.TimeoutMs),
+                cancellationToken);
+
+            if (workspaceRecord is not null && (!cleanupResult.Existed || cleanupResult.RemovedNow))
+            {
+                workspaceRecord.LastCleanedAtUtc = timeProvider.GetUtcNow();
+                workspaceRecord.LastCleanupReason = RunStopReasons.Terminal;
+                await dbContext.SaveChangesAsync(cancellationToken);
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Tracked terminal cleanup failed for issue {IssueIdentifier}.", cachedIssue.Identifier);
+        }
+    }
+
+    private async Task<bool> ReleaseTerminalRetryStateAsync(
+        IssueCacheEntity cachedIssue,
+        string instanceId,
+        CancellationToken cancellationToken)
+    {
+        var nowUtc = timeProvider.GetUtcNow();
+        var retryingRuns = await dbContext.Runs
+            .Where(run => run.IssueId == cachedIssue.IssueId && run.Status == RunStatusNames.Retrying)
+            .ToListAsync(cancellationToken);
+
+        foreach (var run in retryingRuns)
+        {
+            run.Status = RunStatusNames.CanceledByReconciliation;
+            run.CompletedAtUtc = nowUtc;
+            run.RequestedStopReason = null;
+            run.CleanupWorkspaceOnStop = false;
+            run.LastEvent = "terminal_state_observed";
+            run.LastMessage = RunStopReasons.Terminal;
+            run.LastEventAtUtc = nowUtc;
+        }
+
+        var retryEntries = await dbContext.RetryQueue
+            .Where(entry => entry.IssueId == cachedIssue.IssueId)
+            .ToListAsync(cancellationToken);
+        if (retryEntries.Count > 0)
+        {
+            dbContext.RetryQueue.RemoveRange(retryEntries);
+        }
+
+        if (retryingRuns.Count > 0 || retryEntries.Count > 0)
+        {
+            await coordinationStore.ReleaseIssueClaimAsync(
+                cachedIssue.IssueId,
+                instanceId,
+                RunStatusNames.CanceledByReconciliation,
+                cancellationToken);
+        }
+
+        if (retryingRuns.Count > 0 || retryEntries.Count > 0)
+        {
+            await dbContext.SaveChangesAsync(cancellationToken);
+            return true;
+        }
+
+        return false;
     }
 
     private async Task<IReadOnlyList<IssueStateSnapshot>?> TryFetchIssueStatesByIdsAsync(

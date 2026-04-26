@@ -166,6 +166,10 @@ public sealed partial class OrchestrationTickService
             run.CompletedAtUtc = null;
             run.RequestedStopReason = null;
             run.CleanupWorkspaceOnStop = false;
+            run.SessionId = null;
+            run.LastReportedInputTokens = 0;
+            run.LastReportedOutputTokens = 0;
+            run.LastReportedTotalTokens = 0;
         }
 
         var runAttempt = new RunAttemptEntity

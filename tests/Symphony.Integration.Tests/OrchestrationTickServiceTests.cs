@@ -114,6 +114,30 @@ public sealed class OrchestrationTickServiceTests
     }
 
     [Fact]
+    public async Task RunTickAsync_ShouldPersistTerminalStopBeforeCancelingLiveRun()
+    {
+        var coordinator = new FakeIssueExecutionCoordinator(
+            FakeDispatchOutcome.LeaveRunning,
+            observeStopStateWithFreshContext: true);
+
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: new FakeTrackerClient([], issueStatesById: new Dictionary<string, string>
+            {
+                ["issue-1"] = "Closed"
+            }),
+            coordinator);
+
+        await harness.InsertRunningRunAsync("issue-1", "#1", "Open", "instance-1");
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.NotNull(coordinator.ObservedStopState);
+        Assert.Equal(RunStopReasons.Terminal, coordinator.ObservedStopState.Value.RequestedStopReason);
+        Assert.True(coordinator.ObservedStopState.Value.CleanupWorkspaceOnStop);
+    }
+
+    [Fact]
     public async Task RunTickAsync_ShouldRefreshTrackedIssueCacheStateForClosedIssues()
     {
         await using var harness = await TestHarness.CreateAsync(
@@ -132,6 +156,62 @@ public sealed class OrchestrationTickServiceTests
         var cachedIssue = await harness.DbContext.IssueCache.SingleAsync();
         Assert.Equal("Closed", cachedIssue.State);
         Assert.True(cachedIssue.CachedAtUtc > initialCachedAtUtc);
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldCleanupRetryWorkspaceWhenTrackedIssueBecomesClosed()
+    {
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: new FakeTrackerClient([], issueStatesById: new Dictionary<string, string>
+            {
+                ["issue-1"] = "Closed"
+            }),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await harness.InsertIssueCacheAsync("issue-1", "#1", "Open", DateTimeOffset.UtcNow.AddMinutes(-5));
+        await harness.InsertRetryingRunAsync("issue-1", "#1", "Open", "instance-1");
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var cleanupRequest = Assert.Single(harness.WorkspaceManager.CleanupRequests);
+        Assert.Equal("#1", cleanupRequest.IssueIdentifier);
+        Assert.Empty(await harness.DbContext.RetryQueue.ToListAsync());
+        Assert.Equal(RunStatusNames.CanceledByReconciliation, (await harness.DbContext.Runs.SingleAsync()).Status);
+        Assert.Equal(RunStatusNames.CanceledByReconciliation, (await harness.DbContext.DispatchClaims.SingleAsync()).Status);
+        Assert.NotNull((await harness.DbContext.WorkspaceRecords.SingleAsync()).LastCleanedAtUtc);
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldResetLastReportedTokenTotalsWhenRetryStartsNewAttempt()
+    {
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: new FakeTrackerClient([BuildIssue("issue-1", "#1", "Open", null)]),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await harness.InsertRetryingRunAsync(
+            "issue-1",
+            "#1",
+            "Open",
+            "instance-1",
+            inputTokens: 100,
+            outputTokens: 50,
+            totalTokens: 150,
+            lastReportedInputTokens: 100,
+            lastReportedOutputTokens: 50,
+            lastReportedTotalTokens: 150);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var run = await harness.DbContext.Runs.SingleAsync();
+        Assert.Equal(RunStatusNames.Running, run.Status);
+        Assert.Equal(100, run.InputTokens);
+        Assert.Equal(50, run.OutputTokens);
+        Assert.Equal(150, run.TotalTokens);
+        Assert.Equal(0, run.LastReportedInputTokens);
+        Assert.Equal(0, run.LastReportedOutputTokens);
+        Assert.Equal(0, run.LastReportedTotalTokens);
     }
 
     [Fact]
@@ -315,7 +395,7 @@ public sealed class OrchestrationTickServiceTests
             await dbContext.Database.EnsureCreatedAsync();
 
             var workspaceManager = new FakeWorkspaceManager();
-            coordinator.Attach(dbContext);
+            coordinator.Attach(dbContext, dbPath);
 
             var service = new OrchestrationTickService(
                 new FakeWorkflowDefinitionProvider(workflowDefinition),
@@ -415,6 +495,72 @@ public sealed class OrchestrationTickServiceTests
             await DbContext.SaveChangesAsync();
         }
 
+        public async Task InsertRetryingRunAsync(
+            string issueId,
+            string identifier,
+            string state,
+            string instanceId,
+            int inputTokens = 0,
+            int outputTokens = 0,
+            int totalTokens = 0,
+            int lastReportedInputTokens = 0,
+            int lastReportedOutputTokens = 0,
+            int lastReportedTotalTokens = 0)
+        {
+            var nowUtc = DateTimeOffset.UtcNow;
+            var run = new RunEntity
+            {
+                Id = Guid.NewGuid().ToString("N"),
+                IssueId = issueId,
+                IssueIdentifier = identifier,
+                OwnerInstanceId = instanceId,
+                Status = RunStatusNames.Retrying,
+                State = state,
+                CurrentRetryAttempt = 1,
+                StartedAtUtc = nowUtc.AddMinutes(-1),
+                InputTokens = inputTokens,
+                OutputTokens = outputTokens,
+                TotalTokens = totalTokens,
+                LastReportedInputTokens = lastReportedInputTokens,
+                LastReportedOutputTokens = lastReportedOutputTokens,
+                LastReportedTotalTokens = lastReportedTotalTokens
+            };
+
+            DbContext.Runs.Add(run);
+            DbContext.RetryQueue.Add(new RetryQueueEntity
+            {
+                IssueId = issueId,
+                IssueIdentifier = identifier,
+                RunId = run.Id,
+                OwnerInstanceId = instanceId,
+                Attempt = 1,
+                DueAtUtc = nowUtc.AddSeconds(-1),
+                DelayType = RetryDelayTypes.Continuation,
+                MaxBackoffMs = 300_000,
+                CreatedAtUtc = nowUtc.AddMinutes(-1),
+                UpdatedAtUtc = nowUtc.AddMinutes(-1)
+            });
+            DbContext.DispatchClaims.Add(new DispatchClaimEntity
+            {
+                IssueId = issueId,
+                IssueIdentifier = identifier,
+                ClaimedByInstanceId = instanceId,
+                ClaimedAtUtc = nowUtc.AddMinutes(-1),
+                UpdatedAtUtc = nowUtc.AddMinutes(-1),
+                Status = "active"
+            });
+            DbContext.WorkspaceRecords.Add(new WorkspaceRecordEntity
+            {
+                IssueId = issueId,
+                IssueIdentifier = identifier,
+                WorkspacePath = $"C:\\tmp\\{identifier}",
+                BranchName = $"symphony/{identifier}",
+                LastPreparedAtUtc = nowUtc.AddMinutes(-1)
+            });
+
+            await DbContext.SaveChangesAsync();
+        }
+
         public async ValueTask DisposeAsync()
         {
             await DbContext.DisposeAsync();
@@ -505,16 +651,22 @@ public sealed class OrchestrationTickServiceTests
         Failure
     }
 
-    private sealed class FakeIssueExecutionCoordinator(FakeDispatchOutcome outcome, bool stopReturnsFalse = false) : IIssueExecutionCoordinator
+    private sealed class FakeIssueExecutionCoordinator(
+        FakeDispatchOutcome outcome,
+        bool stopReturnsFalse = false,
+        bool observeStopStateWithFreshContext = false) : IIssueExecutionCoordinator
     {
         private SymphonyDbContext? dbContext;
+        private string? dbPath;
 
         public List<IssueExecutionRequest> StartRequests { get; } = [];
         public List<string> StopRequests { get; } = [];
+        public (string? RequestedStopReason, bool CleanupWorkspaceOnStop)? ObservedStopState { get; private set; }
 
-        public void Attach(SymphonyDbContext dbContext)
+        public void Attach(SymphonyDbContext dbContext, string dbPath)
         {
             this.dbContext = dbContext;
+            this.dbPath = dbPath;
         }
 
         public async Task<bool> TryStartAsync(IssueExecutionRequest request, CancellationToken cancellationToken = default)
@@ -577,10 +729,23 @@ public sealed class OrchestrationTickServiceTests
             return true;
         }
 
-        public Task<bool> TryStopAsync(string issueId, CancellationToken cancellationToken = default)
+        public async Task<bool> TryStopAsync(string issueId, CancellationToken cancellationToken = default)
         {
             StopRequests.Add(issueId);
-            return Task.FromResult(!stopReturnsFalse);
+
+            if (observeStopStateWithFreshContext && dbPath is not null)
+            {
+                var options = new DbContextOptionsBuilder<SymphonyDbContext>()
+                    .UseSqlite($"Data Source={dbPath}")
+                    .Options;
+                await using var freshDbContext = new SymphonyDbContext(options);
+                var run = await freshDbContext.Runs.SingleAsync(
+                    runEntity => runEntity.IssueId == issueId,
+                    cancellationToken);
+                ObservedStopState = (run.RequestedStopReason, run.CleanupWorkspaceOnStop);
+            }
+
+            return !stopReturnsFalse;
         }
     }
 }
