@@ -54,6 +54,13 @@ public sealed class WorkspaceManagerTests
             var currentBranch = await RunGitAsync(first.WorkspacePath, ["rev-parse", "--abbrev-ref", "HEAD"]);
             Assert.Equal("symphony/101", currentBranch.Stdout.Trim());
 
+            var upstreamRemote = await RunGitAsync(
+                sharedClonePath,
+                ["config", "--get", "branch.symphony/101.remote"],
+                throwOnNonZeroExitCode: false);
+            Assert.Equal(1, upstreamRemote.ExitCode);
+            Assert.True(string.IsNullOrWhiteSpace(upstreamRemote.Stdout));
+
             var second = await manager.PrepareIssueWorkspaceAsync(request);
             Assert.False(second.CreatedNow);
         }
@@ -172,7 +179,10 @@ public sealed class WorkspaceManagerTests
         }
     }
 
-    private static async Task<GitCommandResult> RunGitAsync(string workingDirectory, IReadOnlyList<string> args)
+    private static async Task<GitCommandResult> RunGitAsync(
+        string workingDirectory,
+        IReadOnlyList<string> args,
+        bool throwOnNonZeroExitCode = true)
     {
         var info = new ProcessStartInfo
         {
@@ -199,16 +209,16 @@ public sealed class WorkspaceManagerTests
         var stderr = await process.StandardError.ReadToEndAsync();
         await process.WaitForExitAsync();
 
-        if (process.ExitCode != 0)
+        if (throwOnNonZeroExitCode && process.ExitCode != 0)
         {
             throw new InvalidOperationException(
                 $"Git failed (exit {process.ExitCode}) with args '{string.Join(' ', args)}'{Environment.NewLine}{stderr}");
         }
 
-        return new GitCommandResult(stdout, stderr);
+        return new GitCommandResult(process.ExitCode, stdout, stderr);
     }
 
-    private sealed record GitCommandResult(string Stdout, string Stderr);
+    private sealed record GitCommandResult(int ExitCode, string Stdout, string Stderr);
 
     private sealed class NoOpWorkspaceHookRunner : IWorkspaceHookRunner
     {

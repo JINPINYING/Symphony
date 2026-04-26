@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Text;
 using Microsoft.Extensions.Logging;
@@ -10,6 +11,8 @@ public sealed class GitWorktreeWorkspaceManager(
     IWorkspaceHookRunner workspaceHookRunner,
     ILogger<GitWorktreeWorkspaceManager> logger) : IWorkspaceManager
 {
+    private static readonly ConcurrentDictionary<string, SemaphoreSlim> SharedCloneLocks = new(StringComparer.OrdinalIgnoreCase);
+
     public async Task<WorkspacePreparationResult> PrepareIssueWorkspaceAsync(
         WorkspacePreparationRequest request,
         CancellationToken cancellationToken = default)
@@ -44,42 +47,51 @@ public sealed class GitWorktreeWorkspaceManager(
         Directory.CreateDirectory(rootPath);
         Directory.CreateDirectory(worktreesRootPath);
 
-        await EnsureSharedCloneAsync(sharedClonePath, request.RemoteRepositoryUrl, cancellationToken);
-        await EnsureLatestFromOriginAsync(sharedClonePath, request.BaseBranch, cancellationToken);
-
-        if (Directory.Exists(worktreePath))
-        {
-            logger.LogInformation(
-                "Reusing existing workspace {WorkspacePath} for issue {IssueIdentifier}.",
-                worktreePath,
-                request.IssueIdentifier);
-
-            return new WorkspacePreparationResult(worktreePath, branchName, CreatedNow: false);
-        }
-
+        var sharedCloneLock = GetSharedCloneLock(sharedClonePath);
+        await sharedCloneLock.WaitAsync(cancellationToken);
         try
         {
-            var hasLocalBranch = await HasLocalBranchAsync(sharedClonePath, branchName, cancellationToken);
-            if (hasLocalBranch)
-            {
-                await RunGitAsync(sharedClonePath, ["worktree", "add", worktreePath, branchName], cancellationToken);
-            }
-            else
-            {
-                await RunGitAsync(
-                    sharedClonePath,
-                    ["worktree", "add", "-b", branchName, worktreePath, $"origin/{request.BaseBranch}"],
-                    cancellationToken);
-            }
-        }
-        catch
-        {
+            await EnsureSharedCloneAsync(sharedClonePath, request.RemoteRepositoryUrl, cancellationToken);
+            await EnsureLatestFromOriginAsync(sharedClonePath, request.BaseBranch, cancellationToken);
+
             if (Directory.Exists(worktreePath))
             {
-                _ = await RemoveWorktreePathAsync(sharedClonePath, worktreePath, CancellationToken.None);
+                logger.LogInformation(
+                    "Reusing existing workspace {WorkspacePath} for issue {IssueIdentifier}.",
+                    worktreePath,
+                    request.IssueIdentifier);
+
+                return new WorkspacePreparationResult(worktreePath, branchName, CreatedNow: false);
             }
 
-            throw;
+            try
+            {
+                var hasLocalBranch = await HasLocalBranchAsync(sharedClonePath, branchName, cancellationToken);
+                if (hasLocalBranch)
+                {
+                    await RunGitAsync(sharedClonePath, ["worktree", "add", worktreePath, branchName], cancellationToken);
+                }
+                else
+                {
+                    await RunGitAsync(
+                        sharedClonePath,
+                        ["worktree", "add", "--no-track", "-b", branchName, worktreePath, $"origin/{request.BaseBranch}"],
+                        cancellationToken);
+                }
+            }
+            catch
+            {
+                if (Directory.Exists(worktreePath))
+                {
+                    _ = await RemoveWorktreePathAsync(sharedClonePath, worktreePath, CancellationToken.None);
+                }
+
+                throw;
+            }
+        }
+        finally
+        {
+            sharedCloneLock.Release();
         }
 
         logger.LogInformation(
@@ -156,7 +168,18 @@ public sealed class GitWorktreeWorkspaceManager(
             }
         }
 
-        var removedNow = await RemoveWorktreePathAsync(sharedClonePath, worktreePath, cancellationToken);
+        var sharedCloneLock = GetSharedCloneLock(sharedClonePath);
+        await sharedCloneLock.WaitAsync(cancellationToken);
+        bool removedNow;
+        try
+        {
+            removedNow = await RemoveWorktreePathAsync(sharedClonePath, worktreePath, cancellationToken);
+        }
+        finally
+        {
+            sharedCloneLock.Release();
+        }
+
         if (removedNow)
         {
             logger.LogInformation(
@@ -188,7 +211,7 @@ public sealed class GitWorktreeWorkspaceManager(
         var gitDirectoryPath = Path.Combine(sharedClonePath, ".git");
         if (Directory.Exists(gitDirectoryPath))
         {
-            await RunGitAsync(sharedClonePath, ["remote", "set-url", "origin", remoteRepositoryUrl], cancellationToken);
+            await EnsureRemoteUrlAsync(sharedClonePath, remoteRepositoryUrl, cancellationToken);
             return;
         }
 
@@ -202,6 +225,25 @@ public sealed class GitWorktreeWorkspaceManager(
             workingDirectory: null,
             ["clone", "--no-checkout", remoteRepositoryUrl, sharedClonePath],
             cancellationToken);
+    }
+
+    private async Task EnsureRemoteUrlAsync(
+        string sharedClonePath,
+        string remoteRepositoryUrl,
+        CancellationToken cancellationToken)
+    {
+        var currentRemote = await RunGitAsync(
+            sharedClonePath,
+            ["remote", "get-url", "origin"],
+            cancellationToken,
+            throwOnNonZeroExitCode: false);
+        if (currentRemote.ExitCode == 0 &&
+            currentRemote.Stdout.Trim().Equals(remoteRepositoryUrl, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        await RunGitAsync(sharedClonePath, ["remote", "set-url", "origin", remoteRepositoryUrl], cancellationToken);
     }
 
     private async Task EnsureLatestFromOriginAsync(string sharedClonePath, string baseBranch, CancellationToken cancellationToken)
@@ -320,6 +362,7 @@ public sealed class GitWorktreeWorkspaceManager(
         process.BeginOutputReadLine();
         process.BeginErrorReadLine();
         await process.WaitForExitAsync(cancellationToken);
+        process.WaitForExit();
 
         var result = new GitResult(process.ExitCode, stdout.ToString(), stderr.ToString());
         if (throwOnNonZeroExitCode && result.ExitCode != 0)
@@ -332,6 +375,9 @@ public sealed class GitWorktreeWorkspaceManager(
     }
 
     private sealed record GitResult(int ExitCode, string Stdout, string Stderr);
+
+    private static SemaphoreSlim GetSharedCloneLock(string sharedClonePath) =>
+        SharedCloneLocks.GetOrAdd(sharedClonePath, _ => new SemaphoreSlim(1, 1));
 
     private static void EnsureDirectoryPathAvailable(string path, string logicalName)
     {

@@ -132,6 +132,49 @@ public sealed class CodexAgentRunnerTests
     }
 
     [Fact]
+    public void CreateProtocolUpdate_ShouldIgnoreGenericUsageOnOrdinaryEvents()
+    {
+        var update = CreateProtocolUpdate("""
+            {
+              "method": "turn/completed",
+              "params": {
+                "message": "done",
+                "usage": {
+                  "input_tokens": 11,
+                  "output_tokens": 7,
+                  "total_tokens": 18
+                }
+              }
+            }
+            """);
+
+        Assert.Null(update.InputTokens);
+        Assert.Null(update.OutputTokens);
+        Assert.Null(update.TotalTokens);
+    }
+
+    [Fact]
+    public void CreateProtocolUpdate_ShouldReadGenericUsageFromThreadTokenUsageUpdatedPayloads()
+    {
+        var update = CreateProtocolUpdate("""
+            {
+              "method": "thread/tokenUsage/updated",
+              "params": {
+                "usage": {
+                  "input_tokens": 11,
+                  "output_tokens": 7,
+                  "total_tokens": 18
+                }
+              }
+            }
+            """);
+
+        Assert.Equal(11, update.InputTokens);
+        Assert.Equal(7, update.OutputTokens);
+        Assert.Equal(18, update.TotalTokens);
+    }
+
+    [Fact]
     public void CreateProtocolUpdate_ShouldClampDerivedTotalTokensToIntMaxValue()
     {
         var update = CreateProtocolUpdate($$"""

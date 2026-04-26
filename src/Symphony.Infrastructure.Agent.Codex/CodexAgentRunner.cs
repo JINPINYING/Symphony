@@ -1085,13 +1085,14 @@ public sealed partial class CodexAgentRunner(
 
     private static bool TryExtractUsage(JsonElement root, string eventName, out UsageSnapshot? usage)
     {
-        if (IsAbsoluteTokenUsageEvent(eventName) &&
+        var isAbsoluteTokenUsageEvent = IsAbsoluteTokenUsageEvent(eventName);
+        if (isAbsoluteTokenUsageEvent &&
             TryParseUsageObject(GetMessagePayload(root), out usage))
         {
             return true;
         }
 
-        foreach (var propertyName in new[] { "total_token_usage", "totalTokenUsage", "token_usage", "tokenUsage", "usage" })
+        foreach (var propertyName in new[] { "total_token_usage", "totalTokenUsage", "token_usage", "tokenUsage" })
         {
             if (!TryFindPropertyRecursive(root, propertyName, out var usageElement))
             {
@@ -1102,6 +1103,13 @@ public sealed partial class CodexAgentRunner(
             {
                 return true;
             }
+        }
+
+        if (isAbsoluteTokenUsageEvent &&
+            TryFindPropertyRecursive(root, "usage", out var genericUsageElement) &&
+            TryParseUsageObject(genericUsageElement, out usage))
+        {
+            return true;
         }
 
         usage = null;

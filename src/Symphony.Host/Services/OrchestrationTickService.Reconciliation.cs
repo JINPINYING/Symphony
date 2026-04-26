@@ -219,6 +219,8 @@ public sealed partial class OrchestrationTickService
         run.LastMessage = stopReason;
         run.LastEventAtUtc = timeProvider.GetUtcNow();
 
+        await dbContext.SaveChangesAsync(cancellationToken);
+
         var stopRequested = await issueExecutionCoordinator.TryStopAsync(run.IssueId, cancellationToken);
         if (stopRequested)
         {
