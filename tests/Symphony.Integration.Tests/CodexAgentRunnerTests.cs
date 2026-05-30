@@ -136,7 +136,7 @@ public sealed class CodexAgentRunnerTests
     {
         var update = CreateProtocolUpdate("""
             {
-              "method": "turn/completed",
+              "method": "notification",
               "params": {
                 "message": "done",
                 "usage": {
@@ -151,6 +151,29 @@ public sealed class CodexAgentRunnerTests
         Assert.Null(update.InputTokens);
         Assert.Null(update.OutputTokens);
         Assert.Null(update.TotalTokens);
+    }
+
+    [Fact]
+    public void CreateProtocolUpdate_ShouldReadDeltaUsageFromTurnCompletedPayloads()
+    {
+        var update = CreateProtocolUpdate("""
+            {
+              "method": "turn/completed",
+              "params": {
+                "message": "done",
+                "usage": {
+                  "input_tokens": 11,
+                  "output_tokens": 7,
+                  "total_tokens": 18
+                }
+              }
+            }
+            """);
+
+        Assert.Equal(11, update.InputTokens);
+        Assert.Equal(7, update.OutputTokens);
+        Assert.Equal(18, update.TotalTokens);
+        Assert.True(update.TokenUsageIsDelta);
     }
 
     [Fact]

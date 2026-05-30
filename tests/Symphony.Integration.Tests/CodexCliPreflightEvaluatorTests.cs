@@ -16,8 +16,8 @@ public sealed class CodexCliPreflightEvaluatorTests
             var result = await CodexCliPreflightEvaluator.CheckAsync(
                 CreateRunner(new Dictionary<string, CodexCliCommandResult>(StringComparer.Ordinal)
                 {
-                    ["codex --version"] = new(0, "codex-cli 0.114.0", string.Empty),
-                    ["npm view @openai/codex version"] = new(0, "0.114.0", string.Empty),
+                    ["codex --version"] = new(0, "codex-cli 0.135.0", string.Empty),
+                    ["npm view @openai/codex version"] = new(0, "0.135.0", string.Empty),
                     ["codex login status"] = new(0, "Logged in using ChatGPT", string.Empty)
                 }),
                 codexHome,
@@ -25,8 +25,8 @@ public sealed class CodexCliPreflightEvaluatorTests
                 CancellationToken.None);
 
             Assert.True(result.IsReadyToStart);
-            Assert.Equal("0.114.0", result.InstalledVersion);
-            Assert.Equal("0.114.0", result.LatestVersion);
+            Assert.Equal("0.135.0", result.InstalledVersion);
+            Assert.Equal("0.135.0", result.LatestVersion);
             Assert.True(result.LatestVersionVerified);
             Assert.True(result.HasAuthJson);
             Assert.True(result.LoginConfigured);
@@ -50,7 +50,7 @@ public sealed class CodexCliPreflightEvaluatorTests
                 CreateRunner(new Dictionary<string, CodexCliCommandResult>(StringComparer.Ordinal)
                 {
                     ["codex --version"] = new(0, "codex-cli 0.113.0", string.Empty),
-                    ["npm view @openai/codex version"] = new(0, "0.114.0", string.Empty),
+                    ["npm view @openai/codex version"] = new(0, "0.135.0", string.Empty),
                     ["codex login status"] = new(0, "Logged in using ChatGPT", string.Empty)
                 }),
                 codexHome,
@@ -60,7 +60,7 @@ public sealed class CodexCliPreflightEvaluatorTests
             Assert.False(result.IsReadyToStart);
             Assert.Contains(
                 result.BlockingIssues,
-                issue => issue.Contains("Symphony-validated version 0.114.0", StringComparison.Ordinal));
+                issue => issue.Contains("Symphony-validated version 0.135.0", StringComparison.Ordinal));
         }
         finally
         {
@@ -78,8 +78,8 @@ public sealed class CodexCliPreflightEvaluatorTests
             var result = await CodexCliPreflightEvaluator.CheckAsync(
                 CreateRunner(new Dictionary<string, CodexCliCommandResult>(StringComparer.Ordinal)
                 {
-                    ["codex --version"] = new(0, "codex-cli 0.114.0", string.Empty),
-                    ["npm view @openai/codex version"] = new(0, "0.114.0", string.Empty),
+                    ["codex --version"] = new(0, "codex-cli 0.135.0", string.Empty),
+                    ["npm view @openai/codex version"] = new(0, "0.135.0", string.Empty),
                     ["codex login status"] = new(0, "Logged in using ChatGPT", string.Empty)
                 }),
                 codexHome,
@@ -109,14 +109,14 @@ public sealed class CodexCliPreflightEvaluatorTests
                 Path.Combine(codexHome, "version.json"),
                 """
                 {
-                  "latest_version": "0.114.0"
+                  "latest_version": "0.135.0"
                 }
                 """);
 
             var result = await CodexCliPreflightEvaluator.CheckAsync(
                 CreateRunner(new Dictionary<string, CodexCliCommandResult>(StringComparer.Ordinal)
                 {
-                    ["codex --version"] = new(0, "codex-cli 0.114.0", string.Empty),
+                    ["codex --version"] = new(0, "codex-cli 0.135.0", string.Empty),
                     ["npm view @openai/codex version"] = new(1, string.Empty, "npm unavailable"),
                     ["codex login status"] = new(0, "Logged in using ChatGPT", string.Empty)
                 }),
@@ -163,7 +163,7 @@ public sealed class CodexCliPreflightEvaluatorTests
                 Path.Combine(codexHome, "version.json"),
                 """
                 {
-                  "latest_version": "0.114.0"
+                  "latest_version": "0.135.0"
                 }
                 """);
 
@@ -172,7 +172,7 @@ public sealed class CodexCliPreflightEvaluatorTests
                     ? WaitForCancellationAsync(token)
                     : Task.FromResult(command switch
                     {
-                        "codex --version" => new CodexCliCommandResult(0, "codex-cli 0.114.0", string.Empty),
+                        "codex --version" => new CodexCliCommandResult(0, "codex-cli 0.135.0", string.Empty),
                         "codex login status" => new CodexCliCommandResult(0, "Logged in using ChatGPT", string.Empty),
                         _ => throw new InvalidOperationException($"Unexpected command '{command}'.")
                     }),

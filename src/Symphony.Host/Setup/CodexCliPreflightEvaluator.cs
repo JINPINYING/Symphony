@@ -6,7 +6,7 @@ namespace Symphony.Host.Setup;
 
 internal static class CodexCliPreflightEvaluator
 {
-    internal const string ValidatedNpmVersion = "0.114.0";
+    internal const string ValidatedNpmVersion = "0.135.0";
     internal static readonly TimeSpan DefaultProbeTimeout = TimeSpan.FromSeconds(10);
     private const string CodexPackageName = "@openai/codex";
     private const string AuthFileName = "auth.json";
