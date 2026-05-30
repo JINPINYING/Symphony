@@ -5,7 +5,7 @@ COPY . .
 RUN dotnet publish src/Symphony.Host/Symphony.Host.csproj -c Release -o /app/publish /p:UseAppHost=false
 
 FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime
-ARG CODEX_NPM_VERSION=0.114.0
+ARG CODEX_NPM_VERSION=0.135.0
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends bash ca-certificates curl git nodejs npm openssh-client \

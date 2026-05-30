@@ -10,6 +10,7 @@ public sealed record AgentRunUpdate(
     int? InputTokens = null,
     int? OutputTokens = null,
     int? TotalTokens = null,
+    bool TokenUsageIsDelta = false,
     string? RateLimitsJson = null,
     string? DataJson = null)
 {

@@ -1079,6 +1079,7 @@ public sealed partial class CodexAgentRunner(
             InputTokens: usage?.InputTokens,
             OutputTokens: usage?.OutputTokens,
             TotalTokens: usage?.TotalTokens,
+            TokenUsageIsDelta: usage?.IsDelta ?? false,
             RateLimitsJson: SecretRedactor.Redact(rateLimitsJson, knownSecret),
             DataJson: SecretRedactor.Redact(message.GetRawText(), knownSecret));
     }
@@ -1089,6 +1090,7 @@ public sealed partial class CodexAgentRunner(
         if (isAbsoluteTokenUsageEvent &&
             TryParseUsageObject(GetMessagePayload(root), out usage))
         {
+            usage = usage! with { IsDelta = false };
             return true;
         }
 
@@ -1101,6 +1103,7 @@ public sealed partial class CodexAgentRunner(
 
             if (TryParseUsageObject(usageElement, out usage))
             {
+                usage = usage! with { IsDelta = false };
                 return true;
             }
         }
@@ -1109,6 +1112,15 @@ public sealed partial class CodexAgentRunner(
             TryFindPropertyRecursive(root, "usage", out var genericUsageElement) &&
             TryParseUsageObject(genericUsageElement, out usage))
         {
+            usage = usage! with { IsDelta = false };
+            return true;
+        }
+
+        if (IsDeltaTokenUsageEvent(eventName) &&
+            TryFindPropertyRecursive(root, "usage", out var deltaUsageElement) &&
+            TryParseUsageObject(deltaUsageElement, out usage))
+        {
+            usage = usage! with { IsDelta = true };
             return true;
         }
 
@@ -1136,6 +1148,24 @@ public sealed partial class CodexAgentRunner(
         return normalizedEventName.Contains("thread", StringComparison.OrdinalIgnoreCase) &&
                normalizedEventName.Contains("tokenusage", StringComparison.OrdinalIgnoreCase) &&
                normalizedEventName.Contains("updated", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsDeltaTokenUsageEvent(string eventName)
+    {
+        if (string.IsNullOrWhiteSpace(eventName))
+        {
+            return false;
+        }
+
+        var normalizedEventName = eventName.Replace("/", string.Empty, StringComparison.Ordinal)
+            .Replace("_", string.Empty, StringComparison.Ordinal)
+            .Replace("-", string.Empty, StringComparison.Ordinal);
+
+        return normalizedEventName.Contains("turn", StringComparison.OrdinalIgnoreCase) &&
+               (normalizedEventName.Contains("completed", StringComparison.OrdinalIgnoreCase) ||
+                normalizedEventName.Contains("failed", StringComparison.OrdinalIgnoreCase) ||
+                normalizedEventName.Contains("cancelled", StringComparison.OrdinalIgnoreCase) ||
+                normalizedEventName.Contains("canceled", StringComparison.OrdinalIgnoreCase));
     }
 
     private static bool TryExtractRateLimitsJson(JsonElement root, out string? rateLimitsJson)
@@ -1227,7 +1257,7 @@ public sealed partial class CodexAgentRunner(
             return false;
         }
 
-        usage = new UsageSnapshot(inputTokens, outputTokens, totalTokens);
+        usage = new UsageSnapshot(inputTokens, outputTokens, totalTokens, IsDelta: false);
         return true;
     }
 
@@ -1663,5 +1693,5 @@ public sealed partial class CodexAgentRunner(
 
     private sealed record ToolCallRequest(object RequestId, string Name, string? InputJson);
 
-    private sealed record UsageSnapshot(int? InputTokens, int? OutputTokens, int? TotalTokens);
+    private sealed record UsageSnapshot(int? InputTokens, int? OutputTokens, int? TotalTokens, bool IsDelta);
 }

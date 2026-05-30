@@ -253,9 +253,9 @@ public sealed class InstallCommandTests
     {
         return readyToStart
             ? new CodexCliPreflightResult(
-                InstalledVersion: "0.114.0",
-                ValidatedVersion: "0.114.0",
-                LatestVersion: "0.114.0",
+                InstalledVersion: "0.135.0",
+                ValidatedVersion: "0.135.0",
+                LatestVersion: "0.135.0",
                 LatestVersionSource: "npm",
                 LatestVersionVerified: true,
                 AuthJsonPath: Path.Combine(Path.GetTempPath(), ".codex", "auth.json"),
@@ -266,8 +266,8 @@ public sealed class InstallCommandTests
                 RemediationSteps: [])
             : new CodexCliPreflightResult(
                 InstalledVersion: "0.113.0",
-                ValidatedVersion: "0.114.0",
-                LatestVersion: "0.114.0",
+                ValidatedVersion: "0.135.0",
+                LatestVersion: "0.135.0",
                 LatestVersionSource: "npm",
                 LatestVersionVerified: true,
                 AuthJsonPath: Path.Combine(Path.GetTempPath(), ".codex", "auth.json"),
@@ -275,13 +275,13 @@ public sealed class InstallCommandTests
                 LoginConfigured: false,
                 BlockingIssues:
                 [
-                    "Codex CLI 0.113.0 is older than the Symphony-validated version 0.114.0.",
+                    "Codex CLI 0.113.0 is older than the Symphony-validated version 0.135.0.",
                     $"Codex auth file is missing: '{Path.Combine(Path.GetTempPath(), ".codex", "auth.json")}'."
                 ],
                 Warnings: [],
                 RemediationSteps:
                 [
-                    "Update Codex CLI with `npm install -g @openai/codex@0.114.0`.",
+                    "Update Codex CLI with `npm install -g @openai/codex@0.135.0`.",
                     "Run `codex login` in another terminal, finish the sign-in flow, then return here."
                 ]);
     }

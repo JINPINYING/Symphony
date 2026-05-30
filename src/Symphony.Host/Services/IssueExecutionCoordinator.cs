@@ -642,16 +642,41 @@ public sealed class IssueExecutionCoordinator(
 
     private static void ApplyTokenTotals(RunEntity run, AgentRunUpdate update)
     {
-        (run.InputTokens, run.LastReportedInputTokens) = AccumulateAbsoluteTotal(run.InputTokens, run.LastReportedInputTokens, update.InputTokens);
-        (run.OutputTokens, run.LastReportedOutputTokens) = AccumulateAbsoluteTotal(run.OutputTokens, run.LastReportedOutputTokens, update.OutputTokens);
-        (run.TotalTokens, run.LastReportedTotalTokens) = AccumulateAbsoluteTotal(run.TotalTokens, run.LastReportedTotalTokens, update.TotalTokens);
+        (run.InputTokens, run.LastReportedInputTokens) = AccumulateTokenTotal(run.InputTokens, run.LastReportedInputTokens, update.InputTokens, update.TokenUsageIsDelta);
+        (run.OutputTokens, run.LastReportedOutputTokens) = AccumulateTokenTotal(run.OutputTokens, run.LastReportedOutputTokens, update.OutputTokens, update.TokenUsageIsDelta);
+        (run.TotalTokens, run.LastReportedTotalTokens) = AccumulateTokenTotal(run.TotalTokens, run.LastReportedTotalTokens, update.TotalTokens, update.TokenUsageIsDelta);
     }
 
     private static void ApplyTokenTotals(SessionEntity session, AgentRunUpdate update)
     {
-        (session.CodexInputTokens, session.LastReportedInputTokens) = AccumulateAbsoluteTotal(session.CodexInputTokens, session.LastReportedInputTokens, update.InputTokens);
-        (session.CodexOutputTokens, session.LastReportedOutputTokens) = AccumulateAbsoluteTotal(session.CodexOutputTokens, session.LastReportedOutputTokens, update.OutputTokens);
-        (session.CodexTotalTokens, session.LastReportedTotalTokens) = AccumulateAbsoluteTotal(session.CodexTotalTokens, session.LastReportedTotalTokens, update.TotalTokens);
+        (session.CodexInputTokens, session.LastReportedInputTokens) = AccumulateTokenTotal(session.CodexInputTokens, session.LastReportedInputTokens, update.InputTokens, update.TokenUsageIsDelta);
+        (session.CodexOutputTokens, session.LastReportedOutputTokens) = AccumulateTokenTotal(session.CodexOutputTokens, session.LastReportedOutputTokens, update.OutputTokens, update.TokenUsageIsDelta);
+        (session.CodexTotalTokens, session.LastReportedTotalTokens) = AccumulateTokenTotal(session.CodexTotalTokens, session.LastReportedTotalTokens, update.TotalTokens, update.TokenUsageIsDelta);
+    }
+
+    private static (int AccumulatedTotal, int LastReportedTotal) AccumulateTokenTotal(
+        int accumulatedTotal,
+        int lastReportedTotal,
+        int? nextObservedTotal,
+        bool tokenUsageIsDelta)
+    {
+        return tokenUsageIsDelta
+            ? AccumulateDeltaTotal(accumulatedTotal, lastReportedTotal, nextObservedTotal)
+            : AccumulateAbsoluteTotal(accumulatedTotal, lastReportedTotal, nextObservedTotal);
+    }
+
+    private static (int AccumulatedTotal, int LastReportedTotal) AccumulateDeltaTotal(
+        int accumulatedTotal,
+        int lastReportedTotal,
+        int? nextObservedDelta)
+    {
+        if (!nextObservedDelta.HasValue)
+        {
+            return (accumulatedTotal, lastReportedTotal);
+        }
+
+        var delta = Math.Max(nextObservedDelta.Value, 0);
+        return (accumulatedTotal + delta, lastReportedTotal + delta);
     }
 
     private static (int AccumulatedTotal, int LastReportedTotal) AccumulateAbsoluteTotal(

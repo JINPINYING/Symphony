@@ -4,7 +4,7 @@ services:
       context: ../..
       dockerfile: Dockerfile
       args:
-        CODEX_NPM_VERSION: ${CODEX_NPM_VERSION:-0.114.0}
+        CODEX_NPM_VERSION: ${CODEX_NPM_VERSION:-0.135.0}
     image: ${SYMPHONY_IMAGE:-symphony:dev}
     restart: unless-stopped
     ports:
