@@ -10,6 +10,8 @@ namespace Symphony.Integration.Tests;
 
 public sealed class CodexAgentRunnerTests
 {
+    private const int AppServerHarnessReadTimeoutMs = 30_000;
+
     [Fact]
     public async Task RunIssueAsync_ShouldUsePropertyParameterNamesForValidationErrors()
     {
@@ -494,7 +496,8 @@ public sealed class CodexAgentRunnerTests
             ApprovalPolicy: "never",
             ThreadSandbox: threadSandbox,
             TurnSandboxPolicy: turnSandboxPolicy,
-            ReadTimeoutMs: 5_000,
+            // Windows CI can take more than five seconds to cold-start the PowerShell fake app-server.
+            ReadTimeoutMs: AppServerHarnessReadTimeoutMs,
             TrackerQuery: trackerQuery);
     }
 
