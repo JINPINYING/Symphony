@@ -132,6 +132,42 @@ public sealed class CodexAgentRunnerTests
     }
 
     [Fact]
+    public void CreateProtocolUpdate_ShouldReadCurrentAppServerThreadTokenUsageShape()
+    {
+        var update = CreateProtocolUpdate("""
+            {
+              "method": "thread/tokenUsage/updated",
+              "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "tokenUsage": {
+                  "total": {
+                    "inputTokens": 110,
+                    "cachedInputTokens": 40,
+                    "outputTokens": 70,
+                    "reasoningOutputTokens": 30,
+                    "totalTokens": 180
+                  },
+                  "last": {
+                    "inputTokens": 11,
+                    "cachedInputTokens": 4,
+                    "outputTokens": 7,
+                    "reasoningOutputTokens": 3,
+                    "totalTokens": 18
+                  },
+                  "modelContextWindow": 258400
+                }
+              }
+            }
+            """);
+
+        Assert.Equal(110, update.InputTokens);
+        Assert.Equal(70, update.OutputTokens);
+        Assert.Equal(180, update.TotalTokens);
+        Assert.False(update.TokenUsageIsDelta);
+    }
+
+    [Fact]
     public void CreateProtocolUpdate_ShouldIgnoreGenericUsageOnOrdinaryEvents()
     {
         var update = CreateProtocolUpdate("""
@@ -589,7 +625,7 @@ public sealed class CodexAgentRunnerTests
             if ($request.method -eq 'thread/start') { @{ id = $request.id; result = @{ thread = @{ id = 'thread-1' } } } | ConvertTo-Json -Compress; continue }
             if ($request.method -eq 'turn/start') {
                 @{ id = $request.id; result = @{ turn = @{ id = 'turn-1' } } } | ConvertTo-Json -Compress
-                @{ method = 'thread/tokenUsage/updated'; params = @{ input_tokens = 11; output_tokens = 7; total_tokens = 18 } } | ConvertTo-Json -Compress
+                @{ method = 'thread/tokenUsage/updated'; params = @{ threadId = 'thread-1'; turnId = 'turn-1'; tokenUsage = @{ total = @{ inputTokens = 11; cachedInputTokens = 3; outputTokens = 7; reasoningOutputTokens = 2; totalTokens = 18 }; last = @{ inputTokens = 5; cachedInputTokens = 1; outputTokens = 3; reasoningOutputTokens = 1; totalTokens = 8 }; modelContextWindow = 258400 } } } | ConvertTo-Json -Depth 6 -Compress
                 @{ method = 'turn/completed'; params = @{ message = 'done' } } | ConvertTo-Json -Compress
                 continue
             }
