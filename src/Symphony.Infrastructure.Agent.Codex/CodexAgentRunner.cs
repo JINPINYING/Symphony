@@ -635,15 +635,7 @@ public sealed partial class CodexAgentRunner(
             return;
         }
 
-        await ReportUpdateAsync(
-            onUpdate,
-            update with
-            {
-                EventType = string.Equals(eventName, "notification", StringComparison.OrdinalIgnoreCase)
-                    ? "notification"
-                    : "other_message"
-            },
-            cancellationToken);
+        await ReportUpdateAsync(onUpdate, update, cancellationToken);
     }
 
     private async Task<string?> RefreshIssueStateAsync(
@@ -1088,7 +1080,7 @@ public sealed partial class CodexAgentRunner(
     {
         var isAbsoluteTokenUsageEvent = IsAbsoluteTokenUsageEvent(eventName);
         if (isAbsoluteTokenUsageEvent &&
-            TryParseUsageObject(GetMessagePayload(root), out usage))
+            TryParseAbsoluteUsageObject(GetMessagePayload(root), out usage))
         {
             usage = usage! with { IsDelta = false };
             return true;
@@ -1101,7 +1093,7 @@ public sealed partial class CodexAgentRunner(
                 continue;
             }
 
-            if (TryParseUsageObject(usageElement, out usage))
+            if (TryParseAbsoluteUsageObject(usageElement, out usage))
             {
                 usage = usage! with { IsDelta = false };
                 return true;
@@ -1122,6 +1114,27 @@ public sealed partial class CodexAgentRunner(
         {
             usage = usage! with { IsDelta = true };
             return true;
+        }
+
+        usage = null;
+        return false;
+    }
+
+    private static bool TryParseAbsoluteUsageObject(JsonElement usageElement, out UsageSnapshot? usage)
+    {
+        if (TryParseUsageObject(usageElement, out usage))
+        {
+            return true;
+        }
+
+        foreach (var propertyName in new[] { "total", "total_token_usage", "totalTokenUsage" })
+        {
+            if (usageElement.ValueKind == JsonValueKind.Object &&
+                usageElement.TryGetProperty(propertyName, out var totalUsageElement) &&
+                TryParseUsageObject(totalUsageElement, out usage))
+            {
+                return true;
+            }
         }
 
         usage = null;

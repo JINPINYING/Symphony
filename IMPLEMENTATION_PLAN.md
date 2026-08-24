@@ -148,6 +148,7 @@ DB operational defaults:
 Phase 0 - Bootstrap (1-2 days)
 - Create solution/projects, CI skeleton, base logging, options model.
 - Add Windows Service host mode and API host wiring.
+- Validate build and tests on both Windows and Linux in pull-request CI.
 - Exit criteria: host boots as service, config loads, health endpoint responds.
 
 Phase 1 - Workflow + Config (2-3 days)

@@ -54,7 +54,7 @@ $env:GITHUB_TOKEN = "<token>"
 
 GitHub Actions now provides:
 
-- `ci.yml` for restore/build/test on pushes and pull requests
+- `ci.yml` for restore/build/test on Windows and Linux for pushes and pull requests
 - `release-packages.yml` for versioned multi-platform bundles on published GitHub Releases
 
 Published releases attach self-contained archives for `win-x64`, `win-arm64`, `linux-x64`, `linux-arm64`, `osx-x64`, and `osx-arm64`.
