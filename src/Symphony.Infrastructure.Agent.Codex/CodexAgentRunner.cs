@@ -635,15 +635,7 @@ public sealed partial class CodexAgentRunner(
             return;
         }
 
-        await ReportUpdateAsync(
-            onUpdate,
-            update with
-            {
-                EventType = string.Equals(eventName, "notification", StringComparison.OrdinalIgnoreCase)
-                    ? "notification"
-                    : "other_message"
-            },
-            cancellationToken);
+        await ReportUpdateAsync(onUpdate, update, cancellationToken);
     }
 
     private async Task<string?> RefreshIssueStateAsync(

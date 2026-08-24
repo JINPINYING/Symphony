@@ -452,7 +452,7 @@ public sealed class CodexAgentRunnerTests
             update.OutputTokens == 7 &&
             update.TotalTokens == 18);
 
-        Assert.Equal("other_message", tokenUpdate.EventType);
+        Assert.Equal("thread/tokenUsage/updated", tokenUpdate.EventType);
         Assert.Equal(11, tokenUpdate.InputTokens);
         Assert.Equal(7, tokenUpdate.OutputTokens);
         Assert.Equal(18, tokenUpdate.TotalTokens);
