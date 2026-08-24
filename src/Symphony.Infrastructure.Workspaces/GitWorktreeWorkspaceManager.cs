@@ -51,8 +51,16 @@ public sealed class GitWorktreeWorkspaceManager(
         await sharedCloneLock.WaitAsync(cancellationToken);
         try
         {
+            using var mutationLock = await AcquireSharedCloneMutationLockAsync(
+                rootPath,
+                sharedClonePath,
+                cancellationToken);
+
             await EnsureSharedCloneAsync(sharedClonePath, request.RemoteRepositoryUrl, cancellationToken);
-            await EnsureLatestFromOriginAsync(sharedClonePath, request.BaseBranch, cancellationToken);
+            var baseBranchSnapshotRef = await EnsureLatestFromOriginAsync(
+                sharedClonePath,
+                request.BaseBranch,
+                cancellationToken);
 
             if (Directory.Exists(worktreePath))
             {
@@ -75,7 +83,7 @@ public sealed class GitWorktreeWorkspaceManager(
                 {
                     await RunGitAsync(
                         sharedClonePath,
-                        ["worktree", "add", "--no-track", "-b", branchName, worktreePath, $"origin/{request.BaseBranch}"],
+                        ["worktree", "add", "--no-track", "-b", branchName, worktreePath, baseBranchSnapshotRef],
                         cancellationToken);
                 }
             }
@@ -173,6 +181,11 @@ public sealed class GitWorktreeWorkspaceManager(
         bool removedNow;
         try
         {
+            using var mutationLock = await AcquireSharedCloneMutationLockAsync(
+                rootPath,
+                sharedClonePath,
+                cancellationToken);
+
             removedNow = await RemoveWorktreePathAsync(sharedClonePath, worktreePath, cancellationToken);
         }
         finally
@@ -246,10 +259,65 @@ public sealed class GitWorktreeWorkspaceManager(
         await RunGitAsync(sharedClonePath, ["remote", "set-url", "origin", remoteRepositoryUrl], cancellationToken);
     }
 
-    private async Task EnsureLatestFromOriginAsync(string sharedClonePath, string baseBranch, CancellationToken cancellationToken)
+    private async Task<string> EnsureLatestFromOriginAsync(
+        string sharedClonePath,
+        string baseBranch,
+        CancellationToken cancellationToken)
     {
-        await RunGitAsync(sharedClonePath, ["fetch", "origin", "--prune"], cancellationToken);
-        await RunGitAsync(sharedClonePath, ["fetch", "origin", baseBranch], cancellationToken);
+        var snapshotRef = GetBaseBranchSnapshotRef(baseBranch);
+        await RunGitAsync(
+            sharedClonePath,
+            ["fetch", "origin", $"+refs/heads/{baseBranch}:{snapshotRef}"],
+            cancellationToken);
+        return snapshotRef;
+    }
+
+    private async Task<IDisposable> AcquireSharedCloneMutationLockAsync(
+        string rootPath,
+        string sharedClonePath,
+        CancellationToken cancellationToken)
+    {
+        var lockPath = GetSharedCloneLockPath(sharedClonePath);
+        WorkspacePathSafety.EnsurePathIsWithinRoot(rootPath, lockPath);
+
+        var lockDirectory = Path.GetDirectoryName(lockPath);
+        if (!string.IsNullOrWhiteSpace(lockDirectory))
+        {
+            Directory.CreateDirectory(lockDirectory);
+        }
+
+        var loggedWait = false;
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            try
+            {
+                var stream = new FileStream(
+                    lockPath,
+                    FileMode.OpenOrCreate,
+                    FileAccess.ReadWrite,
+                    FileShare.None,
+                    bufferSize: 1,
+                    FileOptions.None);
+
+                WriteLockMetadata(stream, sharedClonePath);
+                return stream;
+            }
+            catch (IOException) when (!cancellationToken.IsCancellationRequested)
+            {
+                if (!loggedWait)
+                {
+                    logger.LogInformation(
+                        "Waiting for shared clone mutation lock {LockPath} for {SharedClonePath}.",
+                        lockPath,
+                        sharedClonePath);
+                    loggedWait = true;
+                }
+
+                await Task.Delay(TimeSpan.FromMilliseconds(250), cancellationToken);
+            }
+        }
     }
 
     private async Task<bool> HasLocalBranchAsync(string sharedClonePath, string branchName, CancellationToken cancellationToken)
@@ -378,6 +446,24 @@ public sealed class GitWorktreeWorkspaceManager(
 
     private static SemaphoreSlim GetSharedCloneLock(string sharedClonePath) =>
         SharedCloneLocks.GetOrAdd(sharedClonePath, _ => new SemaphoreSlim(1, 1));
+
+    private static string GetSharedCloneLockPath(string sharedClonePath) =>
+        $"{sharedClonePath}.lock";
+
+    private static string GetBaseBranchSnapshotRef(string baseBranch) =>
+        $"refs/symphony/origin/{baseBranch}";
+
+    private static void WriteLockMetadata(FileStream stream, string sharedClonePath)
+    {
+        var metadata =
+            $"pid={Environment.ProcessId}{Environment.NewLine}" +
+            $"acquired_utc={DateTimeOffset.UtcNow:O}{Environment.NewLine}" +
+            $"shared_clone_path={sharedClonePath}{Environment.NewLine}";
+        var bytes = Encoding.UTF8.GetBytes(metadata);
+        stream.SetLength(0);
+        stream.Write(bytes);
+        stream.Flush(flushToDisk: true);
+    }
 
     private static void EnsureDirectoryPathAvailable(string path, string logicalName)
     {

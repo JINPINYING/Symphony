@@ -71,6 +71,70 @@ public sealed class WorkspaceManagerTests
     }
 
     [Fact]
+    public async Task PrepareIssueWorkspaceAsync_ShouldWaitForSharedCloneMutationLock()
+    {
+        var tempRoot = Path.Combine(Path.GetTempPath(), $"symphony-ws-{Guid.NewGuid():N}");
+        var remoteBare = Path.Combine(tempRoot, "remote.git");
+        var seedClone = Path.Combine(tempRoot, "seed");
+        var workspaceRoot = Path.Combine(tempRoot, "workspaces");
+        var sharedClonePath = Path.Combine(workspaceRoot, "repo");
+        var worktreesRoot = Path.Combine(workspaceRoot, "worktrees");
+        var lockPath = $"{sharedClonePath}.lock";
+
+        try
+        {
+            Directory.CreateDirectory(tempRoot);
+            Directory.CreateDirectory(workspaceRoot);
+
+            await RunGitAsync(tempRoot, ["init", "--bare", remoteBare]);
+            await RunGitAsync(tempRoot, ["clone", remoteBare, seedClone]);
+            await RunGitAsync(seedClone, ["config", "user.name", "symfony-tests"]);
+            await RunGitAsync(seedClone, ["config", "user.email", "symphony-tests@example.com"]);
+            await File.WriteAllTextAsync(Path.Combine(seedClone, "README.md"), "seed");
+            await RunGitAsync(seedClone, ["add", "README.md"]);
+            await RunGitAsync(seedClone, ["commit", "-m", "seed"]);
+            await RunGitAsync(seedClone, ["branch", "-M", "main"]);
+            await RunGitAsync(seedClone, ["push", "-u", "origin", "main"]);
+
+            using var heldLock = new FileStream(
+                lockPath,
+                FileMode.OpenOrCreate,
+                FileAccess.ReadWrite,
+                FileShare.None);
+
+            var manager = new GitWorktreeWorkspaceManager(
+                new NoOpWorkspaceHookRunner(),
+                NullLogger<GitWorktreeWorkspaceManager>.Instance);
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+
+            var prepareTask = manager.PrepareIssueWorkspaceAsync(
+                new WorkspacePreparationRequest(
+                    IssueId: "I1",
+                    IssueIdentifier: "#101",
+                    SuggestedBranchName: null,
+                    WorkspaceRoot: workspaceRoot,
+                    SharedClonePath: sharedClonePath,
+                    WorktreesRoot: worktreesRoot,
+                    BaseBranch: "main",
+                    RemoteRepositoryUrl: remoteBare),
+                cts.Token);
+
+            var firstCompleted = await Task.WhenAny(prepareTask, Task.Delay(TimeSpan.FromMilliseconds(500), cts.Token));
+            Assert.NotSame(prepareTask, firstCompleted);
+
+            heldLock.Dispose();
+
+            var result = await prepareTask.WaitAsync(TimeSpan.FromSeconds(15), CancellationToken.None);
+            Assert.True(result.CreatedNow);
+            Assert.True(Directory.Exists(result.WorkspacePath));
+        }
+        finally
+        {
+            TryDeleteDirectory(tempRoot);
+        }
+    }
+
+    [Fact]
     public async Task CleanupIssueWorkspaceAsync_ShouldRunBeforeRemoveAndDeleteWorktree()
     {
         var tempRoot = Path.Combine(Path.GetTempPath(), $"symphony-ws-{Guid.NewGuid():N}");
