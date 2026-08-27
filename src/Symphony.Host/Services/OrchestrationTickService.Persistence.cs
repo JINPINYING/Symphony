@@ -172,9 +172,12 @@ public sealed partial class OrchestrationTickService
                 refreshedState.State,
                 workflowDefinition.Runtime.Tracker.TerminalStates);
 
-            if (!string.Equals(cachedIssue.State, refreshedState.State, StringComparison.OrdinalIgnoreCase))
+            var refreshedLabelsJson = JsonSerializer.Serialize(refreshedState.Labels);
+            if (!string.Equals(cachedIssue.State, refreshedState.State, StringComparison.OrdinalIgnoreCase) ||
+                !string.Equals(cachedIssue.LabelsJson, refreshedLabelsJson, StringComparison.Ordinal))
             {
                 cachedIssue.State = refreshedState.State;
+                cachedIssue.LabelsJson = refreshedLabelsJson;
                 cachedIssue.CachedAtUtc = refreshedAtUtc;
                 hasChanges = true;
             }
@@ -185,6 +188,23 @@ public sealed partial class OrchestrationTickService
                     cachedIssue,
                     workflowDefinition,
                     instanceId,
+                    cancellationToken);
+
+                continue;
+            }
+
+            if (!IssueStateMatcher.MatchesConfiguredActiveState(
+                    refreshedState.State,
+                    workflowDefinition.Runtime.Tracker.ActiveStates) ||
+                !MatchesRequiredLabels(
+                    refreshedState.Labels,
+                    workflowDefinition.Runtime.Tracker.Labels))
+            {
+                await ReleaseRetryReservationAsync(
+                    cachedIssue.IssueId,
+                    cachedIssue.Identifier,
+                    instanceId,
+                    "issue no longer eligible for dispatch",
                     cancellationToken);
             }
         }

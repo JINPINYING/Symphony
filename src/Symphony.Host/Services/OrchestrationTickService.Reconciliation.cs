@@ -168,6 +168,18 @@ public sealed partial class OrchestrationTickService
                     workflowDefinition.Runtime.Agent.MaxRetryBackoffMs,
                     instanceId,
                     cancellationToken);
+                continue;
+            }
+
+            if (!MatchesRequiredLabels(refreshedState.Labels, workflowDefinition.Runtime.Tracker.Labels))
+            {
+                await RequestRunStopAsync(
+                    run,
+                    RunStopReasons.Inactive,
+                    cleanupWorkspace: false,
+                    workflowDefinition.Runtime.Agent.MaxRetryBackoffMs,
+                    instanceId,
+                    cancellationToken);
             }
         }
 

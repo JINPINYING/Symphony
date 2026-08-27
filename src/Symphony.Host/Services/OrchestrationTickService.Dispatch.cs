@@ -287,6 +287,19 @@ public sealed partial class OrchestrationTickService
         return PassesBlockerRule(issue, workflowDefinition);
     }
 
+    private static bool MatchesRequiredLabels(
+        IReadOnlyList<string> issueLabels,
+        IReadOnlyList<string> requiredLabels)
+    {
+        if (requiredLabels.Count == 0)
+        {
+            return true;
+        }
+
+        var issueLabelSet = new HashSet<string>(issueLabels, StringComparer.OrdinalIgnoreCase);
+        return requiredLabels.All(label => issueLabelSet.Contains(label));
+    }
+
     private static bool PassesBlockerRule(NormalizedIssue issue, WorkflowDefinition workflowDefinition)
     {
         if (!NormalizeStateKey(issue.State).Equals("todo", StringComparison.OrdinalIgnoreCase))

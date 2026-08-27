@@ -303,6 +303,12 @@ public sealed class GitHubTrackerClientTests
                   {
                     "id": "I_100",
                     "state": "OPEN",
+                    "labels": {
+                      "nodes": [
+                        { "name": "Symphony-Test" },
+                        { "name": "backend" }
+                      ]
+                    },
                     "repository": {
                       "name": "symphony",
                       "owner": { "login": "released" }
@@ -311,6 +317,11 @@ public sealed class GitHubTrackerClientTests
                   {
                     "id": "I_200",
                     "state": "CLOSED",
+                    "labels": {
+                      "nodes": [
+                        { "name": "Done" }
+                      ]
+                    },
                     "repository": {
                       "name": "symphony",
                       "owner": { "login": "released" }
@@ -319,6 +330,11 @@ public sealed class GitHubTrackerClientTests
                   {
                     "id": "I_999",
                     "state": "CLOSED",
+                    "labels": {
+                      "nodes": [
+                        { "name": "Other" }
+                      ]
+                    },
                     "repository": {
                       "name": "other",
                       "owner": { "login": "released" }
@@ -352,11 +368,13 @@ public sealed class GitHubTrackerClientTests
             {
                 Assert.Equal("I_200", state.Id);
                 Assert.Equal("Closed", state.State);
+                Assert.Equal(["done"], state.Labels);
             },
             state =>
             {
                 Assert.Equal("I_100", state.Id);
                 Assert.Equal("Open", state.State);
+                Assert.Equal(["symphony-test", "backend"], state.Labels);
             });
     }
 

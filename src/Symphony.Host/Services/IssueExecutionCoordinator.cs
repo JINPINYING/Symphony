@@ -63,6 +63,7 @@ public sealed class IssueExecutionCoordinator(
             var workspaceHookRunner = scope.ServiceProvider.GetRequiredService<IWorkspaceHookRunner>();
             var workflowPromptRenderer = scope.ServiceProvider.GetRequiredService<IWorkflowPromptRenderer>();
             var agentRunner = scope.ServiceProvider.GetRequiredService<IAgentRunner>();
+            var trackerClient = scope.ServiceProvider.GetRequiredService<ITrackerClient>();
             var dbContext = scope.ServiceProvider.GetRequiredService<SymphonyDbContext>();
 
             await AppendEventAsync(
@@ -156,12 +157,26 @@ public sealed class IssueExecutionCoordinator(
 
             if (result.Success)
             {
-                finalStatus = RunStatusNames.Succeeded;
-                retryPlan = new RetryPlan(
-                    Attempt: 1,
-                    DueAtUtc: timeProvider.GetUtcNow().AddMilliseconds(1_000),
-                    DelayType: RetryDelayTypes.Continuation,
-                    Error: null);
+                if (await IsContinuationEligibleAsync(
+                        trackerClient,
+                        trackerQuery,
+                        request,
+                        cancellationToken))
+                {
+                    finalStatus = RunStatusNames.Succeeded;
+                    retryPlan = new RetryPlan(
+                        Attempt: 1,
+                        DueAtUtc: timeProvider.GetUtcNow().AddMilliseconds(1_000),
+                        DelayType: RetryDelayTypes.Continuation,
+                        Error: null);
+                }
+                else
+                {
+                    finalStatus = RunStatusNames.ReleasedIneligible;
+                    finalError = "issue is no longer eligible for dispatch";
+                    releaseClaim = true;
+                    releaseStatus = RunStatusNames.ReleasedIneligible;
+                }
             }
             else
             {
@@ -401,6 +416,67 @@ public sealed class IssueExecutionCoordinator(
         return run is null
             ? (null, false)
             : (run.RequestedStopReason, run.CleanupWorkspaceOnStop);
+    }
+
+    private static async Task<bool> IsContinuationEligibleAsync(
+        ITrackerClient trackerClient,
+        TrackerQuery trackerQuery,
+        IssueExecutionRequest request,
+        CancellationToken cancellationToken)
+    {
+        var refreshedIssues = await trackerClient.FetchIssueStatesByIdsAsync(
+            trackerQuery,
+            [request.Issue.Id],
+            cancellationToken);
+
+        var refreshedIssue = refreshedIssues.FirstOrDefault();
+        if (refreshedIssue is null)
+        {
+            return false;
+        }
+
+        if (!IssueStateMatcher.MatchesConfiguredActiveState(
+                refreshedIssue.State,
+                request.WorkflowDefinition.Runtime.Tracker.ActiveStates))
+        {
+            return false;
+        }
+
+        if (MatchesTerminalState(
+                refreshedIssue.State,
+                request.WorkflowDefinition.Runtime.Tracker.TerminalStates))
+        {
+            return false;
+        }
+
+        return MatchesRequiredLabels(
+            refreshedIssue.Labels,
+            request.WorkflowDefinition.Runtime.Tracker.Labels);
+    }
+
+    private static bool MatchesTerminalState(string state, IReadOnlyList<string> terminalStates)
+    {
+        if (terminalStates.Count == 0)
+        {
+            return IssueStateMatcher.IsClosedState(state);
+        }
+
+        return terminalStates.Any(terminalState =>
+            terminalState.Trim().Equals(state.Trim(), StringComparison.OrdinalIgnoreCase) ||
+            (IssueStateMatcher.IsClosedState(terminalState) && IssueStateMatcher.IsClosedState(state)));
+    }
+
+    private static bool MatchesRequiredLabels(
+        IReadOnlyList<string> issueLabels,
+        IReadOnlyList<string> requiredLabels)
+    {
+        if (requiredLabels.Count == 0)
+        {
+            return true;
+        }
+
+        var issueLabelSet = new HashSet<string>(issueLabels, StringComparer.OrdinalIgnoreCase);
+        return requiredLabels.All(label => issueLabelSet.Contains(label));
     }
 
     private async Task PersistFinalStateAsync(

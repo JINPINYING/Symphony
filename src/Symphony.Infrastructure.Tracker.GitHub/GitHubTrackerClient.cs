@@ -73,6 +73,11 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
             ... on Issue {
               id
               state
+              labels(first: 50) {
+                nodes {
+                  name
+                }
+              }
               repository {
                 name
                 owner {
@@ -177,7 +182,7 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
                 }
 
                 var normalizedState = NormalizeState(GetOptionalString(issueNode, "state")) ?? "Open";
-                statesById[issueId] = new IssueStateSnapshot(issueId, normalizedState);
+                statesById[issueId] = new IssueStateSnapshot(issueId, normalizedState, ParseLabels(issueNode));
             }
         }
 
@@ -401,18 +406,7 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
 
     private static NormalizedIssue ParseIssue(JsonElement issueNode, bool includePullRequests)
     {
-        var labels = issueNode.TryGetProperty("labels", out var labelsNode) &&
-                     labelsNode.ValueKind == JsonValueKind.Object &&
-                     labelsNode.TryGetProperty("nodes", out var labelNodes) &&
-                     labelNodes.ValueKind == JsonValueKind.Array
-            ? labelNodes
-                .EnumerateArray()
-                .Select(node => GetOptionalString(node, "name"))
-                .Where(name => !string.IsNullOrWhiteSpace(name))
-                .Select(name => name!.Trim().ToLowerInvariant())
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .ToList()
-            : [];
+        var labels = ParseLabels(issueNode);
 
         var blockedBy = issueNode.TryGetProperty("blockedBy", out var blockedByNode) &&
                         blockedByNode.ValueKind == JsonValueKind.Object &&
@@ -534,6 +528,22 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
 
         var issueLabelSet = new HashSet<string>(issueLabels, StringComparer.OrdinalIgnoreCase);
         return requestedLabels.All(label => issueLabelSet.Contains(label));
+    }
+
+    private static IReadOnlyList<string> ParseLabels(JsonElement issueNode)
+    {
+        return issueNode.TryGetProperty("labels", out var labelsNode) &&
+               labelsNode.ValueKind == JsonValueKind.Object &&
+               labelsNode.TryGetProperty("nodes", out var labelNodes) &&
+               labelNodes.ValueKind == JsonValueKind.Array
+            ? labelNodes
+                .EnumerateArray()
+                .Select(node => GetOptionalString(node, "name"))
+                .Where(name => !string.IsNullOrWhiteSpace(name))
+                .Select(name => name!.Trim().ToLowerInvariant())
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList()
+            : [];
     }
 
     private static bool MatchesActiveState(string issueState, IReadOnlyList<string> configuredStates)

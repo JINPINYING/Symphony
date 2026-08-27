@@ -358,11 +358,9 @@ public sealed partial class CodexAgentRunner(
                     break;
                 }
 
-                var refreshedState = await RefreshIssueStateAsync(request, cancellationToken);
-                if (!string.IsNullOrWhiteSpace(refreshedState) &&
-                    !IssueStateMatcher.MatchesConfiguredActiveState(
-                        refreshedState,
-                        request.TrackerQuery?.ActiveStates ?? []))
+                var refreshedIssue = await RefreshIssueStateAsync(request, cancellationToken);
+                if (refreshedIssue is not null &&
+                    !IsContinuationEligible(refreshedIssue, request.TrackerQuery))
                 {
                     break;
                 }
@@ -638,7 +636,7 @@ public sealed partial class CodexAgentRunner(
         await ReportUpdateAsync(onUpdate, update, cancellationToken);
     }
 
-    private async Task<string?> RefreshIssueStateAsync(
+    private async Task<IssueStateSnapshot?> RefreshIssueStateAsync(
         AgentRunRequest request,
         CancellationToken cancellationToken)
     {
@@ -654,7 +652,7 @@ public sealed partial class CodexAgentRunner(
                 [request.IssueId],
                 cancellationToken);
 
-            return refreshedStates.FirstOrDefault()?.State;
+            return refreshedStates.FirstOrDefault();
         }
         catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
         {
@@ -663,6 +661,27 @@ public sealed partial class CodexAgentRunner(
                 SecretRedactor.Redact(ex.Message, request.TrackerQuery.ApiKey) ?? "Issue state refresh failed.",
                 ex);
         }
+    }
+
+    private static bool IsContinuationEligible(IssueStateSnapshot refreshedIssue, TrackerQuery? trackerQuery)
+    {
+        if (trackerQuery is null)
+        {
+            return true;
+        }
+
+        if (!IssueStateMatcher.MatchesConfiguredActiveState(refreshedIssue.State, trackerQuery.ActiveStates))
+        {
+            return false;
+        }
+
+        if (trackerQuery.Labels.Count == 0)
+        {
+            return true;
+        }
+
+        var issueLabelSet = new HashSet<string>(refreshedIssue.Labels, StringComparer.OrdinalIgnoreCase);
+        return trackerQuery.Labels.All(label => issueLabelSet.Contains(label));
     }
 
     private async Task<object> ExecuteToolCallAsync(

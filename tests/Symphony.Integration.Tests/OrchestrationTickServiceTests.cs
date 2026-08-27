@@ -234,6 +234,64 @@ public sealed class OrchestrationTickServiceTests
     }
 
     [Fact]
+    public async Task RunTickAsync_ShouldStopRunningRunWhenRequiredLabelIsRemoved()
+    {
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1, labels: ["symphony-test"]),
+            tracker: new FakeTrackerClient(
+                [],
+                issueStatesById: new Dictionary<string, string>
+                {
+                    ["issue-1"] = "Open"
+                },
+                issueLabelsById: new Dictionary<string, IReadOnlyList<string>>
+                {
+                    ["issue-1"] = []
+                }),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning, stopReturnsFalse: true));
+
+        await harness.InsertRunningRunAsync("issue-1", "#1", "Open", "instance-1");
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Empty(harness.WorkspaceManager.CleanupRequests);
+        Assert.Empty(await harness.DbContext.RetryQueue.ToListAsync());
+        Assert.Equal(RunStatusNames.CanceledByReconciliation, (await harness.DbContext.Runs.SingleAsync()).Status);
+        Assert.Equal(RunStatusNames.CanceledByReconciliation, (await harness.DbContext.DispatchClaims.SingleAsync()).Status);
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldReleaseContinuationRetryWhenRequiredLabelIsRemoved()
+    {
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1, labels: ["symphony-test"]),
+            tracker: new FakeTrackerClient(
+                [],
+                issueStatesById: new Dictionary<string, string>
+                {
+                    ["issue-1"] = "Open"
+                },
+                issueLabelsById: new Dictionary<string, IReadOnlyList<string>>
+                {
+                    ["issue-1"] = []
+                }),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await harness.InsertIssueCacheAsync("issue-1", "#1", "Open", DateTimeOffset.UtcNow.AddMinutes(-5));
+        await harness.InsertRetryingRunAsync("issue-1", "#1", "Open", "instance-1");
+        var retry = await harness.DbContext.RetryQueue.SingleAsync();
+        retry.DueAtUtc = DateTimeOffset.UtcNow.AddHours(1);
+        await harness.DbContext.SaveChangesAsync();
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Empty(await harness.DbContext.RetryQueue.ToListAsync());
+        Assert.Equal(RunStatusNames.ReleasedIneligible, (await harness.DbContext.Runs.SingleAsync()).Status);
+        Assert.Equal(RunStatusNames.ReleasedIneligible, (await harness.DbContext.DispatchClaims.SingleAsync()).Status);
+        Assert.Equal("[]", (await harness.DbContext.IssueCache.SingleAsync()).LabelsJson);
+    }
+
+    [Fact]
     public async Task RunTickAsync_ShouldDetectStalledRunsFromLastActivity()
     {
         await using var harness = await TestHarness.CreateAsync(
@@ -307,6 +365,7 @@ public sealed class OrchestrationTickServiceTests
         int maxConcurrentAgents,
         IReadOnlyList<string>? activeStates = null,
         IReadOnlyDictionary<string, int>? maxConcurrentByState = null,
+        IReadOnlyList<string>? labels = null,
         string apiKey = "test-token")
     {
         var runtime = new WorkflowRuntimeSettings(
@@ -318,7 +377,7 @@ public sealed class OrchestrationTickServiceTests
                 Repo: "symphony",
                 Milestone: null,
                 IncludePullRequests: true,
-                Labels: [],
+                Labels: labels ?? [],
                 ActiveStates: activeStates ?? ["Open"],
                 TerminalStates: ["Closed"]),
             new WorkflowPollingSettings(600_000),
@@ -594,11 +653,15 @@ public sealed class OrchestrationTickServiceTests
 
     private sealed class FakeTrackerClient(
         IReadOnlyList<NormalizedIssue> issues,
-        IReadOnlyDictionary<string, string>? issueStatesById = null) : IGitHubTrackerClient
+        IReadOnlyDictionary<string, string>? issueStatesById = null,
+        IReadOnlyDictionary<string, IReadOnlyList<string>>? issueLabelsById = null) : IGitHubTrackerClient
     {
         private readonly Dictionary<string, string> statesById = issueStatesById is null
             ? new(StringComparer.OrdinalIgnoreCase)
             : new(issueStatesById, StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, IReadOnlyList<string>> labelsById = issueLabelsById is null
+            ? new(StringComparer.OrdinalIgnoreCase)
+            : new(issueLabelsById, StringComparer.OrdinalIgnoreCase);
 
         public bool FetchCandidateIssuesCalled { get; private set; }
 
@@ -615,7 +678,10 @@ public sealed class OrchestrationTickServiceTests
         {
             var snapshots = issueIds
                 .Where(id => statesById.ContainsKey(id))
-                .Select(id => new IssueStateSnapshot(id, statesById[id]))
+                .Select(id => new IssueStateSnapshot(
+                    id,
+                    statesById[id],
+                    labelsById.TryGetValue(id, out var labels) ? labels : []))
                 .ToList();
             return Task.FromResult<IReadOnlyList<IssueStateSnapshot>>(snapshots);
         }

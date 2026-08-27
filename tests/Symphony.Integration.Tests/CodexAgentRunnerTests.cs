@@ -305,6 +305,35 @@ public sealed class CodexAgentRunnerTests
     }
 
     [Fact]
+    public async Task RunIssueAsync_ShouldStopContinuationTurnsWhenRequiredLabelIsRemoved()
+    {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            return;
+        }
+
+        var tracker = new SequencedTrackerClient(
+            ["Open", "Open"],
+            labels: [["symphony-test"], []]);
+        var runner = CreateRunner(tracker);
+        using var harness = CreateAppServerHarness(StandardCompletionScript());
+
+        var result = await runner.RunIssueAsync(
+            CreateRequest(
+                "id-5b",
+                "#5b",
+                harness.WorkspacePath,
+                harness.Command,
+                30_000,
+                maxTurns: 3,
+                trackerQuery: CreateTrackerQuery(labels: ["symphony-test"])));
+
+        Assert.True(result.Success, result.Stderr);
+        Assert.Equal(2, tracker.RefreshCount);
+        Assert.Equal(2, CountOccurrences(result.Stdout, "\"turn/completed\""));
+    }
+
+    [Fact]
     public async Task RunIssueAsync_ShouldAutoApproveSupportedRequestsAndExecuteGithubGraphQlTool()
     {
         if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
@@ -348,7 +377,7 @@ public sealed class CodexAgentRunnerTests
 
         var tracker = new SequencedTrackerClient(
             ["Closed"],
-            new GitHubGraphQlExecutionResult(
+            graphQlResult: new GitHubGraphQlExecutionResult(
                 false,
                 "{\"errors\":[{\"message\":\"boom\"}]}",
                 "github_graphql_errors",
@@ -501,7 +530,7 @@ public sealed class CodexAgentRunnerTests
             TrackerQuery: trackerQuery);
     }
 
-    private static TrackerQuery CreateTrackerQuery()
+    private static TrackerQuery CreateTrackerQuery(IReadOnlyList<string>? labels = null)
     {
         return new TrackerQuery(
             Endpoint: "https://api.github.com/graphql",
@@ -509,7 +538,7 @@ public sealed class CodexAgentRunnerTests
             Owner: "released",
             Repo: "symphony",
             ActiveStates: ["Open"],
-            Labels: [],
+            Labels: labels ?? [],
             Milestone: null);
     }
 
@@ -678,9 +707,11 @@ public sealed class CodexAgentRunnerTests
 
     private sealed class SequencedTrackerClient(
         IReadOnlyList<string> states,
+        IReadOnlyList<IReadOnlyList<string>>? labels = null,
         GitHubGraphQlExecutionResult? graphQlResult = null) : ITrackerClient
     {
         private readonly Queue<string> pendingStates = new(states);
+        private readonly Queue<IReadOnlyList<string>> pendingLabels = new(labels ?? []);
         private readonly GitHubGraphQlExecutionResult configuredGraphQlResult =
             graphQlResult ?? new GitHubGraphQlExecutionResult(true, "{\"data\":{\"viewer\":{\"login\":\"nick\"}}}");
 
@@ -696,7 +727,8 @@ public sealed class CodexAgentRunnerTests
         {
             RefreshCount++;
             var nextState = pendingStates.Count == 0 ? "Closed" : pendingStates.Dequeue();
-            return Task.FromResult<IReadOnlyList<IssueStateSnapshot>>([new IssueStateSnapshot(issueIds[0], nextState)]);
+            var nextLabels = pendingLabels.Count == 0 ? [] : pendingLabels.Dequeue();
+            return Task.FromResult<IReadOnlyList<IssueStateSnapshot>>([new IssueStateSnapshot(issueIds[0], nextState, nextLabels)]);
         }
 
         public Task<GitHubGraphQlExecutionResult> ExecuteGitHubGraphQlAsync(TrackerQuery query, string graphQlDocument, string? variablesJson, CancellationToken cancellationToken = default)
