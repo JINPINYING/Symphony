@@ -13,6 +13,7 @@ public sealed class ContinuousTurnBudgetTests
     [InlineData(40, 20, true)]
     [InlineData(41, 20, true)]
     [InlineData(2, 1, true)]
+    [InlineData(2147483647, 2147483647, false)]
     public void HasExceededContinuousTurnBudget_ShouldBoundLiveContinuationLoops(
         int turnCount,
         int maxTurns,
