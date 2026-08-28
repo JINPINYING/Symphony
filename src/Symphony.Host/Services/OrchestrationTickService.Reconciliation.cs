@@ -181,18 +181,26 @@ public sealed partial class OrchestrationTickService
         CancellationToken cancellationToken)
     {
         var stallTimeoutMs = workflowDefinition.Runtime.Codex.StallTimeoutMs;
-        if (stallTimeoutMs <= 0)
-        {
-            return;
-        }
-
         var nowUtc = timeProvider.GetUtcNow();
+
         foreach (var run in runningIssues.Where(run => run.OwnerInstanceId.Equals(instanceId, StringComparison.OrdinalIgnoreCase)))
         {
             var lastActivity = run.LastEventAtUtc ?? run.StartedAtUtc;
-            if ((nowUtc - lastActivity).TotalMilliseconds <= stallTimeoutMs)
+            var inactivityStalled = stallTimeoutMs > 0 &&
+                                    (nowUtc - lastActivity).TotalMilliseconds > stallTimeoutMs;
+            var continuousTurnBudgetExceeded = HasExceededContinuousTurnBudget(run, workflowDefinition);
+
+            if (!inactivityStalled && !continuousTurnBudgetExceeded)
             {
                 continue;
+            }
+
+            if (continuousTurnBudgetExceeded && !inactivityStalled)
+            {
+                logger.LogWarning(
+                    "Run for issue {IssueIdentifier} exceeded the continuous turn safety budget with {TurnCount} turns while Codex activity remained live. Requesting a bounded stalled retry.",
+                    run.IssueIdentifier,
+                    run.TurnCount);
             }
 
             await RequestRunStopAsync(
@@ -203,6 +211,13 @@ public sealed partial class OrchestrationTickService
                 instanceId,
                 cancellationToken);
         }
+    }
+
+    private static bool HasExceededContinuousTurnBudget(RunEntity run, WorkflowDefinition workflowDefinition)
+    {
+        var maxTurnsPerWorker = Math.Max(workflowDefinition.Runtime.Agent.MaxTurns, 1);
+        var maxContinuousTurns = (long)maxTurnsPerWorker * 2;
+        return run.TurnCount >= maxContinuousTurns;
     }
 
     private async Task RequestRunStopAsync(

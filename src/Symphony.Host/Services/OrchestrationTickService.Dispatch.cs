@@ -90,7 +90,14 @@ public sealed partial class OrchestrationTickService
                 continue;
             }
 
-            if (await DispatchIssueAsync(retryIssue, workflowDefinition, instanceId, retryEntry.Attempt, countsByState, cancellationToken))
+            if (await DispatchIssueAsync(
+                    retryIssue,
+                    workflowDefinition,
+                    instanceId,
+                    retryEntry.Attempt,
+                    countsByState,
+                    cancellationToken,
+                    resetContinuousTurnBudget: retryEntry.DelayType == RetryDelayTypes.Backoff))
             {
                 runningIssueIds.Add(retryIssue.Id);
             }
@@ -121,7 +128,8 @@ public sealed partial class OrchestrationTickService
         string instanceId,
         int? attempt,
         Dictionary<string, int> countsByState,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool resetContinuousTurnBudget = false)
     {
         var claimed = await coordinationStore.TryClaimIssueAsync(
             issue.Id,
@@ -170,6 +178,10 @@ public sealed partial class OrchestrationTickService
             run.LastReportedInputTokens = 0;
             run.LastReportedOutputTokens = 0;
             run.LastReportedTotalTokens = 0;
+            if (resetContinuousTurnBudget)
+            {
+                run.TurnCount = 0;
+            }
         }
 
         var runAttempt = new RunAttemptEntity
