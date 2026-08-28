@@ -216,7 +216,7 @@ public sealed partial class OrchestrationTickService
     private static bool HasExceededContinuousTurnBudget(RunEntity run, WorkflowDefinition workflowDefinition)
     {
         var maxTurnsPerWorker = Math.Max(workflowDefinition.Runtime.Agent.MaxTurns, 1);
-        var maxContinuousTurns = checked(maxTurnsPerWorker * 2);
+        var maxContinuousTurns = (long)maxTurnsPerWorker * 2;
         return run.TurnCount >= maxContinuousTurns;
     }
 
