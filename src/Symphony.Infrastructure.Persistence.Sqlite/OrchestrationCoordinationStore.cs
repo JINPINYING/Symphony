@@ -8,6 +8,8 @@ public sealed class OrchestrationCoordinationStore(
     SymphonyDbContext dbContext,
     TimeProvider timeProvider) : IOrchestrationCoordinationStore
 {
+    private const int StartupAttemptBudget = 2;
+
     public async Task<bool> AcquireOrRenewLeaseAsync(
         string leaseName,
         string instanceId,
@@ -102,6 +104,29 @@ public sealed class OrchestrationCoordinationStore(
         {
             if (activeClaim.ClaimedByInstanceId.Equals(instanceId, StringComparison.OrdinalIgnoreCase))
             {
+                var retryReservation = await dbContext.RetryQueue
+                    .SingleOrDefaultAsync(item => item.IssueId == issueId, cancellationToken);
+
+                if (retryReservation is not null)
+                {
+                    var runAttemptCount = await dbContext.RunAttempts
+                        .CountAsync(item => item.RunId == retryReservation.RunId, cancellationToken);
+                    var hasStartedSession = await dbContext.Sessions
+                        .AnyAsync(item => item.RunId == retryReservation.RunId, cancellationToken);
+
+                    if (!hasStartedSession && runAttemptCount >= StartupAttemptBudget)
+                    {
+                        await transaction.RollbackAsync(cancellationToken);
+                        return false;
+                    }
+
+                    if (retryReservation.DueAtUtc > nowUtc)
+                    {
+                        await transaction.RollbackAsync(cancellationToken);
+                        return false;
+                    }
+                }
+
                 activeClaim.UpdatedAtUtc = nowUtc;
                 await dbContext.SaveChangesAsync(cancellationToken);
                 await transaction.CommitAsync(cancellationToken);
