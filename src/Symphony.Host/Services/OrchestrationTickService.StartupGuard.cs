@@ -30,10 +30,11 @@ public sealed partial class OrchestrationTickService
         {
             var activeAttempts = await dbContext.RunAttempts
                 .Where(attempt => attempt.RunId == run.Id && attempt.CompletedAtUtc == null)
-                .OrderByDescending(attempt => attempt.StartedAtUtc)
                 .ToListAsync(cancellationToken);
 
-            var activeAttempt = activeAttempts.FirstOrDefault();
+            var activeAttempt = activeAttempts
+                .OrderByDescending(attempt => attempt.StartedAtUtc)
+                .FirstOrDefault();
             if (activeAttempt is null || !IsStartupAttemptStale(activeAttempt.StartedAtUtc, nowUtc, startupTimeout))
             {
                 continue;
