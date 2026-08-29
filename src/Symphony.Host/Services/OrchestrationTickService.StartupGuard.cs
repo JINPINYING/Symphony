@@ -44,7 +44,7 @@ public sealed partial class OrchestrationTickService
             var exhausted = HasExhaustedStartupAttemptBudget(attemptCount);
             var age = nowUtc - activeAttempt.StartedAtUtc;
             var message = exhausted
-                ? $"Startup retry budget exhausted after {attemptCount} attempts without a Codex session. Latest attempt {activeAttempt.Id} remained pre-session for {(int)age.TotalSeconds}s."
+                ? $"Startup retry budget exhausted after {attemptCount} attempts without a Codex session. Latest attempt {activeAttempt.Id} remained pre-session for {(int)age.TotalSeconds}s. The active claim remains reserved so ordinary candidate polling cannot start a third attempt."
                 : $"Startup attempt {activeAttempt.Id} remained pre-session for {(int)age.TotalSeconds}s and exceeded the {startupTimeout.TotalSeconds:0}s startup timeout.";
 
             dbContext.EventLog.Add(new EventLogEntity
@@ -72,9 +72,12 @@ public sealed partial class OrchestrationTickService
                 exhausted,
                 (int)age.TotalSeconds);
 
+            // Use the stalled path for both cases so the issue claim remains owned. When the
+            // second pre-session attempt is exhausted, TryClaimIssueAsync observes the durable
+            // attempt history and refuses any third dispatch even after the retry due time.
             await RequestRunStopAsync(
                 run,
-                exhausted ? RunStopReasons.Inactive : RunStopReasons.Stalled,
+                RunStopReasons.Stalled,
                 cleanupWorkspace: false,
                 workflowDefinition.Runtime.Agent.MaxRetryBackoffMs,
                 instanceId,
