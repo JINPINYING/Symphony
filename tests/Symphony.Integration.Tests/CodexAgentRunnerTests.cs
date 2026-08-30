@@ -10,7 +10,12 @@ namespace Symphony.Integration.Tests;
 
 public sealed class CodexAgentRunnerTests
 {
-    private const int AppServerHarnessReadTimeoutMs = 30_000;
+    // Cold windows-latest runners have been observed to exceed 30s starting the
+    // PowerShell fake app-server (main CI run 33291288584 failed with
+    // response_timeout at exactly 30s). Tests that assert timeout behavior key off
+    // TimeoutMs, not this read timeout, so a generous value only slows a run whose
+    // fake server is genuinely wedged.
+    private const int AppServerHarnessReadTimeoutMs = 120_000;
 
     [Fact]
     public async Task RunIssueAsync_ShouldUsePropertyParameterNamesForValidationErrors()
