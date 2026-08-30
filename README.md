@@ -30,6 +30,7 @@ Release bundle installation guidance is in [docs/PackageGuide.md](docs/PackageGu
 - GitHub issue normalization now includes linked branch metadata, blocker references, milestone data, and optional PR metadata for prompt rendering and orchestration.
 - SQLite persists workflow snapshots, issue cache, runs, run attempts, sessions, retry queue entries, workspace records, event log entries, leases, and dispatch claims for restart recovery and debugging.
 - Dispatch enforces exact active-state matching, per-state concurrency caps, continuation retries, exponential-backoff retries, and the `Todo` blocker rule.
+- Candidate acquisition has a 60-second bounded fallback scan and durable observability for first eligible sighting, claim attempts, claim outcomes, refusal reasons, stale reservation reconciliation, and 2-minute delayed-acquisition warnings.
 - Reconciliation refreshes issue states every tick, stops non-active or terminal runs, cleans terminal workspaces for running and retrying issues, and reschedules stalled runs from the last Codex activity timestamp.
 - Codex app-server sessions now support streamed multi-turn execution on a shared thread, permissive auto-approval, structured tool-call failures, and the `github_graphql` client-side tool.
 - Runtime state, tracked issue distribution, recent events, lease snapshots, token totals, and latest rate-limit payloads are available through the HTTP API and are derived from persisted orchestrator state. Token totals advance only from absolute Codex usage snapshots, not ordinary per-event `usage` maps.

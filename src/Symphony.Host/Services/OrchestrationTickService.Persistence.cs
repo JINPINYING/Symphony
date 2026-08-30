@@ -100,18 +100,43 @@ public sealed partial class OrchestrationTickService
         await dbContext.SaveChangesAsync(cancellationToken);
     }
 
-    private async Task UpsertIssueCacheAsync(IReadOnlyList<NormalizedIssue> issues, CancellationToken cancellationToken)
+    private async Task UpsertIssueCacheAsync(
+        IReadOnlyList<NormalizedIssue> issues,
+        WorkflowDefinition workflowDefinition,
+        CancellationToken cancellationToken)
     {
         var cachedAtUtc = timeProvider.GetUtcNow();
+        var activeIssueIds = await dbContext.Runs
+            .Where(run => run.Status == RunStatusNames.Running || run.Status == RunStatusNames.Retrying)
+            .Select(run => run.IssueId)
+            .ToListAsync(cancellationToken);
+        var activeIssueIdSet = new HashSet<string>(activeIssueIds, StringComparer.OrdinalIgnoreCase);
+
         foreach (var issue in issues)
         {
+            var isEligible = IsCandidateEligibleForAcquisitionSlo(issue, workflowDefinition);
+            var isUnclaimedEligibilityEpisode = isEligible && !activeIssueIdSet.Contains(issue.Id);
             var existing = await dbContext.IssueCache.SingleOrDefaultAsync(
                 entity => entity.IssueId == issue.Id,
                 cancellationToken);
 
             if (existing is null)
             {
-                dbContext.IssueCache.Add(CreateIssueCacheEntity(issue, cachedAtUtc));
+                var entity = CreateIssueCacheEntity(issue, cachedAtUtc);
+                if (isUnclaimedEligibilityEpisode)
+                {
+                    entity.EligibleSeenAtUtc = cachedAtUtc;
+                    AddIssueEvent(
+                        issue.Id,
+                        issue.Identifier,
+                        null,
+                        null,
+                        "candidate_discovered",
+                        LogLevel.Information,
+                        $"Issue {issue.Identifier} first observed as acquisition-eligible.");
+                }
+
+                dbContext.IssueCache.Add(entity);
                 continue;
             }
 
@@ -135,6 +160,24 @@ public sealed partial class OrchestrationTickService
             existing.BlockedByJson = JsonSerializer.Serialize(issue.BlockedBy);
             existing.CreatedAtUtc = issue.CreatedAt;
             existing.UpdatedAtUtc = issue.UpdatedAt;
+            if (isUnclaimedEligibilityEpisode && existing.EligibleSeenAtUtc is null)
+            {
+                existing.EligibleSeenAtUtc = cachedAtUtc;
+                AddIssueEvent(
+                    issue.Id,
+                    issue.Identifier,
+                    null,
+                    null,
+                    "candidate_discovered",
+                    LogLevel.Information,
+                    $"Issue {issue.Identifier} first observed as acquisition-eligible.");
+            }
+
+            if (!isEligible)
+            {
+                existing.EligibleSeenAtUtc = null;
+            }
+
             existing.CachedAtUtc = cachedAtUtc;
         }
 
@@ -378,6 +421,28 @@ public sealed partial class OrchestrationTickService
             UpdatedAtUtc = issue.UpdatedAt,
             CachedAtUtc = cachedAtUtc
         };
+    }
+
+    private void AddIssueEvent(
+        string? issueId,
+        string? issueIdentifier,
+        string? runId,
+        string? runAttemptId,
+        string eventName,
+        LogLevel level,
+        string message)
+    {
+        dbContext.EventLog.Add(new EventLogEntity
+        {
+            IssueId = issueId,
+            IssueIdentifier = issueIdentifier,
+            RunId = runId,
+            RunAttemptId = runAttemptId,
+            EventName = eventName,
+            Level = level.ToString(),
+            Message = message,
+            OccurredAtUtc = timeProvider.GetUtcNow()
+        });
     }
 
     private static TrackerQuery BuildTrackerQuery(WorkflowDefinition workflowDefinition, string apiKey)

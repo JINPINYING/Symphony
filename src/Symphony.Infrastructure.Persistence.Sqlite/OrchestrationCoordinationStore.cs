@@ -87,7 +87,7 @@ public sealed class OrchestrationCoordinationStore(
         await dbContext.SaveChangesAsync(cancellationToken);
     }
 
-    public async Task<bool> TryClaimIssueAsync(
+    public async Task<IssueClaimResult> TryClaimIssueAsync(
         string issueId,
         string issueIdentifier,
         string leaseName,
@@ -117,20 +117,20 @@ public sealed class OrchestrationCoordinationStore(
                     if (!hasStartedSession && runAttemptCount >= StartupAttemptBudget)
                     {
                         await transaction.RollbackAsync(cancellationToken);
-                        return false;
+                        return IssueClaimResult.Refused("startup_attempt_fence");
                     }
 
                     if (retryReservation.DueAtUtc > nowUtc)
                     {
                         await transaction.RollbackAsync(cancellationToken);
-                        return false;
+                        return IssueClaimResult.Refused("retry_reservation_not_due");
                     }
                 }
 
                 activeClaim.UpdatedAtUtc = nowUtc;
                 await dbContext.SaveChangesAsync(cancellationToken);
                 await transaction.CommitAsync(cancellationToken);
-                return true;
+                return IssueClaimResult.Accepted();
             }
 
             var matchingLeases = await dbContext.InstanceLeases
@@ -143,7 +143,7 @@ public sealed class OrchestrationCoordinationStore(
             if (ownerHasLiveLease)
             {
                 await transaction.RollbackAsync(cancellationToken);
-                return false;
+                return IssueClaimResult.Refused("active_lease");
             }
 
             activeClaim.ClaimedByInstanceId = instanceId;
@@ -152,7 +152,7 @@ public sealed class OrchestrationCoordinationStore(
             activeClaim.ReleasedAtUtc = null;
             await dbContext.SaveChangesAsync(cancellationToken);
             await transaction.CommitAsync(cancellationToken);
-            return true;
+            return IssueClaimResult.Accepted();
         }
 
         dbContext.DispatchClaims.Add(new DispatchClaimEntity
@@ -169,12 +169,12 @@ public sealed class OrchestrationCoordinationStore(
         {
             await dbContext.SaveChangesAsync(cancellationToken);
             await transaction.CommitAsync(cancellationToken);
-            return true;
+            return IssueClaimResult.Accepted();
         }
         catch (DbUpdateException)
         {
             await transaction.RollbackAsync(cancellationToken);
-            return false;
+            return IssueClaimResult.Refused("active_claim_conflict");
         }
     }
 

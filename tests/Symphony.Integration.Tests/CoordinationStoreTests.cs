@@ -33,12 +33,13 @@ public sealed class CoordinationStoreTests
 
             var claimA = await storeA.TryClaimIssueAsync("issue-1", "#1", "dispatch", "instance-a");
             var claimB = await storeB.TryClaimIssueAsync("issue-1", "#1", "dispatch", "instance-b");
-            Assert.True(claimA);
-            Assert.False(claimB);
+            Assert.True(claimA.Claimed);
+            Assert.False(claimB.Claimed);
+            Assert.Equal("active_lease", claimB.Reason);
 
             await storeA.ReleaseIssueClaimAsync("issue-1", "instance-a", "released");
             var claimBAfterRelease = await storeB.TryClaimIssueAsync("issue-1", "#1", "dispatch", "instance-b");
-            Assert.True(claimBAfterRelease);
+            Assert.True(claimBAfterRelease.Claimed);
         }
         finally
         {
@@ -71,11 +72,12 @@ public sealed class CoordinationStoreTests
 
             Assert.True(await storeA.AcquireOrRenewLeaseAsync("dispatch", "instance-a", TimeSpan.FromMinutes(5)));
             Assert.True(await storeA.AcquireOrRenewLeaseAsync("status-snapshot", "instance-a", TimeSpan.FromMinutes(5)));
-            Assert.True(await storeA.TryClaimIssueAsync("issue-1", "#1", "dispatch", "instance-a"));
+            Assert.True((await storeA.TryClaimIssueAsync("issue-1", "#1", "dispatch", "instance-a")).Claimed);
 
             var claimedByOtherInstance = await storeB.TryClaimIssueAsync("issue-1", "#1", "dispatch", "instance-b");
 
-            Assert.False(claimedByOtherInstance);
+            Assert.False(claimedByOtherInstance.Claimed);
+            Assert.Equal("active_lease", claimedByOtherInstance.Reason);
         }
         finally
         {

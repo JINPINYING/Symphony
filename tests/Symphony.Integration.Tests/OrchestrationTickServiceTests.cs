@@ -1,4 +1,5 @@
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Symphony.Core.Abstractions;
@@ -410,6 +411,254 @@ public sealed class OrchestrationTickServiceTests
     }
 
     [Fact]
+    public async Task RunTickAsync_ShouldPersistCandidateDiscoveryAndClaimEventsForNewEligibleIssue()
+    {
+        var now = DateTimeOffset.Parse("2026-08-29T16:32:14Z");
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: new FakeTrackerClient([BuildIssue("issue-86", "#86", "Open", null)]),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning),
+            timeProvider: new FixedTimeProvider(now));
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var cachedIssue = await harness.DbContext.IssueCache.SingleAsync();
+        Assert.Null(cachedIssue.EligibleSeenAtUtc);
+
+        var eventNames = (await harness.DbContext.EventLog.ToListAsync())
+            .Select(entry => entry.EventName)
+            .ToList();
+        Assert.Contains("candidate_discovered", eventNames);
+        Assert.Contains("claim_attempted", eventNames);
+        Assert.Contains("claim_succeeded", eventNames);
+        Assert.Single(harness.Coordinator.StartRequests);
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldNotRecordContradictoryRefusalAfterRetryClaimSucceeds()
+    {
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 5),
+            tracker: new FakeTrackerClient([BuildIssue("issue-86", "#86", "Open", null)]),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await harness.InsertRetryingRunAsync("issue-86", "#86", "Open", "instance-1");
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var events = await harness.DbContext.EventLog.ToListAsync();
+        Assert.Contains(events, entry => entry.EventName == "claim_succeeded");
+        Assert.DoesNotContain(
+            events,
+            entry => entry.EventName == "claim_refused" && entry.Message.Contains("already_running"));
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldDeduplicateCapacityRefusalsWithinEligibilityEpisode()
+    {
+        var now = DateTimeOffset.Parse("2026-08-29T18:35:00Z");
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: new FakeTrackerClient([BuildIssue("issue-86", "#86", "Open", null)]),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning, stopReturnsFalse: true),
+            timeProvider: new FixedTimeProvider(now));
+
+        await harness.InsertIssueCacheAsync(
+            "issue-86",
+            "#86",
+            "Open",
+            cachedAtUtc: now.AddMinutes(-3),
+            eligibleSeenAtUtc: now.AddMinutes(-3));
+        await harness.InsertRunningRunAsync("issue-1", "#1", "Open", "instance-1");
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var refusalCount = await harness.DbContext.EventLog.CountAsync(
+            entry => entry.EventName == "claim_refused" && entry.Message.Contains("concurrency_limit"));
+        var warningCount = await harness.DbContext.EventLog.CountAsync(
+            entry => entry.EventName == "candidate_acquisition_delayed");
+        Assert.Equal(1, refusalCount);
+        Assert.Equal(1, warningCount);
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldReconcileStaleClaimBeforeAcquiringEligibleIssue()
+    {
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: new FakeTrackerClient([BuildIssue("issue-86", "#86", "Open", null)]),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await harness.InsertActiveClaimAsync("issue-86", "#86", "instance-1", DateTimeOffset.UtcNow.AddHours(-2));
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Single(harness.Coordinator.StartRequests);
+        Assert.Contains(
+            await harness.DbContext.DispatchClaims.ToListAsync(),
+            claim => claim.IssueId == "issue-86" && claim.Status == "active");
+        Assert.Contains(
+            await harness.DbContext.EventLog.ToListAsync(),
+            entry => entry.EventName == "stale_reservation_reconciled");
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldAcquireNextEligibleIssueAfterPriorIssueBecomesTerminal()
+    {
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: new FakeTrackerClient(
+                [BuildIssue("issue-2", "#2", "Open", null)],
+                issueStatesById: new Dictionary<string, string>
+                {
+                    ["issue-1"] = "Closed"
+                }),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning, stopReturnsFalse: true));
+
+        await harness.InsertRunningRunAsync("issue-1", "#1", "Open", "instance-1");
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Single(harness.Coordinator.StartRequests);
+        Assert.Equal("issue-2", harness.Coordinator.StartRequests.Single().Issue.Id);
+        Assert.Equal(RunStatusNames.CanceledByReconciliation, (await harness.DbContext.Runs.SingleAsync(run => run.IssueId == "issue-1")).Status);
+        Assert.Equal(RunStatusNames.Running, (await harness.DbContext.Runs.SingleAsync(run => run.IssueId == "issue-2")).Status);
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldAcquireQueuedIssueAfterRestartWithoutDuplicateRun()
+    {
+        var now = DateTimeOffset.Parse("2026-08-29T18:32:24Z");
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: new FakeTrackerClient([BuildIssue("issue-86", "#86", "Open", null)]),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning),
+            timeProvider: new FixedTimeProvider(now));
+
+        await harness.InsertIssueCacheAsync(
+            "issue-86",
+            "#86",
+            "Open",
+            cachedAtUtc: now.AddMinutes(-1),
+            eligibleSeenAtUtc: now.AddMinutes(-1));
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Single(harness.Coordinator.StartRequests);
+        Assert.Single(await harness.DbContext.Runs.Where(run => run.IssueId == "issue-86").ToListAsync());
+        Assert.Single(await harness.DbContext.DispatchClaims.Where(claim => claim.IssueId == "issue-86" && claim.Status == "active").ToListAsync());
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldAcquireQueuedIssueWhenCapacityFrees()
+    {
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: new FakeTrackerClient([BuildIssue("issue-86", "#86", "Open", null)]),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await harness.InsertRunningRunAsync("issue-1", "#1", "Open", "instance-1");
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        Assert.Empty(harness.Coordinator.StartRequests);
+
+        var priorRun = await harness.DbContext.Runs.SingleAsync(run => run.IssueId == "issue-1");
+        priorRun.Status = RunStatusNames.Succeeded;
+        priorRun.CompletedAtUtc = DateTimeOffset.UtcNow;
+        var priorClaim = await harness.DbContext.DispatchClaims.SingleAsync(claim => claim.IssueId == "issue-1");
+        priorClaim.Status = RunStatusNames.Succeeded;
+        priorClaim.ReleasedAtUtc = DateTimeOffset.UtcNow;
+        priorClaim.UpdatedAtUtc = DateTimeOffset.UtcNow;
+        await harness.DbContext.SaveChangesAsync();
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Single(harness.Coordinator.StartRequests);
+        Assert.Equal("issue-86", harness.Coordinator.StartRequests.Single().Issue.Id);
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldWarnWhenEligibleIssueIsDelayedByCapacity()
+    {
+        var now = DateTimeOffset.Parse("2026-08-29T18:35:00Z");
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: new FakeTrackerClient([BuildIssue("issue-86", "#86", "Open", null)]),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning),
+            timeProvider: new FixedTimeProvider(now));
+
+        await harness.InsertIssueCacheAsync(
+            "issue-86",
+            "#86",
+            "Open",
+            cachedAtUtc: now.AddMinutes(-3),
+            eligibleSeenAtUtc: now.AddMinutes(-3));
+        await harness.InsertRunningRunAsync("issue-1", "#1", "Open", "instance-1");
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Empty(harness.Coordinator.StartRequests);
+        var events = await harness.DbContext.EventLog.ToListAsync();
+        Assert.Contains(events, entry => entry.EventName == "claim_refused" && entry.Message.Contains("concurrency_limit"));
+        Assert.Contains(events, entry => entry.EventName == "candidate_acquisition_delayed");
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldPersistCandidateScanFailure()
+    {
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: new FakeTrackerClient([], throwOnFetchCandidates: true),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Contains(
+            await harness.DbContext.EventLog.ToListAsync(),
+            entry => entry.EventName == "candidate_scan_failed" && entry.Level == LogLevel.Error.ToString());
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldAcquireIssueAfterTwoHourDelaySignature()
+    {
+        var now = DateTimeOffset.Parse("2026-08-29T18:32:24Z");
+        var coordinator = new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning, stopReturnsFalse: true);
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: new FakeTrackerClient([BuildIssue("issue-86", "#86", "Open", null)]),
+            coordinator,
+            timeProvider: new FixedTimeProvider(now));
+
+        await harness.InsertIssueCacheAsync(
+            "issue-86",
+            "#86",
+            "Open",
+            cachedAtUtc: now.AddHours(-2),
+            eligibleSeenAtUtc: now.AddHours(-2));
+        await harness.InsertRunningRunAsync(
+            "issue-1",
+            "#1",
+            "Open",
+            "instance-1",
+            startedAtUtc: now.AddHours(-2),
+            lastEventAtUtc: now.AddHours(-2));
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var retryingRun = await harness.DbContext.Runs.SingleAsync(run => run.IssueId == "issue-1");
+        Assert.Equal(RunStatusNames.Retrying, retryingRun.Status);
+        Assert.Single(harness.Coordinator.StartRequests);
+        Assert.Equal("issue-86", harness.Coordinator.StartRequests.Single().Issue.Id);
+        var run = await harness.DbContext.Runs.SingleAsync(run => run.IssueId == "issue-86");
+        Assert.Equal(RunStatusNames.Running, run.Status);
+        Assert.Contains(
+            await harness.DbContext.EventLog.ToListAsync(),
+            entry => entry.EventName == "claim_succeeded" && entry.IssueId == "issue-86");
+    }
+
+    [Fact]
     public async Task RunTickAsync_ShouldHonorPerStateConcurrencyLimits()
     {
         var workflow = BuildWorkflowDefinition(
@@ -750,7 +999,8 @@ public sealed class OrchestrationTickServiceTests
         public static async Task<TestHarness> CreateAsync(
             WorkflowDefinition workflowDefinition,
             FakeTrackerClient tracker,
-            FakeIssueExecutionCoordinator coordinator)
+            FakeIssueExecutionCoordinator coordinator,
+            TimeProvider? timeProvider = null)
         {
             var dbPath = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid():N}-orchestration.db");
             var options = new DbContextOptionsBuilder<SymphonyDbContext>()
@@ -763,11 +1013,12 @@ public sealed class OrchestrationTickServiceTests
 
             var workspaceManager = new FakeWorkspaceManager();
             coordinator.Attach(dbContext, dbPath);
+            var clock = timeProvider ?? TimeProvider.System;
 
             var service = new OrchestrationTickService(
                 new FakeWorkflowDefinitionProvider(workflowDefinition),
                 tracker,
-                new OrchestrationCoordinationStore(dbContext, TimeProvider.System),
+                new OrchestrationCoordinationStore(dbContext, clock),
                 dbContext,
                 workspaceManager,
                 coordinator,
@@ -777,7 +1028,7 @@ public sealed class OrchestrationTickServiceTests
                     LeaseName = "poll-dispatch",
                     LeaseTtlSeconds = 900
                 }),
-                TimeProvider.System,
+                clock,
                 NullLogger<OrchestrationTickService>.Instance);
 
             return new TestHarness(dbPath, dbContext, tracker, workspaceManager, coordinator, service);
@@ -846,6 +1097,7 @@ public sealed class OrchestrationTickServiceTests
             string identifier,
             string state,
             DateTimeOffset? cachedAtUtc = null,
+            DateTimeOffset? eligibleSeenAtUtc = null,
             string pullRequestsJson = "[]")
         {
             var nowUtc = cachedAtUtc ?? DateTimeOffset.UtcNow;
@@ -858,8 +1110,28 @@ public sealed class OrchestrationTickServiceTests
                 LabelsJson = "[]",
                 PullRequestsJson = pullRequestsJson,
                 BlockedByJson = "[]",
+                EligibleSeenAtUtc = eligibleSeenAtUtc,
                 CachedAtUtc = nowUtc,
                 UpdatedAtUtc = nowUtc
+            });
+
+            await DbContext.SaveChangesAsync();
+        }
+
+        public async Task InsertActiveClaimAsync(
+            string issueId,
+            string identifier,
+            string instanceId,
+            DateTimeOffset claimedAtUtc)
+        {
+            DbContext.DispatchClaims.Add(new DispatchClaimEntity
+            {
+                IssueId = issueId,
+                IssueIdentifier = identifier,
+                ClaimedByInstanceId = instanceId,
+                ClaimedAtUtc = claimedAtUtc,
+                UpdatedAtUtc = claimedAtUtc,
+                Status = "active"
             });
 
             await DbContext.SaveChangesAsync();
@@ -993,7 +1265,8 @@ public sealed class OrchestrationTickServiceTests
     private sealed class FakeTrackerClient(
         IReadOnlyList<NormalizedIssue> issues,
         IReadOnlyDictionary<string, string>? issueStatesById = null,
-        bool throwOnFetchStatesByIds = false) : IGitHubTrackerClient
+        bool throwOnFetchStatesByIds = false,
+        bool throwOnFetchCandidates = false) : IGitHubTrackerClient
     {
         private readonly Dictionary<string, string> statesById = issueStatesById is null
             ? new(StringComparer.OrdinalIgnoreCase)
@@ -1003,6 +1276,11 @@ public sealed class OrchestrationTickServiceTests
 
         public Task<IReadOnlyList<NormalizedIssue>> FetchCandidateIssuesAsync(TrackerQuery query, CancellationToken cancellationToken = default)
         {
+            if (throwOnFetchCandidates)
+            {
+                throw new InvalidOperationException("simulated candidate scan outage");
+            }
+
             FetchCandidateIssuesCalled = true;
             return Task.FromResult(issues);
         }
@@ -1032,6 +1310,11 @@ public sealed class OrchestrationTickServiceTests
         {
             return Task.FromResult(new GitHubGraphQlExecutionResult(true, "{\"data\":{}}"));
         }
+    }
+
+    private sealed class FixedTimeProvider(DateTimeOffset utcNow) : TimeProvider
+    {
+        public override DateTimeOffset GetUtcNow() => utcNow;
     }
 
     private sealed class FakeWorkspaceManager : IWorkspaceManager
