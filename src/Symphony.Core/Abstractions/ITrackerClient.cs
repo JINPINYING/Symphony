@@ -50,4 +50,9 @@ public interface ITrackerClient
         TrackerQuery query,
         string issueId,
         CancellationToken cancellationToken = default);
+
+    Task<PullRequestStatus?> FetchPullRequestStatusAsync(
+        TrackerQuery query,
+        int pullRequestNumber,
+        CancellationToken cancellationToken = default);
 }

@@ -482,6 +482,32 @@ public sealed partial class OrchestrationTickService
             directive: directive);
     }
 
+    // M4: dispatch a phase-orchestrated run (review/final review on the other
+    // vendor, or the single bounded repair) outside the ordinary candidate loop.
+    private async Task<bool> DispatchPhaseIssueAsync(
+        NormalizedIssue issue,
+        WorkflowDefinition workflowDefinition,
+        string instanceId,
+        PhaseDispatchRequest phaseRequest,
+        CancellationToken cancellationToken)
+    {
+        var runningRuns = await dbContext.Runs
+            .Where(run => run.Status == RunStatusNames.Running)
+            .ToListAsync(cancellationToken);
+        var countsByState = runningRuns
+            .GroupBy(run => NormalizeStateKey(run.State), StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(group => group.Key, group => group.Count(), StringComparer.OrdinalIgnoreCase);
+
+        return await DispatchIssueAsync(
+            issue,
+            workflowDefinition,
+            instanceId,
+            attempt: null,
+            countsByState,
+            cancellationToken,
+            phaseDispatch: phaseRequest);
+    }
+
     private async Task<bool> DispatchIssueAsync(
         NormalizedIssue issue,
         WorkflowDefinition workflowDefinition,
@@ -490,7 +516,8 @@ public sealed partial class OrchestrationTickService
         Dictionary<string, int> countsByState,
         CancellationToken cancellationToken,
         bool resetContinuousTurnBudget = false,
-        DirectiveDispatchContext? directive = null)
+        DirectiveDispatchContext? directive = null,
+        PhaseDispatchRequest? phaseDispatch = null)
     {
         AddIssueEvent(
             issue.Id,
@@ -547,7 +574,7 @@ public sealed partial class OrchestrationTickService
                 (runEntity.Status == RunStatusNames.Running || runEntity.Status == RunStatusNames.Retrying))
             .SingleOrDefaultAsync(cancellationToken);
 
-        var dispatchPhase = directive?.Phase ?? RunPhaseNames.Implementation;
+        var dispatchPhase = phaseDispatch?.Phase ?? directive?.Phase ?? RunPhaseNames.Implementation;
         if (run is null)
         {
             run = new RunEntity
@@ -636,7 +663,9 @@ public sealed partial class OrchestrationTickService
                 workflowDefinition,
                 DirectiveInstructions: directive?.Instructions,
                 DirectiveAction: directive?.Action,
-                DirectivePhase: directive?.Phase),
+                DirectivePhase: directive?.Phase,
+                PromptOverride: phaseDispatch?.Prompt,
+                RunnerOverride: phaseDispatch?.RunnerName),
             cancellationToken);
 
         if (!started)

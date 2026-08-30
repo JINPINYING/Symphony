@@ -65,9 +65,12 @@ public sealed class IssueExecutionCoordinator(
             var agentRunnerResolver = scope.ServiceProvider.GetRequiredService<IAgentRunnerResolver>();
             var dbContext = scope.ServiceProvider.GetRequiredService<SymphonyDbContext>();
 
-            // M4: pick the implementer for this issue (label-routed rollout) and
-            // record it on the run so stall detection uses the right window.
-            var runnerSelection = agentRunnerResolver.Resolve(request.WorkflowDefinition, request.Issue);
+            // M4: pick the implementer for this issue (label-routed rollout, or a
+            // phase dispatch's forced runner) and record it on the run so stall
+            // detection uses the right window.
+            var runnerSelection = request.RunnerOverride is null
+                ? agentRunnerResolver.Resolve(request.WorkflowDefinition, request.Issue)
+                : agentRunnerResolver.ResolveByName(request.WorkflowDefinition, request.RunnerOverride);
             var runEntity = await dbContext.Runs.SingleOrDefaultAsync(
                 run => run.Id == request.RunId,
                 cancellationToken);
@@ -138,13 +141,14 @@ public sealed class IssueExecutionCoordinator(
                 request.WorkflowDefinition.Runtime.Hooks.TimeoutMs,
                 cancellationToken);
 
-            var prompt = workflowPromptRenderer.RenderForIssue(
+            var prompt = request.PromptOverride ?? workflowPromptRenderer.RenderForIssue(
                 request.WorkflowDefinition,
                 request.Issue,
                 request.Attempt);
 
-            if (!string.IsNullOrWhiteSpace(request.DirectiveInstructions) ||
-                !string.IsNullOrWhiteSpace(request.DirectiveAction))
+            if (request.PromptOverride is null &&
+                (!string.IsNullOrWhiteSpace(request.DirectiveInstructions) ||
+                 !string.IsNullOrWhiteSpace(request.DirectiveAction)))
             {
                 prompt +=
                     "\n\n## COMMAND CENTER DIRECTIVE (authoritative for this dispatch)\n" +

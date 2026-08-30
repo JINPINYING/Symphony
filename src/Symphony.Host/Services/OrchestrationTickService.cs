@@ -20,6 +20,7 @@ public sealed partial class OrchestrationTickService
     private readonly IIssueExecutionCoordinator issueExecutionCoordinator;
     private readonly EscalationPublisher escalationPublisher;
     private readonly DirectiveProcessor directiveProcessor;
+    private readonly PhaseOrchestrator phaseOrchestrator;
     private readonly OrchestrationOptions orchestrationOptions;
     private readonly TimeProvider timeProvider;
     private readonly ILogger<OrchestrationTickService> logger;
@@ -33,6 +34,7 @@ public sealed partial class OrchestrationTickService
         IIssueExecutionCoordinator issueExecutionCoordinator,
         EscalationPublisher escalationPublisher,
         DirectiveProcessor directiveProcessor,
+        PhaseOrchestrator phaseOrchestrator,
         IOptions<OrchestrationOptions> orchestrationOptions,
         TimeProvider timeProvider,
         ILogger<OrchestrationTickService> logger)
@@ -45,6 +47,7 @@ public sealed partial class OrchestrationTickService
         this.issueExecutionCoordinator = issueExecutionCoordinator;
         this.escalationPublisher = escalationPublisher;
         this.directiveProcessor = directiveProcessor;
+        this.phaseOrchestrator = phaseOrchestrator;
         this.orchestrationOptions = orchestrationOptions.Value;
         this.timeProvider = timeProvider;
         this.logger = logger;
@@ -163,6 +166,14 @@ public sealed partial class OrchestrationTickService
                 workflowDefinition,
                 BuildTrackerQuery(workflowDefinition, apiKey),
                 (issue, directive, token) => DispatchDirectiveIssueAsync(issue, workflowDefinition, instanceId, directive, token),
+                cancellationToken);
+
+            // M4: advance verify/review phases for issues whose implementation is
+            // durable (exact-head CI gate, cross-vendor review, bounded repair).
+            await phaseOrchestrator.ProcessPhasesAsync(
+                workflowDefinition,
+                BuildTrackerQuery(workflowDefinition, apiKey),
+                (issue, phaseRequest, token) => DispatchPhaseIssueAsync(issue, workflowDefinition, instanceId, phaseRequest, token),
                 cancellationToken);
             return workflowDefinition.Runtime.Polling.IntervalMs;
         }

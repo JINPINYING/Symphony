@@ -388,6 +388,14 @@ public sealed class HostLifecycleTests
         {
             return Task.CompletedTask;
         }
+
+        public Task<PullRequestStatus?> FetchPullRequestStatusAsync(
+            TrackerQuery query,
+            int pullRequestNumber,
+            CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult<PullRequestStatus?>(null);
+        }
     }
 
     private sealed class CurrentDirectoryScope : IDisposable

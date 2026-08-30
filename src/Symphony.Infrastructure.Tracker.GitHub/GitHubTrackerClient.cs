@@ -562,6 +562,95 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
         return result;
     }
 
+    private const string GraphQlPullRequestStatusQuery = """
+        query($owner: String!, $repo: String!, $number: Int!) {
+          repository(owner: $owner, name: $repo) {
+            pullRequest(number: $number) {
+              number
+              state
+              isDraft
+              mergeable
+              headRefOid
+              commits(last: 1) {
+                nodes {
+                  commit {
+                    statusCheckRollup {
+                      state
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        """;
+
+    public async Task<PullRequestStatus?> FetchPullRequestStatusAsync(
+        TrackerQuery query,
+        int pullRequestNumber,
+        CancellationToken cancellationToken = default)
+    {
+        var endpoint = string.IsNullOrWhiteSpace(query.Endpoint) ? "https://api.github.com/graphql" : query.Endpoint;
+
+        using var request = BuildGraphQlRequest(
+            endpoint,
+            query.ApiKey,
+            GraphQlPullRequestStatusQuery,
+            new
+            {
+                owner = query.Owner,
+                repo = query.Repo,
+                number = pullRequestNumber
+            });
+
+        using var response = await SendAsync(request, cancellationToken);
+        using var document = await ParseGraphQlDocumentAsync(response, cancellationToken);
+
+        var dataElement = GetRequiredObject(document.RootElement, "data");
+        if (!dataElement.TryGetProperty("repository", out var repositoryNode) ||
+            repositoryNode.ValueKind != JsonValueKind.Object ||
+            !repositoryNode.TryGetProperty("pullRequest", out var prNode) ||
+            prNode.ValueKind != JsonValueKind.Object)
+        {
+            return null;
+        }
+
+        var headSha = GetOptionalString(prNode, "headRefOid");
+        var state = GetOptionalString(prNode, "state");
+        if (string.IsNullOrWhiteSpace(headSha) || string.IsNullOrWhiteSpace(state))
+        {
+            return null;
+        }
+
+        string? checksState = null;
+        if (prNode.TryGetProperty("commits", out var commitsNode) &&
+            commitsNode.ValueKind == JsonValueKind.Object &&
+            commitsNode.TryGetProperty("nodes", out var commitNodes) &&
+            commitNodes.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var commitWrapper in commitNodes.EnumerateArray())
+            {
+                if (commitWrapper.ValueKind == JsonValueKind.Object &&
+                    commitWrapper.TryGetProperty("commit", out var commitNode) &&
+                    commitNode.ValueKind == JsonValueKind.Object &&
+                    commitNode.TryGetProperty("statusCheckRollup", out var rollupNode) &&
+                    rollupNode.ValueKind == JsonValueKind.Object)
+                {
+                    checksState = GetOptionalString(rollupNode, "state");
+                }
+            }
+        }
+
+        var isDraft = prNode.TryGetProperty("isDraft", out var draftNode) && draftNode.ValueKind == JsonValueKind.True;
+        return new PullRequestStatus(
+            pullRequestNumber,
+            state,
+            isDraft,
+            headSha,
+            checksState,
+            GetOptionalString(prNode, "mergeable"));
+    }
+
     public async Task CloseIssueAsync(
         TrackerQuery query,
         string issueId,

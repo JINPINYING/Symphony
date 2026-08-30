@@ -21,4 +21,9 @@ public sealed record IssueExecutionRequest(
     // the rendered prompt so the worker executes with the owner's instructions.
     string? DirectiveInstructions = null,
     string? DirectiveAction = null,
-    string? DirectivePhase = null);
+    string? DirectivePhase = null,
+    // M4 phase dispatches: a complete replacement prompt (review/repair
+    // templates) and a forced runner (cross-vendor review must not follow the
+    // implementation label routing).
+    string? PromptOverride = null,
+    string? RunnerOverride = null);

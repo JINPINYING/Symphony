@@ -22,6 +22,8 @@ public sealed record AgentRunnerSelection(
 public interface IAgentRunnerResolver
 {
     AgentRunnerSelection Resolve(WorkflowDefinition workflowDefinition, NormalizedIssue issue);
+
+    AgentRunnerSelection ResolveByName(WorkflowDefinition workflowDefinition, string runnerName);
 }
 
 // M4 rollout (blueprint decision 7): an issue's labels pick its implementer.
@@ -35,8 +37,11 @@ public sealed class AgentRunnerResolver(
 {
     public AgentRunnerSelection Resolve(WorkflowDefinition workflowDefinition, NormalizedIssue issue)
     {
-        var runnerName = ResolveRunnerName(workflowDefinition.Runtime.Agent, issue.Labels);
+        return ResolveByName(workflowDefinition, ResolveRunnerName(workflowDefinition.Runtime.Agent, issue.Labels));
+    }
 
+    public AgentRunnerSelection ResolveByName(WorkflowDefinition workflowDefinition, string runnerName)
+    {
         if (string.Equals(runnerName, AgentRunnerNames.Claude, StringComparison.OrdinalIgnoreCase))
         {
             var settings = workflowDefinition.Runtime.Claude;
