@@ -62,15 +62,26 @@ public sealed class IssueExecutionCoordinator(
             var workspaceManager = scope.ServiceProvider.GetRequiredService<IWorkspaceManager>();
             var workspaceHookRunner = scope.ServiceProvider.GetRequiredService<IWorkspaceHookRunner>();
             var workflowPromptRenderer = scope.ServiceProvider.GetRequiredService<IWorkflowPromptRenderer>();
-            var agentRunner = scope.ServiceProvider.GetRequiredService<IAgentRunner>();
+            var agentRunnerResolver = scope.ServiceProvider.GetRequiredService<IAgentRunnerResolver>();
             var dbContext = scope.ServiceProvider.GetRequiredService<SymphonyDbContext>();
+
+            // M4: pick the implementer for this issue (label-routed rollout) and
+            // record it on the run so stall detection uses the right window.
+            var runnerSelection = agentRunnerResolver.Resolve(request.WorkflowDefinition, request.Issue);
+            var runEntity = await dbContext.Runs.SingleOrDefaultAsync(
+                run => run.Id == request.RunId,
+                cancellationToken);
+            if (runEntity is not null)
+            {
+                runEntity.Runner = runnerSelection.RunnerName;
+            }
 
             await AppendEventAsync(
                 dbContext,
                 request,
                 "dispatch_started",
                 LogLevel.Information,
-                $"Dispatch started for {request.Issue.Identifier}.",
+                $"Dispatch started for {request.Issue.Identifier} on runner '{runnerSelection.RunnerName}'.",
                 cancellationToken);
 
             var remoteUrl = ResolveRemoteUrl(
@@ -150,20 +161,20 @@ public sealed class IssueExecutionCoordinator(
                 request.WorkflowDefinition,
                 WorkflowDispatchPreflightValidator.ValidateAndResolveApiKey(request.WorkflowDefinition));
 
-            var result = await agentRunner.RunIssueAsync(
+            var result = await runnerSelection.Runner.RunIssueAsync(
                 new AgentRunRequest(
                     request.Issue.Id,
                     request.Issue.Identifier,
                     request.Issue.Title,
                     workspace.WorkspacePath,
                     prompt,
-                    request.WorkflowDefinition.Runtime.Codex.Command,
-                    request.WorkflowDefinition.Runtime.Codex.TurnTimeoutMs,
+                    runnerSelection.Command,
+                    runnerSelection.TurnTimeoutMs,
                     request.WorkflowDefinition.Runtime.Agent.MaxTurns,
-                    request.WorkflowDefinition.Runtime.Codex.ApprovalPolicy,
-                    request.WorkflowDefinition.Runtime.Codex.ThreadSandbox,
-                    request.WorkflowDefinition.Runtime.Codex.TurnSandboxPolicy,
-                    request.WorkflowDefinition.Runtime.Codex.ReadTimeoutMs,
+                    runnerSelection.ApprovalPolicy,
+                    runnerSelection.ThreadSandbox,
+                    runnerSelection.TurnSandboxPolicy,
+                    runnerSelection.ReadTimeoutMs,
                     trackerQuery),
                 (update, token) => PersistAgentUpdateAsync(request, update, token),
                 cancellationToken);

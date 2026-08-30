@@ -47,7 +47,9 @@ public sealed class WorkflowPromptRendererTests
                 MaxConcurrentAgents: 5,
                 MaxTurns: 20,
                 MaxRetryBackoffMs: 300_000,
-                MaxConcurrentAgentsByState: new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)),
+                MaxConcurrentAgentsByState: new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase),
+                DefaultRunner: "codex",
+                RunnerByLabel: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)),
             new WorkflowServerSettings(Port: null),
             new WorkflowWorkspaceSettings(
                 Root: "./workspaces",
@@ -68,7 +70,8 @@ public sealed class WorkflowPromptRendererTests
                 ThreadSandbox: "danger-full-access",
                 TurnSandboxPolicy: "danger-full-access",
                 ReadTimeoutMs: 5000,
-                StallTimeoutMs: 300_000));
+                StallTimeoutMs: 300_000),
+            new WorkflowClaudeSettings("claude", 30_000, "bypassPermissions", null, 600_000));
 
         return new WorkflowDefinition(
             Config: new Dictionary<string, object?>(),

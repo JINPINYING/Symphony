@@ -13,6 +13,10 @@ public sealed class RunEntity
     // reconciliation distinguish an unfinished IMPLEMENTATION from later
     // VERIFY/REVIEW/FINAL_REVIEW work so an existing PR is never reimplemented.
     public string Phase { get; set; } = "implementation";
+
+    // Which agent runner executes this run (M4): codex or claude. Stall detection
+    // and dashboards read it — a slower runner gets a wider stall window.
+    public string Runner { get; set; } = "codex";
     public int? CurrentRetryAttempt { get; set; }
     public string? WorkspacePath { get; set; }
     public string? SessionId { get; set; }

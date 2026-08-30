@@ -61,7 +61,88 @@ public sealed class WorkflowLoaderTests
             Assert.Equal("danger-full-access", definition.Runtime.Codex.TurnSandboxPolicy);
             Assert.Equal(5_000, definition.Runtime.Codex.ReadTimeoutMs);
             Assert.Equal(300_000, definition.Runtime.Codex.StallTimeoutMs);
+            Assert.Equal("claude", definition.Runtime.Claude.Command);
+            Assert.Equal(3_600_000, definition.Runtime.Claude.TurnTimeoutMs);
+            Assert.Equal("bypassPermissions", definition.Runtime.Claude.PermissionMode);
+            Assert.Null(definition.Runtime.Claude.Model);
+            Assert.Equal(600_000, definition.Runtime.Claude.StallTimeoutMs);
+            Assert.Equal("codex", definition.Runtime.Agent.DefaultRunner);
+            Assert.Empty(definition.Runtime.Agent.RunnerByLabel);
             Assert.Equal("Test prompt body.", definition.PromptTemplate);
+        }
+        finally
+        {
+            File.Delete(workflowPath);
+        }
+    }
+
+    [Fact]
+    public async Task LoadAsync_ShouldParseClaudeSettingsAndRunnerRouting()
+    {
+        var workflowPath = CreateWorkflowPath();
+        await File.WriteAllTextAsync(workflowPath, """
+            ---
+            tracker:
+              kind: github
+              endpoint: https://api.github.com/graphql
+              api_key: test-token
+              owner: released
+              repo: symphony
+            agent:
+              default_runner: codex
+              runner_by_label:
+                lane:control-plane: claude
+            claude:
+              command: claude
+              turn_timeout_ms: 1800000
+              permission_mode: acceptEdits
+              model: claude-sonnet-5
+              stall_timeout_ms: 480000
+            ---
+            Prompt.
+            """);
+
+        try
+        {
+            var definition = await new WorkflowLoader().LoadAsync(workflowPath);
+
+            Assert.Equal("codex", definition.Runtime.Agent.DefaultRunner);
+            Assert.Equal("claude", definition.Runtime.Agent.RunnerByLabel["lane:control-plane"]);
+            Assert.Equal(1_800_000, definition.Runtime.Claude.TurnTimeoutMs);
+            Assert.Equal("acceptEdits", definition.Runtime.Claude.PermissionMode);
+            Assert.Equal("claude-sonnet-5", definition.Runtime.Claude.Model);
+            Assert.Equal(480_000, definition.Runtime.Claude.StallTimeoutMs);
+        }
+        finally
+        {
+            File.Delete(workflowPath);
+        }
+    }
+
+    [Fact]
+    public async Task LoadAsync_ShouldRejectUnknownRunnerNames()
+    {
+        var workflowPath = CreateWorkflowPath();
+        await File.WriteAllTextAsync(workflowPath, """
+            ---
+            tracker:
+              kind: github
+              endpoint: https://api.github.com/graphql
+              api_key: test-token
+              owner: released
+              repo: symphony
+            agent:
+              runner_by_label:
+                backend: gemini
+            ---
+            Prompt.
+            """);
+
+        try
+        {
+            var ex = await Assert.ThrowsAsync<WorkflowLoadException>(
+                () => new WorkflowLoader().LoadAsync(workflowPath));
+            Assert.Equal("invalid_agent_runner_by_label", ex.Code);
         }
         finally
         {

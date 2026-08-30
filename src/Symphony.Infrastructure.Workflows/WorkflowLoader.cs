@@ -1,4 +1,5 @@
 using Symphony.Core.Defaults;
+using Symphony.Core.Models;
 using Symphony.Infrastructure.Workflows.Models;
 using YamlDotNet.Core;
 using YamlDotNet.Serialization;
@@ -174,6 +175,18 @@ public sealed class WorkflowLoader
         }
 
         var maxConcurrentAgentsByState = GetNormalizedPositiveIntMap(agentMap, "max_concurrent_agents_by_state");
+
+        var defaultRunner = (GetOptionalStringFromOptionalMap(agentMap, "default_runner") ?? AgentRunnerNames.Codex)
+            .Trim().ToLowerInvariant();
+        if (!AgentRunnerNames.IsKnown(defaultRunner))
+        {
+            throw new WorkflowLoadException(
+                "invalid_agent_default_runner",
+                $"agent.default_runner must be one of: {string.Join(", ", AgentRunnerNames.All)}.");
+        }
+
+        var runnerByLabel = GetRunnerByLabelMap(agentMap, "runner_by_label");
+
         var serverMap = GetOptionalMap(config, "server");
         var serverPort = GetOptionalNullableInt(serverMap, "port");
         if (serverPort is < 0)
@@ -246,6 +259,35 @@ public sealed class WorkflowLoader
 
         var codexStallTimeoutMs = GetOptionalInt(codexMap, "stall_timeout_ms", 300_000);
 
+        var claudeMap = GetOptionalMap(config, "claude");
+        var claudeCommand = GetOptionalStringFromOptionalMap(claudeMap, "command") ?? "claude";
+        if (string.IsNullOrWhiteSpace(claudeCommand))
+        {
+            throw new WorkflowLoadException("invalid_claude_command", "claude.command must be non-empty.");
+        }
+
+        var claudeTurnTimeoutMs = GetOptionalInt(claudeMap, "turn_timeout_ms", 3_600_000);
+        if (claudeTurnTimeoutMs <= 0)
+        {
+            throw new WorkflowLoadException("invalid_claude_turn_timeout", "claude.turn_timeout_ms must be > 0.");
+        }
+
+        var claudePermissionMode = GetOptionalStringFromOptionalMap(claudeMap, "permission_mode") ?? "bypassPermissions";
+        if (string.IsNullOrWhiteSpace(claudePermissionMode))
+        {
+            throw new WorkflowLoadException("invalid_claude_permission_mode", "claude.permission_mode must be non-empty.");
+        }
+
+        var claudeModel = GetOptionalStringFromOptionalMap(claudeMap, "model");
+
+        // Claude thinks longer between visible stream events than the Codex
+        // app-server; the default stall window is deliberately wider.
+        var claudeStallTimeoutMs = GetOptionalInt(claudeMap, "stall_timeout_ms", 600_000);
+        if (claudeStallTimeoutMs <= 0)
+        {
+            throw new WorkflowLoadException("invalid_claude_stall_timeout", "claude.stall_timeout_ms must be > 0.");
+        }
+
         return new WorkflowRuntimeSettings(
             new WorkflowTrackerSettings(
                 kind.ToLowerInvariant(),
@@ -263,7 +305,9 @@ public sealed class WorkflowLoader
                 maxConcurrentAgents,
                 maxTurns,
                 maxRetryBackoffMs,
-                maxConcurrentAgentsByState),
+                maxConcurrentAgentsByState,
+                defaultRunner,
+                runnerByLabel),
             new WorkflowServerSettings(serverPort),
             new WorkflowWorkspaceSettings(
                 workspaceRoot,
@@ -284,7 +328,47 @@ public sealed class WorkflowLoader
                 codexThreadSandbox,
                 codexTurnSandboxPolicy,
                 codexReadTimeoutMs,
-                codexStallTimeoutMs));
+                codexStallTimeoutMs),
+            new WorkflowClaudeSettings(
+                claudeCommand,
+                claudeTurnTimeoutMs,
+                claudePermissionMode,
+                claudeModel,
+                claudeStallTimeoutMs));
+    }
+
+    private static Dictionary<string, string> GetRunnerByLabelMap(Dictionary<string, object?>? source, string key)
+    {
+        if (source is null || !source.TryGetValue(key, out var raw) || raw is null)
+        {
+            return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        if (raw is not Dictionary<string, object?> map)
+        {
+            throw new WorkflowLoadException("workflow_parse_error", $"'{key}' must be an object/map.");
+        }
+
+        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (label, rawValue) in map)
+        {
+            if (string.IsNullOrWhiteSpace(label))
+            {
+                continue;
+            }
+
+            var runner = (rawValue as string)?.Trim().ToLowerInvariant();
+            if (string.IsNullOrWhiteSpace(runner) || !AgentRunnerNames.IsKnown(runner))
+            {
+                throw new WorkflowLoadException(
+                    "invalid_agent_runner_by_label",
+                    $"agent.runner_by_label['{label}'] must be one of: {string.Join(", ", AgentRunnerNames.All)}.");
+            }
+
+            result[label.Trim()] = runner;
+        }
+
+        return result;
     }
 
     private static Dictionary<string, object?>? GetOptionalMap(IReadOnlyDictionary<string, object?> source, string key)

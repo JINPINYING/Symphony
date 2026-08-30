@@ -5,6 +5,7 @@
     <ProjectReference Include="..\Symphony.Infrastructure.Persistence.Sqlite\Symphony.Infrastructure.Persistence.Sqlite.csproj" />
     <ProjectReference Include="..\Symphony.Infrastructure.Tracker.GitHub\Symphony.Infrastructure.Tracker.GitHub.csproj" />
     <ProjectReference Include="..\Symphony.Infrastructure.Agent.Codex\Symphony.Infrastructure.Agent.Codex.csproj" />
+    <ProjectReference Include="..\Symphony.Infrastructure.Agent.Claude\Symphony.Infrastructure.Agent.Claude.csproj" />
     <ProjectReference Include="..\Symphony.Infrastructure.Workflows\Symphony.Infrastructure.Workflows.csproj" />
     <ProjectReference Include="..\Symphony.Infrastructure.Workspaces\Symphony.Infrastructure.Workspaces.csproj" />
   </ItemGroup>

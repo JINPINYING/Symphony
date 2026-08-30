@@ -180,11 +180,15 @@ public sealed partial class OrchestrationTickService
         string instanceId,
         CancellationToken cancellationToken)
     {
-        var stallTimeoutMs = workflowDefinition.Runtime.Codex.StallTimeoutMs;
         var nowUtc = timeProvider.GetUtcNow();
 
         foreach (var run in runningIssues.Where(run => run.OwnerInstanceId.Equals(instanceId, StringComparison.OrdinalIgnoreCase)))
         {
+            // M4: stall windows are per runner — a slower implementer (claude)
+            // must not trip the codex-tuned inactivity rule.
+            var stallTimeoutMs = string.Equals(run.Runner, AgentRunnerNames.Claude, StringComparison.OrdinalIgnoreCase)
+                ? workflowDefinition.Runtime.Claude.StallTimeoutMs
+                : workflowDefinition.Runtime.Codex.StallTimeoutMs;
             var lastActivity = run.LastEventAtUtc ?? run.StartedAtUtc;
             var inactivityStalled = stallTimeoutMs > 0 &&
                                     (nowUtc - lastActivity).TotalMilliseconds > stallTimeoutMs;

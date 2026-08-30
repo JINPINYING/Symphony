@@ -7,7 +7,8 @@ public static class ServiceCollectionExtensions
 {
     public static IServiceCollection AddSymphonyCodexAgentRunner(this IServiceCollection services)
     {
-        services.AddScoped<IAgentRunner, CodexAgentRunner>();
+        services.AddScoped<CodexAgentRunner>();
+        services.AddScoped<IAgentRunner>(provider => provider.GetRequiredService<CodexAgentRunner>());
         return services;
     }
 }
