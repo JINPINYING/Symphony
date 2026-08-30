@@ -151,6 +151,18 @@ public sealed partial class OrchestrationTickService
                 return workflowDefinition.Runtime.Polling.IntervalMs;
             }
 
+            // M4: phases run BEFORE ordinary dispatch. An issue whose
+            // implementation is durable belongs to the phase machine (verify ->
+            // cross-vendor review -> bounded repair); seeding its ledger first is
+            // what makes DispatchCandidatesAsync skip it. With the order reversed,
+            // the candidate loop claimed such an issue on the same tick and
+            // overwrote the review run's phase and runner.
+            await phaseOrchestrator.ProcessPhasesAsync(
+                workflowDefinition,
+                BuildTrackerQuery(workflowDefinition, apiKey),
+                (issue, phaseRequest, token) => DispatchPhaseIssueAsync(issue, workflowDefinition, instanceId, phaseRequest, token),
+                cancellationToken);
+
             await DispatchCandidatesAsync(workflowDefinition, apiKey, instanceId, cancellationToken);
 
             // M1: escalations created this tick (or still pending from earlier
@@ -166,14 +178,6 @@ public sealed partial class OrchestrationTickService
                 workflowDefinition,
                 BuildTrackerQuery(workflowDefinition, apiKey),
                 (issue, directive, token) => DispatchDirectiveIssueAsync(issue, workflowDefinition, instanceId, directive, token),
-                cancellationToken);
-
-            // M4: advance verify/review phases for issues whose implementation is
-            // durable (exact-head CI gate, cross-vendor review, bounded repair).
-            await phaseOrchestrator.ProcessPhasesAsync(
-                workflowDefinition,
-                BuildTrackerQuery(workflowDefinition, apiKey),
-                (issue, phaseRequest, token) => DispatchPhaseIssueAsync(issue, workflowDefinition, instanceId, phaseRequest, token),
                 cancellationToken);
             return workflowDefinition.Runtime.Polling.IntervalMs;
         }

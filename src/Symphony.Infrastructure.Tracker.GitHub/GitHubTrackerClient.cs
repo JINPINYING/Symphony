@@ -1425,3 +1425,5 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
 // Note: trivial source changes intentionally shift this assembly's hash; Windows
 // Smart App Control on the build machine scores binaries per hash and has blocked
 // stale hashes before (0x800711C7). See docs in the M3 PR description.
+
+// build-stamp: m4b-1788130263

@@ -589,3 +589,5 @@ public sealed class WorkflowLoader
         return rawState.Trim().ToLowerInvariant();
     }
 }
+
+// build-stamp: m4b-1788130263

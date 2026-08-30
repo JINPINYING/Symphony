@@ -70,6 +70,21 @@ public sealed partial class OrchestrationTickService
 
         var candidatesById = issues.ToDictionary(issue => issue.Id, StringComparer.OrdinalIgnoreCase);
 
+        // M4 ownership rule: an issue with an active phase ledger belongs to the
+        // phase orchestrator (verify / cross-vendor review / bounded repair). The
+        // ordinary candidate and retry paths must not dispatch it — they would
+        // re-dispatch it as a plain implementation on the label-routed runner and
+        // overwrite the phase run's row, which is exactly what happened to the
+        // first live review dispatch.
+        var phaseOwnedIssueIds = new HashSet<string>(
+            await dbContext.PhaseLedger
+                .Where(entry => entry.Stage != PhaseStages.Ready &&
+                                entry.Stage != PhaseStages.Escalated &&
+                                entry.Stage != PhaseStages.Closed)
+                .Select(entry => entry.IssueId)
+                .ToListAsync(cancellationToken),
+            StringComparer.OrdinalIgnoreCase);
+
         await ReconcileAbandonedReleasedRunsAsync(workflowDefinition, query, candidatesById, cancellationToken);
         var staleReservationIssueIds = await ReconcileStaleReservationsBeforeCandidateSelectionAsync(
             candidatesById,
@@ -81,6 +96,13 @@ public sealed partial class OrchestrationTickService
 
         foreach (var retryEntry in dueRetries)
         {
+            if (phaseOwnedIssueIds.Contains(retryEntry.IssueId))
+            {
+                // The phase orchestrator owns this issue; it decides whether a
+                // failed phase run is retried or escalated.
+                continue;
+            }
+
             if (string.Equals(retryEntry.DelayType, RetryDelayTypes.Continuation, StringComparison.OrdinalIgnoreCase))
             {
                 await CompleteSuccessfulDispatchAsync(retryEntry, instanceId, cancellationToken);
@@ -165,6 +187,14 @@ public sealed partial class OrchestrationTickService
                     countsByState,
                     cancellationToken);
                 break;
+            }
+
+            if (phaseOwnedIssueIds.Contains(issue.Id))
+            {
+                // Owned by the phase orchestrator until its ledger reaches a
+                // terminal stage; dispatching here would clobber the phase run.
+                await RecordCandidateRefusalAsync(issue, "owned_by_phase_orchestrator", cancellationToken);
+                continue;
             }
 
             if (finalizedThisTick.Contains(issue.Id) ||

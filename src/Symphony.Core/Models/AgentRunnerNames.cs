@@ -12,3 +12,5 @@ public static class AgentRunnerNames
     public static bool IsKnown(string? name) =>
         name is not null && All.Contains(name, StringComparer.Ordinal);
 }
+
+// build-stamp: m4b-1788130263
