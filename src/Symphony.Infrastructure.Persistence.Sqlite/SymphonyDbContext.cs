@@ -75,10 +75,12 @@ public sealed class SymphonyDbContext(DbContextOptions<SymphonyDbContext> option
             entity.Property(x => x.LabelsJson).IsRequired();
             entity.Property(x => x.PullRequestsJson).IsRequired();
             entity.Property(x => x.BlockedByJson).IsRequired();
+            entity.Property(x => x.EligibleSeenAtUtc);
             entity.Property(x => x.CachedAtUtc).IsRequired();
             entity.HasIndex(x => x.Identifier);
             entity.HasIndex(x => x.State);
             entity.HasIndex(x => x.UpdatedAtUtc);
+            entity.HasIndex(x => x.EligibleSeenAtUtc);
         });
 
         modelBuilder.Entity<RunEntity>(entity =>

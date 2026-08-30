@@ -20,18 +20,20 @@ public sealed class RetryReservationClaimTests
             await using var context = new SymphonyDbContext(options);
             var store = new OrchestrationCoordinationStore(context, clock);
             Assert.True(await store.AcquireOrRenewLeaseAsync("dispatch", "instance-a", TimeSpan.FromMinutes(5)));
-            Assert.True(await store.TryClaimIssueAsync("issue-84", "#84", "dispatch", "instance-a"));
+            Assert.True((await store.TryClaimIssueAsync("issue-84", "#84", "dispatch", "instance-a")).Claimed);
 
             AddRetryState(context, now, attemptCount: 1, dueAtUtc: now.AddMinutes(5));
             await context.SaveChangesAsync();
 
-            Assert.False(await store.TryClaimIssueAsync("issue-84", "#84", "dispatch", "instance-a"));
+            var futureRetryClaim = await store.TryClaimIssueAsync("issue-84", "#84", "dispatch", "instance-a");
+            Assert.False(futureRetryClaim.Claimed);
+            Assert.Equal("retry_reservation_not_due", futureRetryClaim.Reason);
 
             var reservation = await context.RetryQueue.SingleAsync();
             reservation.DueAtUtc = now;
             await context.SaveChangesAsync();
 
-            Assert.True(await store.TryClaimIssueAsync("issue-84", "#84", "dispatch", "instance-a"));
+            Assert.True((await store.TryClaimIssueAsync("issue-84", "#84", "dispatch", "instance-a")).Claimed);
         }
         finally
         {
@@ -53,12 +55,14 @@ public sealed class RetryReservationClaimTests
             await using var context = new SymphonyDbContext(options);
             var store = new OrchestrationCoordinationStore(context, clock);
             Assert.True(await store.AcquireOrRenewLeaseAsync("dispatch", "instance-a", TimeSpan.FromMinutes(5)));
-            Assert.True(await store.TryClaimIssueAsync("issue-84", "#84", "dispatch", "instance-a"));
+            Assert.True((await store.TryClaimIssueAsync("issue-84", "#84", "dispatch", "instance-a")).Claimed);
 
             AddRetryState(context, now, attemptCount: 2, dueAtUtc: now);
             await context.SaveChangesAsync();
 
-            Assert.False(await store.TryClaimIssueAsync("issue-84", "#84", "dispatch", "instance-a"));
+            var fencedClaim = await store.TryClaimIssueAsync("issue-84", "#84", "dispatch", "instance-a");
+            Assert.False(fencedClaim.Claimed);
+            Assert.Equal("startup_attempt_fence", fencedClaim.Reason);
         }
         finally
         {

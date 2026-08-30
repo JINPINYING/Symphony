@@ -10,6 +10,8 @@ public sealed class OrchestratorWorker(
     RefreshSignalService refreshSignalService,
     IOptionsMonitor<SymphonyRuntimeOptions> runtimeOptions) : BackgroundService
 {
+    private const int AcquisitionFallbackPollMs = 60_000;
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         logger.LogInformation("Orchestrator worker started.");
@@ -52,7 +54,7 @@ public sealed class OrchestratorWorker(
                 logger.LogError(ex, "Orchestrator tick failed.");
             }
 
-            var pollInterval = TimeSpan.FromMilliseconds(pollIntervalMs);
+            var pollInterval = TimeSpan.FromMilliseconds(Math.Min(pollIntervalMs, AcquisitionFallbackPollMs));
             try
             {
                 await refreshSignalService.WaitAsync(pollInterval, stoppingToken);

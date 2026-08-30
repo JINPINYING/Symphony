@@ -711,15 +711,22 @@ At startup, the service validates config, performs startup cleanup, schedules an
 then repeats every `polling.interval_ms`.
 
 The effective poll interval should be updated when workflow config changes are re-applied.
+Eligible candidate acquisition should normally occur within 60 seconds when capacity is available.
+The diagnostic threshold is 2 minutes: if an eligible issue remains unclaimed beyond that threshold
+without intentional concurrency saturation, Symphony must emit durable warning/event evidence and
+continue bounded fresh scans. Implementations must avoid aggressive busy loops; event-driven refresh
+may wake the worker early, and the fallback scan interval must remain bounded.
 
 Tick sequence:
 
-1. Reconcile running issues.
+1. Reconcile stale running, retrying, lease, reservation, and startup-attempt state.
 2. Run dispatch preflight validation.
 3. Fetch candidate issues from tracker using active states.
-4. Sort issues by dispatch priority.
-5. Dispatch eligible issues while slots remain.
-6. Notify observability/status consumers of state changes.
+4. Persist candidate discovery, including `eligible_seen_at`, for newly eligible issues.
+5. Sort issues by dispatch priority.
+6. Dispatch eligible issues while slots remain.
+7. Persist claim attempts, claim outcomes, refusal reasons, and delayed-acquisition warnings.
+8. Notify observability/status consumers of state changes.
 
 If per-tick validation fails, dispatch is skipped for that tick, but reconciliation still happens
 first.

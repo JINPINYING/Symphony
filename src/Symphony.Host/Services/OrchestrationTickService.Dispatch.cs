@@ -7,6 +7,8 @@ namespace Symphony.Host.Services;
 
 public sealed partial class OrchestrationTickService
 {
+    private static readonly TimeSpan AcquisitionDiagnosticThreshold = TimeSpan.FromMinutes(2);
+
     private async Task DispatchCandidatesAsync(
         WorkflowDefinition workflowDefinition,
         string apiKey,
@@ -25,6 +27,15 @@ public sealed partial class OrchestrationTickService
         }
         catch (Exception ex)
         {
+            AddIssueEvent(
+                null,
+                null,
+                null,
+                null,
+                "candidate_scan_failed",
+                LogLevel.Error,
+                $"Candidate fetch failed for {query.Owner}/{query.Repo}: {ex.GetType().Name}.");
+            await dbContext.SaveChangesAsync(cancellationToken);
             logger.LogWarning(
                 ex,
                 "Candidate fetch failed for {Owner}/{Repo}. Dispatch will be skipped this tick.",
@@ -33,7 +44,7 @@ public sealed partial class OrchestrationTickService
             return;
         }
 
-        await UpsertIssueCacheAsync(issues, cancellationToken);
+        await UpsertIssueCacheAsync(issues, workflowDefinition, cancellationToken);
 
         var runningIssues = await dbContext.Runs
             .Where(run => run.Status == RunStatusNames.Running)
@@ -60,6 +71,13 @@ public sealed partial class OrchestrationTickService
         var candidatesById = issues.ToDictionary(issue => issue.Id, StringComparer.OrdinalIgnoreCase);
 
         await ReconcileAbandonedReleasedRunsAsync(workflowDefinition, query, candidatesById, cancellationToken);
+        var staleReservationIssueIds = await ReconcileStaleReservationsBeforeCandidateSelectionAsync(
+            candidatesById,
+            instanceId,
+            cancellationToken);
+        dueRetries = dueRetries
+            .Where(retry => !staleReservationIssueIds.Contains(retry.IssueId))
+            .ToList();
 
         foreach (var retryEntry in dueRetries)
         {
@@ -83,6 +101,7 @@ public sealed partial class OrchestrationTickService
 
             if (!IsDispatchEligible(retryIssue, workflowDefinition, runningIssueIds, countsByState))
             {
+                await RecordCandidateRefusalAsync(retryIssue, "non_eligible_label_state", cancellationToken);
                 await ReleaseRetryReservationAsync(
                     retryEntry.IssueId,
                     retryEntry.IssueIdentifier,
@@ -105,6 +124,7 @@ public sealed partial class OrchestrationTickService
             if (!HasGlobalSlot(workflowDefinition, runningIssueIds.Count) ||
                 !HasStateSlot(retryIssue.State, workflowDefinition, countsByState))
             {
+                await RecordCandidateRefusalAsync(retryIssue, "concurrency_limit", cancellationToken);
                 await RescheduleRetryAsync(
                     retryEntry,
                     instanceId,
@@ -129,21 +149,42 @@ public sealed partial class OrchestrationTickService
 
         var latestRunByIssueId = await LoadLatestRunByIssueAsync(candidatesById.Keys, cancellationToken);
 
-        foreach (var issue in OrderIssuesForDispatch(issues))
+        var orderedIssues = OrderIssuesForDispatch(issues).ToList();
+        for (var issueIndex = 0; issueIndex < orderedIssues.Count; issueIndex++)
         {
+            var issue = orderedIssues[issueIndex];
             if (!HasGlobalSlot(workflowDefinition, runningIssueIds.Count))
             {
+                var remainingIssues = orderedIssues
+                    .Skip(issueIndex)
+                    .ToList();
+                await RecordRemainingCapacityRefusalsAsync(
+                    remainingIssues,
+                    workflowDefinition,
+                    runningIssueIds,
+                    countsByState,
+                    cancellationToken);
                 break;
             }
 
             if (finalizedThisTick.Contains(issue.Id) ||
                 !IsDispatchEligible(issue, workflowDefinition, runningIssueIds, countsByState))
             {
+                if (!finalizedThisTick.Contains(issue.Id))
+                {
+                    var reason = DetermineIneligibilityReason(issue, workflowDefinition, runningIssueIds, countsByState);
+                    if (!string.Equals(reason, "already_running", StringComparison.OrdinalIgnoreCase))
+                    {
+                        await RecordCandidateRefusalAsync(issue, reason, cancellationToken);
+                    }
+                }
+
                 continue;
             }
 
             if (await ShouldBlockImplementationRedispatchAsync(issue, latestRunByIssueId, workflowDefinition, cancellationToken))
             {
+                await RecordCandidateRefusalAsync(issue, "implementation_redispatch_blocked", cancellationToken);
                 continue;
             }
 
@@ -152,6 +193,77 @@ public sealed partial class OrchestrationTickService
                 runningIssueIds.Add(issue.Id);
             }
         }
+    }
+
+    private async Task<HashSet<string>> ReconcileStaleReservationsBeforeCandidateSelectionAsync(
+        IReadOnlyDictionary<string, NormalizedIssue> candidatesById,
+        string instanceId,
+        CancellationToken cancellationToken)
+    {
+        var activeIssueIds = await dbContext.Runs
+            .Where(run => run.Status == RunStatusNames.Running || run.Status == RunStatusNames.Retrying)
+            .Select(run => run.IssueId)
+            .ToListAsync(cancellationToken);
+        var staleIssueIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        var staleClaims = await dbContext.DispatchClaims
+            .Where(claim => claim.Status == "active" && !activeIssueIds.Contains(claim.IssueId))
+            .ToListAsync(cancellationToken);
+        foreach (var claim in staleClaims)
+        {
+            staleIssueIds.Add(claim.IssueId);
+            claim.Status = RunStatusNames.ReleasedIneligible;
+            claim.ReleasedAtUtc = timeProvider.GetUtcNow();
+            claim.UpdatedAtUtc = timeProvider.GetUtcNow();
+            AddIssueEvent(
+                claim.IssueId,
+                claim.IssueIdentifier,
+                null,
+                null,
+                "stale_reservation_reconciled",
+                LogLevel.Warning,
+                $"Released stale active claim for {claim.IssueIdentifier}: no running or retrying run exists.");
+        }
+
+        var staleRetries = await dbContext.RetryQueue
+            .Where(retry => !activeIssueIds.Contains(retry.IssueId))
+            .ToListAsync(cancellationToken);
+        foreach (var retry in staleRetries)
+        {
+            staleIssueIds.Add(retry.IssueId);
+            dbContext.RetryQueue.Remove(retry);
+            await coordinationStore.ReleaseIssueClaimAsync(
+                retry.IssueId,
+                instanceId,
+                RunStatusNames.ReleasedIneligible,
+                cancellationToken);
+            AddIssueEvent(
+                retry.IssueId,
+                retry.IssueIdentifier,
+                retry.RunId,
+                null,
+                "stale_reservation_reconciled",
+                LogLevel.Warning,
+                $"Removed stale retry reservation for {retry.IssueIdentifier}: no running or retrying run exists.");
+        }
+
+        var staleActiveClaimsForCandidates = staleClaims
+            .Where(claim => candidatesById.ContainsKey(claim.IssueId))
+            .Select(claim => claim.IssueId)
+            .ToList();
+        if (staleActiveClaimsForCandidates.Count > 0)
+        {
+            logger.LogWarning(
+                "Released stale active claims before candidate selection for {IssueCount} currently eligible issue(s).",
+                staleActiveClaimsForCandidates.Count);
+        }
+
+        if (staleClaims.Count > 0 || staleRetries.Count > 0)
+        {
+            await dbContext.SaveChangesAsync(cancellationToken);
+        }
+
+        return staleIssueIds;
     }
 
     private async Task<Dictionary<string, RunEntity>> LoadLatestRunByIssueAsync(
@@ -351,15 +463,51 @@ public sealed partial class OrchestrationTickService
         CancellationToken cancellationToken,
         bool resetContinuousTurnBudget = false)
     {
-        var claimed = await coordinationStore.TryClaimIssueAsync(
+        AddIssueEvent(
+            issue.Id,
+            issue.Identifier,
+            null,
+            null,
+            "claim_attempted",
+            LogLevel.Information,
+            $"Attempting to claim issue {issue.Identifier}.");
+        await dbContext.SaveChangesAsync(cancellationToken);
+
+        var claimResult = await coordinationStore.TryClaimIssueAsync(
             issue.Id,
             issue.Identifier,
             ResolveLeaseName(),
             instanceId,
             cancellationToken);
 
-        if (!claimed)
+        if (!claimResult.Claimed)
         {
+            var claimRefusalReason = claimResult.Reason ?? "claim_refused";
+            if (await ShouldRecordCandidateRefusalAsync(issue.Id, claimRefusalReason, cancellationToken))
+            {
+                AddIssueEvent(
+                    issue.Id,
+                    issue.Identifier,
+                    null,
+                    null,
+                    "claim_refused",
+                    LogLevel.Warning,
+                    $"Claim refused for issue {issue.Identifier}: {claimResult.Reason}.");
+            }
+
+            if (await ShouldWarnDelayedAcquisitionAsync(issue.Id, cancellationToken))
+            {
+                AddIssueEvent(
+                    issue.Id,
+                    issue.Identifier,
+                    null,
+                    null,
+                    "candidate_acquisition_delayed",
+                    LogLevel.Warning,
+                    $"Issue {issue.Identifier} has remained unclaimed past the {AcquisitionDiagnosticThreshold.TotalMinutes:0}-minute acquisition diagnostic threshold. Latest refusal reason: {claimResult.Reason}.");
+            }
+
+            await dbContext.SaveChangesAsync(cancellationToken);
             return false;
         }
 
@@ -436,6 +584,15 @@ public sealed partial class OrchestrationTickService
             Message = $"Issue {issue.Identifier} dispatched with attempt {(attempt.HasValue ? attempt.Value.ToString() : "initial")}.",
             OccurredAtUtc = nowUtc
         });
+        AddIssueEvent(
+            issue.Id,
+            issue.Identifier,
+            run.Id,
+            runAttempt.Id,
+            "claim_succeeded",
+            LogLevel.Information,
+            $"Claim succeeded for issue {issue.Identifier}.");
+        await ClearEligibleSeenAsync(issue.Id, cancellationToken);
 
         await dbContext.SaveChangesAsync(cancellationToken);
 
@@ -484,6 +641,114 @@ public sealed partial class OrchestrationTickService
         return true;
     }
 
+    private async Task RecordRemainingCapacityRefusalsAsync(
+        IEnumerable<NormalizedIssue> issues,
+        WorkflowDefinition workflowDefinition,
+        HashSet<string> runningIssueIds,
+        IReadOnlyDictionary<string, int> countsByState,
+        CancellationToken cancellationToken)
+    {
+        foreach (var issue in issues)
+        {
+            if (IsCandidateEligibleForAcquisitionSlo(issue, workflowDefinition) &&
+                !runningIssueIds.Contains(issue.Id))
+            {
+                await RecordCandidateRefusalAsync(issue, "concurrency_limit", cancellationToken);
+            }
+        }
+    }
+
+    private async Task RecordCandidateRefusalAsync(
+        NormalizedIssue issue,
+        string reason,
+        CancellationToken cancellationToken)
+    {
+        if (await ShouldRecordCandidateRefusalAsync(issue.Id, reason, cancellationToken))
+        {
+            AddIssueEvent(
+                issue.Id,
+                issue.Identifier,
+                null,
+                null,
+                "claim_refused",
+                LogLevel.Warning,
+                $"Issue {issue.Identifier} was not claimable this tick: {reason}.");
+        }
+
+        if (await ShouldWarnDelayedAcquisitionAsync(issue.Id, cancellationToken))
+        {
+            AddIssueEvent(
+                issue.Id,
+                issue.Identifier,
+                null,
+                null,
+                "candidate_acquisition_delayed",
+                LogLevel.Warning,
+                $"Issue {issue.Identifier} has remained unclaimed past the {AcquisitionDiagnosticThreshold.TotalMinutes:0}-minute acquisition diagnostic threshold. Latest refusal reason: {reason}.");
+        }
+
+        await dbContext.SaveChangesAsync(cancellationToken);
+    }
+
+    private async Task<bool> ShouldRecordCandidateRefusalAsync(
+        string issueId,
+        string reason,
+        CancellationToken cancellationToken)
+    {
+        var cachedIssue = await dbContext.IssueCache.SingleOrDefaultAsync(
+            issue => issue.IssueId == issueId,
+            cancellationToken);
+        if (cachedIssue?.EligibleSeenAtUtc is null)
+        {
+            return true;
+        }
+
+        var refusalEvents = await dbContext.EventLog
+            .Where(entry =>
+                entry.IssueId == issueId &&
+                entry.EventName == "claim_refused")
+            .Select(entry => new { entry.OccurredAtUtc, entry.Message })
+            .ToListAsync(cancellationToken);
+
+        return !refusalEvents.Any(entry =>
+            entry.OccurredAtUtc >= cachedIssue.EligibleSeenAtUtc.Value &&
+            entry.Message.Contains(reason, StringComparison.Ordinal));
+    }
+
+    private async Task<bool> ShouldWarnDelayedAcquisitionAsync(string issueId, CancellationToken cancellationToken)
+    {
+        var cachedIssue = await dbContext.IssueCache.SingleOrDefaultAsync(
+            issue => issue.IssueId == issueId,
+            cancellationToken);
+        if (cachedIssue?.EligibleSeenAtUtc is null)
+        {
+            return false;
+        }
+
+        var eligibleSeenAtUtc = cachedIssue.EligibleSeenAtUtc.Value;
+        var warningEvents = await dbContext.EventLog
+            .Where(entry =>
+                entry.IssueId == issueId &&
+                entry.EventName == "candidate_acquisition_delayed")
+            .Select(entry => entry.OccurredAtUtc)
+            .ToListAsync(cancellationToken);
+        var alreadyWarned = warningEvents.Any(occurredAtUtc => occurredAtUtc >= eligibleSeenAtUtc);
+
+        return !alreadyWarned &&
+               timeProvider.GetUtcNow() - cachedIssue.EligibleSeenAtUtc.Value >= AcquisitionDiagnosticThreshold;
+    }
+
+    private async Task ClearEligibleSeenAsync(string issueId, CancellationToken cancellationToken)
+    {
+        var cachedIssue = await dbContext.IssueCache.SingleOrDefaultAsync(
+            issue => issue.IssueId == issueId,
+            cancellationToken);
+        if (cachedIssue is not null)
+        {
+            cachedIssue.EligibleSeenAtUtc = null;
+        }
+    }
+
     private bool IsDispatchEligible(
         NormalizedIssue issue,
         WorkflowDefinition workflowDefinition,
@@ -519,6 +784,59 @@ public sealed partial class OrchestrationTickService
         }
 
         return PassesBlockerRule(issue, workflowDefinition);
+    }
+
+    private static bool IsCandidateEligibleForAcquisitionSlo(NormalizedIssue issue, WorkflowDefinition workflowDefinition)
+    {
+        return !string.IsNullOrWhiteSpace(issue.Id) &&
+               !string.IsNullOrWhiteSpace(issue.Identifier) &&
+               !string.IsNullOrWhiteSpace(issue.Title) &&
+               !string.IsNullOrWhiteSpace(issue.State) &&
+               !MatchesTerminalState(issue.State, workflowDefinition.Runtime.Tracker.TerminalStates) &&
+               IssueStateMatcher.MatchesConfiguredActiveState(issue.State, workflowDefinition.Runtime.Tracker.ActiveStates) &&
+               PassesBlockerRule(issue, workflowDefinition);
+    }
+
+    private static string DetermineIneligibilityReason(
+        NormalizedIssue issue,
+        WorkflowDefinition workflowDefinition,
+        HashSet<string> runningIssueIds,
+        IReadOnlyDictionary<string, int> countsByState)
+    {
+        if (string.IsNullOrWhiteSpace(issue.Id) ||
+            string.IsNullOrWhiteSpace(issue.Identifier) ||
+            string.IsNullOrWhiteSpace(issue.Title) ||
+            string.IsNullOrWhiteSpace(issue.State))
+        {
+            return "invalid_candidate_payload";
+        }
+
+        if (runningIssueIds.Contains(issue.Id))
+        {
+            return "already_running";
+        }
+
+        if (MatchesTerminalState(issue.State, workflowDefinition.Runtime.Tracker.TerminalStates))
+        {
+            return "terminal_state";
+        }
+
+        if (!IssueStateMatcher.MatchesConfiguredActiveState(issue.State, workflowDefinition.Runtime.Tracker.ActiveStates))
+        {
+            return "non_eligible_label_state";
+        }
+
+        if (!HasStateSlot(issue.State, workflowDefinition, countsByState))
+        {
+            return "concurrency_limit";
+        }
+
+        if (!PassesBlockerRule(issue, workflowDefinition))
+        {
+            return "active_blocker";
+        }
+
+        return "not_dispatch_eligible";
     }
 
     private static bool PassesBlockerRule(NormalizedIssue issue, WorkflowDefinition workflowDefinition)

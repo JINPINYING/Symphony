@@ -13,7 +13,7 @@ public interface IOrchestrationCoordinationStore
         string instanceId,
         CancellationToken cancellationToken = default);
 
-    Task<bool> TryClaimIssueAsync(
+    Task<IssueClaimResult> TryClaimIssueAsync(
         string issueId,
         string issueIdentifier,
         string leaseName,
@@ -25,4 +25,11 @@ public interface IOrchestrationCoordinationStore
         string instanceId,
         string releaseStatus,
         CancellationToken cancellationToken = default);
+}
+
+public readonly record struct IssueClaimResult(bool Claimed, string Reason)
+{
+    public static IssueClaimResult Accepted() => new(true, "claimed");
+
+    public static IssueClaimResult Refused(string reason) => new(false, reason);
 }
