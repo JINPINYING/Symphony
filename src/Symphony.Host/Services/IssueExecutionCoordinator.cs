@@ -132,6 +132,20 @@ public sealed class IssueExecutionCoordinator(
                 request.Issue,
                 request.Attempt);
 
+            if (!string.IsNullOrWhiteSpace(request.DirectiveInstructions) ||
+                !string.IsNullOrWhiteSpace(request.DirectiveAction))
+            {
+                prompt +=
+                    "\n\n## COMMAND CENTER DIRECTIVE (authoritative for this dispatch)\n" +
+                    $"action: {request.DirectiveAction ?? "resume"}\n" +
+                    $"phase: {request.DirectivePhase ?? "recorded phase"}\n" +
+                    (string.IsNullOrWhiteSpace(request.DirectiveInstructions)
+                        ? string.Empty
+                        : $"instructions:\n{request.DirectiveInstructions}\n") +
+                    "Follow this directive within the bounded scope of the source issue. " +
+                    "It resolves the previous escalation on this issue; do not restart from scratch unless the directive says to.";
+            }
+
             var trackerQuery = BuildTrackerQuery(
                 request.WorkflowDefinition,
                 WorkflowDispatchPreflightValidator.ValidateAndResolveApiKey(request.WorkflowDefinition));

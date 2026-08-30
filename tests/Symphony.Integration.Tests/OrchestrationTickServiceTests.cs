@@ -182,6 +182,209 @@ public sealed class OrchestrationTickServiceTests
     }
 
     [Fact]
+    public async Task RunTickAsync_ShouldExecuteResumeDirectiveOnEscalatedIssue()
+    {
+        var tracker = new FakeTrackerClient([]);
+        tracker.IssuesById["issue-1"] = BuildIssue("issue-1", "#1", "Open", null);
+        tracker.CommentsByIssueId["issue-1"] =
+        [
+            new NormalizedIssueComment(
+                "directive-1",
+                "symphony:directive\naction: resume\ninstructions: continue from the open PR",
+                "owner-login",
+                "OWNER",
+                DateTimeOffset.UtcNow.AddMinutes(-1))
+        ];
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success));
+
+        await harness.InsertRunAsync("issue-1", "#1", "Open", "instance-1", RunStatusNames.NeedsCommandCenter);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var request = Assert.Single(harness.Coordinator.StartRequests);
+        Assert.Equal("continue from the open PR", request.DirectiveInstructions);
+        Assert.Equal(DirectiveActions.Resume, request.DirectiveAction);
+
+        var runs = (await harness.DbContext.Runs.ToListAsync())
+            .OrderBy(run => run.StartedAtUtc)
+            .ToList();
+        Assert.Equal(2, runs.Count);
+        Assert.Equal(RunStatusNames.ResolvedByDirective, runs[0].Status);
+        Assert.Equal(RunStatusNames.Succeeded, runs[1].Status);
+
+        Assert.Contains(
+            tracker.PostedComments,
+            comment => comment.Body.Contains(DirectiveProcessor.AckMarkerFor("directive-1"), StringComparison.Ordinal));
+        var ledger = Assert.Single(await harness.DbContext.DirectiveLog.ToListAsync());
+        Assert.Equal("consumed_dispatched", ledger.Outcome);
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldConsumeDirectiveExactlyOnceAcrossTicks()
+    {
+        var tracker = new FakeTrackerClient([]);
+        tracker.IssuesById["issue-1"] = BuildIssue("issue-1", "#1", "Open", null);
+        tracker.CommentsByIssueId["issue-1"] =
+        [
+            new NormalizedIssueComment(
+                "directive-1",
+                "symphony:directive\naction: resume",
+                "owner-login",
+                "OWNER",
+                DateTimeOffset.UtcNow.AddMinutes(-1))
+        ];
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success));
+
+        await harness.InsertRunAsync("issue-1", "#1", "Open", "instance-1", RunStatusNames.NeedsCommandCenter);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Single(harness.Coordinator.StartRequests);
+        Assert.Single(await harness.DbContext.DirectiveLog.ToListAsync());
+        Assert.Single(
+            tracker.PostedComments.Where(comment =>
+                comment.Body.Contains(DirectiveProcessor.AckMarkerFor("directive-1"), StringComparison.Ordinal)));
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldReplyAndConsumeMalformedDirectiveWithoutDispatching()
+    {
+        var tracker = new FakeTrackerClient([]);
+        tracker.IssuesById["issue-1"] = BuildIssue("issue-1", "#1", "Open", null);
+        tracker.CommentsByIssueId["issue-1"] =
+        [
+            new NormalizedIssueComment(
+                "directive-1",
+                "symphony:directive\naction: banana",
+                "owner-login",
+                "OWNER",
+                DateTimeOffset.UtcNow.AddMinutes(-1))
+        ];
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success));
+
+        await harness.InsertRunAsync("issue-1", "#1", "Open", "instance-1", RunStatusNames.NeedsCommandCenter);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Empty(harness.Coordinator.StartRequests);
+        Assert.Equal(
+            RunStatusNames.NeedsCommandCenter,
+            (await harness.DbContext.Runs.SingleAsync()).Status);
+        var ledger = Assert.Single(await harness.DbContext.DirectiveLog.ToListAsync());
+        Assert.Equal("consumed_invalid", ledger.Outcome);
+        Assert.Single(
+            tracker.PostedComments.Where(comment =>
+                comment.Body.Contains("could not be executed", StringComparison.Ordinal)));
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldCloseIssueOnCloseDirective()
+    {
+        var tracker = new FakeTrackerClient([]);
+        tracker.CommentsByIssueId["issue-1"] =
+        [
+            new NormalizedIssueComment(
+                "directive-1",
+                "symphony:directive\naction: close",
+                "owner-login",
+                "OWNER",
+                DateTimeOffset.UtcNow.AddMinutes(-1))
+        ];
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success));
+
+        await harness.InsertRunAsync("issue-1", "#1", "Open", "instance-1", RunStatusNames.NeedsCommandCenter);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Contains("issue-1", tracker.ClosedIssueIds);
+        Assert.Empty(harness.Coordinator.StartRequests);
+        Assert.Equal(
+            RunStatusNames.ResolvedByDirective,
+            (await harness.DbContext.Runs.SingleAsync()).Status);
+        var ledger = Assert.Single(await harness.DbContext.DirectiveLog.ToListAsync());
+        Assert.Equal("consumed_closed", ledger.Outcome);
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldIgnoreDirectiveFromUnauthorizedAuthor()
+    {
+        var tracker = new FakeTrackerClient([]);
+        tracker.IssuesById["issue-1"] = BuildIssue("issue-1", "#1", "Open", null);
+        tracker.CommentsByIssueId["issue-1"] =
+        [
+            new NormalizedIssueComment(
+                "directive-1",
+                "symphony:directive\naction: close",
+                "drive-by-account",
+                "NONE",
+                DateTimeOffset.UtcNow.AddMinutes(-1))
+        ];
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success));
+
+        await harness.InsertRunAsync("issue-1", "#1", "Open", "instance-1", RunStatusNames.NeedsCommandCenter);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Empty(tracker.ClosedIssueIds);
+        Assert.Empty(harness.Coordinator.StartRequests);
+        Assert.Empty(await harness.DbContext.DirectiveLog.ToListAsync());
+        Assert.Equal(
+            RunStatusNames.NeedsCommandCenter,
+            (await harness.DbContext.Runs.SingleAsync()).Status);
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldDeferDispatchingDirectiveWhenNoAgentSlotIsFree()
+    {
+        var tracker = new FakeTrackerClient([]);
+        tracker.IssuesById["issue-1"] = BuildIssue("issue-1", "#1", "Open", null);
+        tracker.CommentsByIssueId["issue-1"] =
+        [
+            new NormalizedIssueComment(
+                "directive-1",
+                "symphony:directive\naction: resume",
+                "owner-login",
+                "OWNER",
+                DateTimeOffset.UtcNow.AddMinutes(-1))
+        ];
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await harness.InsertRunningRunAsync("issue-2", "#2", "Open", "instance-1", lastEventAtUtc: DateTimeOffset.UtcNow);
+        await harness.InsertRunAsync("issue-1", "#1", "Open", "instance-1", RunStatusNames.NeedsCommandCenter);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Empty(await harness.DbContext.DirectiveLog.ToListAsync());
+        Assert.DoesNotContain(
+            tracker.PostedComments,
+            comment => comment.Body.Contains("symphony:directive-ack", StringComparison.Ordinal));
+        Assert.Equal(
+            RunStatusNames.NeedsCommandCenter,
+            (await harness.DbContext.Runs.SingleAsync(run => run.IssueId == "issue-1")).Status);
+    }
+
+    [Fact]
     public async Task RunTickAsync_ShouldReleaseMissingRetryCandidateWhenIssueIsTerminal()
     {
         await using var harness = await TestHarness.CreateAsync(
@@ -1132,6 +1335,11 @@ public sealed class OrchestrationTickServiceTests
                     tracker,
                     TimeProvider.System,
                     NullLogger<EscalationPublisher>.Instance),
+                new DirectiveProcessor(
+                    dbContext,
+                    tracker,
+                    TimeProvider.System,
+                    NullLogger<DirectiveProcessor>.Instance),
                 Options.Create(new OrchestrationOptions
                 {
                     InstanceId = "instance-1",
@@ -1466,7 +1674,54 @@ public sealed class OrchestrationTickServiceTests
             }
 
             PostedComments.Add((issueId, body));
+            // Mirror the real tracker: posted comments become visible to later
+            // comment fetches (marker scans, directive ack detection).
+            CommentsByIssueId.TryAdd(issueId, []);
+            CommentsByIssueId[issueId].Add(new NormalizedIssueComment(
+                $"posted-{PostedComments.Count}",
+                body,
+                "symphony-bot",
+                "OWNER",
+                DateTimeOffset.UtcNow));
             return Task.FromResult<string?>($"https://example.test/comments/{PostedComments.Count}");
+        }
+
+        public Dictionary<string, List<NormalizedIssueComment>> CommentsByIssueId { get; } =
+            new(StringComparer.OrdinalIgnoreCase);
+
+        public Dictionary<string, NormalizedIssue> IssuesById { get; } =
+            new(StringComparer.OrdinalIgnoreCase);
+
+        public List<string> ClosedIssueIds { get; } = [];
+
+        public Task<IReadOnlyList<NormalizedIssueComment>> FetchIssueCommentsAsync(
+            TrackerQuery query,
+            string issueId,
+            CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult<IReadOnlyList<NormalizedIssueComment>>(
+                CommentsByIssueId.TryGetValue(issueId, out var comments) ? [.. comments] : []);
+        }
+
+        public Task<IReadOnlyList<NormalizedIssue>> FetchIssuesByIdsAsync(
+            TrackerQuery query,
+            IReadOnlyList<string> issueIds,
+            CancellationToken cancellationToken = default)
+        {
+            var result = issueIds
+                .Where(id => IssuesById.ContainsKey(id))
+                .Select(id => IssuesById[id])
+                .ToList();
+            return Task.FromResult<IReadOnlyList<NormalizedIssue>>(result);
+        }
+
+        public Task CloseIssueAsync(
+            TrackerQuery query,
+            string issueId,
+            CancellationToken cancellationToken = default)
+        {
+            ClosedIssueIds.Add(issueId);
+            return Task.CompletedTask;
         }
     }
 

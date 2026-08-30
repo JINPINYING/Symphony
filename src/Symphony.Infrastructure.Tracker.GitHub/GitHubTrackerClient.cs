@@ -11,15 +11,10 @@ namespace Symphony.Infrastructure.Tracker.GitHub;
 
 public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITrackerClient, IGitHubTrackerClient
 {
-    private const string GraphQlIssuesQuery = """
-        query($owner: String!, $repo: String!, $states: [IssueState!], $labels: [String!], $first: Int!, $after: String, $includePullRequests: Boolean!) {
-          repository(owner: $owner, name: $repo) {
-            issues(states: $states, labels: $labels, first: $first, after: $after, orderBy: { field: CREATED_AT, direction: ASC }) {
-              pageInfo {
-                hasNextPage
-                endCursor
-              }
-              nodes {
+    // Shared field selection for issue nodes; parsed by ParseIssue. Used by both
+    // the candidate-issues query and the by-ids query so the two paths cannot
+    // drift apart.
+    private const string GraphQlIssueNodeFields = """
                 id
                 number
                 title
@@ -61,7 +56,37 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
                     state
                   }
                 }
+        """;
+
+    private const string GraphQlIssuesQuery = """
+        query($owner: String!, $repo: String!, $states: [IssueState!], $labels: [String!], $first: Int!, $after: String, $includePullRequests: Boolean!) {
+          repository(owner: $owner, name: $repo) {
+            issues(states: $states, labels: $labels, first: $first, after: $after, orderBy: { field: CREATED_AT, direction: ASC }) {
+              pageInfo {
+                hasNextPage
+                endCursor
               }
+              nodes {
+        """ + GraphQlIssueNodeFields + """
+
+              }
+            }
+          }
+        }
+        """;
+
+    private const string GraphQlIssuesByIdsQuery = """
+        query($ids: [ID!]!, $includePullRequests: Boolean!) {
+          nodes(ids: $ids) {
+            ... on Issue {
+              repository {
+                name
+                owner {
+                  login
+                }
+              }
+        """ + GraphQlIssueNodeFields + """
+
             }
           }
         }
@@ -347,6 +372,219 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
 
         return GetOptionalString(commentNode, "url");
     }
+
+    private const string GraphQlIssueCommentsQuery = """
+        query($id: ID!, $after: String) {
+          node(id: $id) {
+            ... on Issue {
+              id
+              comments(first: 100, after: $after) {
+                pageInfo {
+                  hasNextPage
+                  endCursor
+                }
+                nodes {
+                  id
+                  body
+                  createdAt
+                  authorAssociation
+                  author {
+                    login
+                  }
+                }
+              }
+            }
+          }
+        }
+        """;
+
+    private const string GraphQlCloseIssueMutation = """
+        mutation($issueId: ID!) {
+          closeIssue(input: { issueId: $issueId }) {
+            issue {
+              id
+              state
+            }
+          }
+        }
+        """;
+
+    // Upper bound on comment pages fetched for directive processing; matches the
+    // marker-scan cap rationale — far beyond any issue Symphony manages.
+    private const int MaxCommentPages = 30;
+
+    public async Task<IReadOnlyList<NormalizedIssueComment>> FetchIssueCommentsAsync(
+        TrackerQuery query,
+        string issueId,
+        CancellationToken cancellationToken = default)
+    {
+        var endpoint = string.IsNullOrWhiteSpace(query.Endpoint) ? "https://api.github.com/graphql" : query.Endpoint;
+        var comments = new List<NormalizedIssueComment>();
+        string? after = null;
+        var pages = 0;
+
+        while (true)
+        {
+            using var request = BuildGraphQlRequest(
+                endpoint,
+                query.ApiKey,
+                GraphQlIssueCommentsQuery,
+                new
+                {
+                    id = issueId,
+                    after
+                });
+
+            using var response = await SendAsync(request, cancellationToken);
+            using var document = await ParseGraphQlDocumentAsync(response, cancellationToken);
+
+            var dataElement = GetRequiredObject(document.RootElement, "data");
+            if (!dataElement.TryGetProperty("node", out var nodeElement) ||
+                nodeElement.ValueKind != JsonValueKind.Object ||
+                string.IsNullOrWhiteSpace(GetOptionalString(nodeElement, "id")))
+            {
+                return comments;
+            }
+
+            var commentsElement = GetRequiredObject(nodeElement, "comments");
+            foreach (var commentNode in GetRequiredArray(commentsElement, "nodes").EnumerateArray())
+            {
+                if (commentNode.ValueKind != JsonValueKind.Object)
+                {
+                    continue;
+                }
+
+                var commentId = GetOptionalString(commentNode, "id");
+                if (string.IsNullOrWhiteSpace(commentId))
+                {
+                    continue;
+                }
+
+                var authorLogin = commentNode.TryGetProperty("author", out var authorNode) &&
+                    authorNode.ValueKind == JsonValueKind.Object
+                        ? GetOptionalString(authorNode, "login")
+                        : null;
+
+                comments.Add(new NormalizedIssueComment(
+                    commentId,
+                    GetOptionalString(commentNode, "body") ?? string.Empty,
+                    authorLogin,
+                    GetOptionalString(commentNode, "authorAssociation"),
+                    ParseDateTimeOffset(commentNode, "createdAt")));
+            }
+
+            var pageInfo = GetRequiredObject(commentsElement, "pageInfo");
+            pages++;
+            if (!GetRequiredBoolean(pageInfo, "hasNextPage") || pages >= MaxCommentPages)
+            {
+                return comments;
+            }
+
+            after = GetOptionalString(pageInfo, "endCursor");
+            if (string.IsNullOrWhiteSpace(after))
+            {
+                return comments;
+            }
+        }
+    }
+
+    public async Task<IReadOnlyList<NormalizedIssue>> FetchIssuesByIdsAsync(
+        TrackerQuery query,
+        IReadOnlyList<string> issueIds,
+        CancellationToken cancellationToken = default)
+    {
+        if (issueIds.Count == 0)
+        {
+            return [];
+        }
+
+        var endpoint = string.IsNullOrWhiteSpace(query.Endpoint) ? "https://api.github.com/graphql" : query.Endpoint;
+        var orderedIds = issueIds
+            .Where(static id => !string.IsNullOrWhiteSpace(id))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        var issuesById = new Dictionary<string, NormalizedIssue>(StringComparer.OrdinalIgnoreCase);
+        foreach (var issueIdBatch in orderedIds.Chunk(50))
+        {
+            using var request = BuildGraphQlRequest(
+                endpoint,
+                query.ApiKey,
+                GraphQlIssuesByIdsQuery,
+                new
+                {
+                    ids = issueIdBatch,
+                    includePullRequests = query.IncludePullRequests
+                });
+
+            using var response = await SendAsync(request, cancellationToken);
+            using var document = await ParseGraphQlDocumentAsync(response, cancellationToken);
+
+            var dataElement = GetRequiredObject(document.RootElement, "data");
+            foreach (var issueNode in GetRequiredArray(dataElement, "nodes").EnumerateArray())
+            {
+                if (issueNode.ValueKind != JsonValueKind.Object ||
+                    string.IsNullOrWhiteSpace(GetOptionalString(issueNode, "id")))
+                {
+                    continue;
+                }
+
+                if (!issueNode.TryGetProperty("repository", out var repositoryNode) ||
+                    repositoryNode.ValueKind != JsonValueKind.Object)
+                {
+                    continue;
+                }
+
+                var owner = repositoryNode.TryGetProperty("owner", out var ownerNode)
+                    ? GetOptionalString(ownerNode, "login")
+                    : null;
+                var repo = GetOptionalString(repositoryNode, "name");
+                if (!string.Equals(owner, query.Owner, StringComparison.OrdinalIgnoreCase) ||
+                    !string.Equals(repo, query.Repo, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                var issue = ParseIssue(issueNode, query.IncludePullRequests);
+                issuesById[issue.Id] = issue;
+            }
+        }
+
+        var result = new List<NormalizedIssue>(issuesById.Count);
+        foreach (var issueId in orderedIds)
+        {
+            if (issuesById.TryGetValue(issueId, out var issue))
+            {
+                result.Add(issue);
+            }
+        }
+
+        return result;
+    }
+
+    public async Task CloseIssueAsync(
+        TrackerQuery query,
+        string issueId,
+        CancellationToken cancellationToken = default)
+    {
+        var endpoint = string.IsNullOrWhiteSpace(query.Endpoint) ? "https://api.github.com/graphql" : query.Endpoint;
+
+        using var request = BuildGraphQlRequest(
+            endpoint,
+            query.ApiKey,
+            GraphQlCloseIssueMutation,
+            new
+            {
+                issueId
+            });
+
+        using var response = await SendAsync(request, cancellationToken);
+        using var document = await ParseGraphQlDocumentAsync(response, cancellationToken);
+
+        var dataElement = GetRequiredObject(document.RootElement, "data");
+        GetRequiredObject(dataElement, "closeIssue");
+    }
+
 
     public async Task<GitHubGraphQlExecutionResult> ExecuteGitHubGraphQlAsync(
         TrackerQuery query,
@@ -1016,3 +1254,7 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
     [GeneratedRegex(@"(?:^|[\s:_-])p(?:riority)?(?<priority>[1-4])(?:$|[\s:_-])", RegexOptions.IgnoreCase)]
     private static partial Regex PriorityRegex();
 }
+
+// Note: trivial source changes intentionally shift this assembly's hash; Windows
+// Smart App Control on the build machine scores binaries per hash and has blocked
+// stale hashes before (0x800711C7). See docs in the M3 PR description.

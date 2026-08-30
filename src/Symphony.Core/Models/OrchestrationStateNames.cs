@@ -11,6 +11,11 @@ public static class RunStatusNames
     public const string CanceledByReconciliation = "canceled_by_reconciliation";
     public const string ReleasedIneligible = "released_ineligible";
     public const string NeedsCommandCenter = "needs_command_center";
+
+    // Terminal outcome for a run whose escalation was resolved by an explicit
+    // command-center directive (M3): the directive either re-dispatched the issue
+    // as a fresh run or closed it.
+    public const string ResolvedByDirective = "resolved_by_directive";
 }
 
 public static class RunPhaseNames

@@ -16,4 +16,9 @@ public sealed record IssueExecutionRequest(
     string InstanceId,
     int? Attempt,
     NormalizedIssue Issue,
-    WorkflowDefinition WorkflowDefinition);
+    WorkflowDefinition WorkflowDefinition,
+    // M3: a command-center directive that authorized this dispatch. Appended to
+    // the rendered prompt so the worker executes with the owner's instructions.
+    string? DirectiveInstructions = null,
+    string? DirectiveAction = null,
+    string? DirectivePhase = null);
