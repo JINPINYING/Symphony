@@ -352,6 +352,191 @@ public sealed class OrchestrationTickServiceTests
     }
 
     [Fact]
+    public async Task RunTickAsync_ShouldSeedLedgerVerifyAndDispatchCrossVendorReview()
+    {
+        var tracker = new FakeTrackerClient([]);
+        var issue = BuildIssue("issue-1", "#1", "Open", null,
+            pullRequests: [new PullRequestRef("pr-5", 5, "OPEN", null, "symphony/1", "main")]);
+        tracker.IssuesById["issue-1"] = issue;
+        tracker.PullRequestStatusByNumber[5] = new PullRequestStatus(5, "OPEN", false, "aaa111", "SUCCESS", "MERGEABLE");
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success));
+
+        await harness.InsertRunAsync("issue-1", "#1", "Open", "instance-1", RunStatusNames.Succeeded);
+
+        await harness.Service.RunTickAsync(CancellationToken.None); // seed + verify passes
+        await harness.Service.RunTickAsync(CancellationToken.None); // review dispatch
+
+        var ledger = Assert.Single(await harness.DbContext.PhaseLedger.ToListAsync());
+        Assert.Equal(PhaseStages.Reviewing, ledger.Stage);
+        Assert.Equal("aaa111", ledger.HeadSha);
+        Assert.Equal("codex", ledger.ImplementerRunner);
+
+        var request = Assert.Single(harness.Coordinator.StartRequests);
+        Assert.Equal("claude", request.RunnerOverride);
+        Assert.NotNull(request.PromptOverride);
+        Assert.Contains(PhaseOrchestrator.ReviewVerdictMarker(5, "aaa111"), request.PromptOverride);
+        Assert.Contains("VERDICT: APPROVED", request.PromptOverride);
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldMarkReadyOnApprovedVerdict()
+    {
+        var tracker = new FakeTrackerClient([]);
+        var issue = BuildIssue("issue-1", "#1", "Open", null,
+            pullRequests: [new PullRequestRef("pr-5", 5, "OPEN", null, "symphony/1", "main")]);
+        tracker.IssuesById["issue-1"] = issue;
+        tracker.PullRequestStatusByNumber[5] = new PullRequestStatus(5, "OPEN", false, "aaa111", "SUCCESS", "MERGEABLE");
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success));
+
+        await harness.InsertRunAsync("issue-1", "#1", "Open", "instance-1", RunStatusNames.Succeeded);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        tracker.CommentsByIssueId.TryAdd("issue-1", []);
+        tracker.CommentsByIssueId["issue-1"].Add(new NormalizedIssueComment(
+            "review-1",
+            PhaseOrchestrator.ReviewVerdictMarker(5, "aaa111") + "\nLooks correct and bounded.\nVERDICT: APPROVED",
+            "reviewer", "OWNER", DateTimeOffset.UtcNow));
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var ledger = Assert.Single(await harness.DbContext.PhaseLedger.ToListAsync());
+        Assert.Equal(PhaseStages.Ready, ledger.Stage);
+        Assert.Equal("APPROVED", ledger.LastVerdict);
+        Assert.Contains(
+            tracker.PostedComments,
+            comment => comment.Body.Contains("READY_FOR_MERGE", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldEscalateWhenRepairNeverMovesHead()
+    {
+        var tracker = new FakeTrackerClient([]);
+        var issue = BuildIssue("issue-1", "#1", "Open", null,
+            pullRequests: [new PullRequestRef("pr-5", 5, "OPEN", null, "symphony/1", "main")]);
+        tracker.IssuesById["issue-1"] = issue;
+        tracker.PullRequestStatusByNumber[5] = new PullRequestStatus(5, "OPEN", false, "aaa111", "SUCCESS", "MERGEABLE");
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success));
+
+        await harness.InsertRunAsync("issue-1", "#1", "Open", "instance-1", RunStatusNames.Succeeded);
+
+        await harness.Service.RunTickAsync(CancellationToken.None); // seed + verify
+        await harness.Service.RunTickAsync(CancellationToken.None); // review dispatch
+
+        tracker.CommentsByIssueId.TryAdd("issue-1", []);
+        tracker.CommentsByIssueId["issue-1"].Add(new NormalizedIssueComment(
+            "review-1",
+            PhaseOrchestrator.ReviewVerdictMarker(5, "aaa111") + "\nFinding: null check missing.\nVERDICT: CHANGES_REQUIRED",
+            "reviewer", "OWNER", DateTimeOffset.UtcNow));
+
+        await harness.Service.RunTickAsync(CancellationToken.None); // repair dispatch
+
+        var ledger = Assert.Single(await harness.DbContext.PhaseLedger.ToListAsync());
+        Assert.Equal(PhaseStages.WaitForRepair, ledger.Stage);
+        Assert.Equal(1, ledger.RepairCount);
+        Assert.Equal("aaa111", ledger.RejectedHeadSha);
+        Assert.Equal(2, harness.Coordinator.StartRequests.Count);
+        var repairRequest = harness.Coordinator.StartRequests[1];
+        Assert.Equal("codex", repairRequest.RunnerOverride);
+        Assert.Contains("SINGLE BOUNDED REPAIR", repairRequest.PromptOverride);
+
+        // Repair run succeeded (fake) but the PR head never moved: the fence
+        // refuses to re-review unchanged rejected code and escalates.
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        ledger = Assert.Single(await harness.DbContext.PhaseLedger.ToListAsync());
+        Assert.Equal(PhaseStages.Escalated, ledger.Stage);
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldAdvanceToFinalReviewWhenRepairMovesHeadAndEscalateOnSecondRejection()
+    {
+        var tracker = new FakeTrackerClient([]);
+        var issue = BuildIssue("issue-1", "#1", "Open", null,
+            pullRequests: [new PullRequestRef("pr-5", 5, "OPEN", null, "symphony/1", "main")]);
+        tracker.IssuesById["issue-1"] = issue;
+        tracker.PullRequestStatusByNumber[5] = new PullRequestStatus(5, "OPEN", false, "aaa111", "SUCCESS", "MERGEABLE");
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success));
+
+        await harness.InsertRunAsync("issue-1", "#1", "Open", "instance-1", RunStatusNames.Succeeded);
+
+        await harness.Service.RunTickAsync(CancellationToken.None); // seed + verify
+        await harness.Service.RunTickAsync(CancellationToken.None); // review dispatch
+
+        tracker.CommentsByIssueId.TryAdd("issue-1", []);
+        tracker.CommentsByIssueId["issue-1"].Add(new NormalizedIssueComment(
+            "review-1",
+            PhaseOrchestrator.ReviewVerdictMarker(5, "aaa111") + "\nVERDICT: CHANGES_REQUIRED",
+            "reviewer", "OWNER", DateTimeOffset.UtcNow));
+
+        await harness.Service.RunTickAsync(CancellationToken.None); // repair dispatch
+
+        // The repair moves the head before the next tick.
+        tracker.PullRequestStatusByNumber[5] = new PullRequestStatus(5, "OPEN", false, "bbb222", "SUCCESS", "MERGEABLE");
+
+        await harness.Service.RunTickAsync(CancellationToken.None); // wait_for_repair -> awaiting_verify
+        await harness.Service.RunTickAsync(CancellationToken.None); // verify passes at new head
+        await harness.Service.RunTickAsync(CancellationToken.None); // final review dispatch
+
+        var ledger = Assert.Single(await harness.DbContext.PhaseLedger.ToListAsync());
+        Assert.Equal(PhaseStages.Reviewing, ledger.Stage);
+        Assert.Equal("bbb222", ledger.HeadSha);
+        Assert.Equal(3, harness.Coordinator.StartRequests.Count);
+        var finalReviewRequest = harness.Coordinator.StartRequests[2];
+        Assert.Equal("claude", finalReviewRequest.RunnerOverride);
+        Assert.Contains("FINAL review", finalReviewRequest.PromptOverride);
+        Assert.Contains(PhaseOrchestrator.ReviewVerdictMarker(5, "bbb222"), finalReviewRequest.PromptOverride);
+
+        // A second CHANGES_REQUIRED at the new head escalates: one repair only.
+        tracker.CommentsByIssueId["issue-1"].Add(new NormalizedIssueComment(
+            "review-2",
+            PhaseOrchestrator.ReviewVerdictMarker(5, "bbb222") + "\nVERDICT: CHANGES_REQUIRED",
+            "reviewer", "OWNER", DateTimeOffset.UtcNow));
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        ledger = Assert.Single(await harness.DbContext.PhaseLedger.ToListAsync());
+        Assert.Equal(PhaseStages.Escalated, ledger.Stage);
+        Assert.Equal(3, harness.Coordinator.StartRequests.Count); // no second repair
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldEscalateWhenVerifyFindsFailingChecks()
+    {
+        var tracker = new FakeTrackerClient([]);
+        var issue = BuildIssue("issue-1", "#1", "Open", null,
+            pullRequests: [new PullRequestRef("pr-5", 5, "OPEN", null, "symphony/1", "main")]);
+        tracker.IssuesById["issue-1"] = issue;
+        tracker.PullRequestStatusByNumber[5] = new PullRequestStatus(5, "OPEN", false, "aaa111", "FAILURE", "MERGEABLE");
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success));
+
+        await harness.InsertRunAsync("issue-1", "#1", "Open", "instance-1", RunStatusNames.Succeeded);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var ledger = Assert.Single(await harness.DbContext.PhaseLedger.ToListAsync());
+        Assert.Equal(PhaseStages.Escalated, ledger.Stage);
+        Assert.Equal(
+            RunStatusNames.NeedsCommandCenter,
+            (await harness.DbContext.Runs.SingleAsync()).Status);
+        Assert.Empty(harness.Coordinator.StartRequests);
+    }
+
+    [Fact]
     public async Task RunTickAsync_ShouldDeferDispatchingDirectiveWhenNoAgentSlotIsFree()
     {
         var tracker = new FakeTrackerClient([]);
@@ -1343,6 +1528,11 @@ public sealed class OrchestrationTickServiceTests
                     tracker,
                     TimeProvider.System,
                     NullLogger<DirectiveProcessor>.Instance),
+                new PhaseOrchestrator(
+                    dbContext,
+                    tracker,
+                    TimeProvider.System,
+                    NullLogger<PhaseOrchestrator>.Instance),
                 Options.Create(new OrchestrationOptions
                 {
                     InstanceId = "instance-1",
@@ -1725,6 +1915,17 @@ public sealed class OrchestrationTickServiceTests
         {
             ClosedIssueIds.Add(issueId);
             return Task.CompletedTask;
+        }
+
+        public Dictionary<int, PullRequestStatus> PullRequestStatusByNumber { get; } = [];
+
+        public Task<PullRequestStatus?> FetchPullRequestStatusAsync(
+            TrackerQuery query,
+            int pullRequestNumber,
+            CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult(
+                PullRequestStatusByNumber.TryGetValue(pullRequestNumber, out var status) ? status : null);
         }
     }
 

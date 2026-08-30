@@ -1256,6 +1256,14 @@ public sealed class ApiSmokeTests
         {
             return Task.CompletedTask;
         }
+
+        public Task<PullRequestStatus?> FetchPullRequestStatusAsync(
+            TrackerQuery query,
+            int pullRequestNumber,
+            CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult<PullRequestStatus?>(null);
+        }
     }
 
     private static void TryDeleteFile(string path)

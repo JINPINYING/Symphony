@@ -16,6 +16,7 @@ public sealed class SymphonyDbContext(DbContextOptions<SymphonyDbContext> option
     public DbSet<WorkspaceRecordEntity> WorkspaceRecords => Set<WorkspaceRecordEntity>();
     public DbSet<EventLogEntity> EventLog => Set<EventLogEntity>();
     public DbSet<DirectiveLogEntity> DirectiveLog => Set<DirectiveLogEntity>();
+    public DbSet<PhaseLedgerEntity> PhaseLedger => Set<PhaseLedgerEntity>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -172,6 +173,23 @@ public sealed class SymphonyDbContext(DbContextOptions<SymphonyDbContext> option
             entity.Property(x => x.LastPreparedAtUtc).IsRequired();
             entity.Property(x => x.LastCleanupReason).HasMaxLength(100);
             entity.HasIndex(x => x.IssueIdentifier);
+        });
+
+        modelBuilder.Entity<PhaseLedgerEntity>(entity =>
+        {
+            entity.ToTable("phase_ledger");
+            entity.HasKey(x => x.IssueId);
+            entity.Property(x => x.IssueId).HasMaxLength(200).IsRequired();
+            entity.Property(x => x.IssueIdentifier).HasMaxLength(200).IsRequired();
+            entity.Property(x => x.Stage).HasMaxLength(50).IsRequired();
+            entity.Property(x => x.HeadSha).HasMaxLength(64);
+            entity.Property(x => x.ImplementerRunner).HasMaxLength(50).IsRequired();
+            entity.Property(x => x.RejectedHeadSha).HasMaxLength(64);
+            entity.Property(x => x.LastVerdict).HasMaxLength(50);
+            entity.Property(x => x.LastVerdictHeadSha).HasMaxLength(64);
+            entity.Property(x => x.CreatedAtUtc).IsRequired();
+            entity.Property(x => x.UpdatedAtUtc).IsRequired();
+            entity.HasIndex(x => x.Stage);
         });
 
         modelBuilder.Entity<DirectiveLogEntity>(entity =>
