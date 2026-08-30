@@ -10,6 +10,15 @@ public static class RunStatusNames
     public const string Stalled = "stalled";
     public const string CanceledByReconciliation = "canceled_by_reconciliation";
     public const string ReleasedIneligible = "released_ineligible";
+    public const string NeedsCommandCenter = "needs_command_center";
+}
+
+public static class RunPhaseNames
+{
+    public const string Implementation = "implementation";
+    public const string Verify = "verify";
+    public const string Review = "review";
+    public const string FinalReview = "final_review";
 }
 
 public static class RetryDelayTypes

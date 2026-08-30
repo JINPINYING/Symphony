@@ -39,12 +39,9 @@ public sealed partial class OrchestrationTickService
             .Where(run => run.Status == RunStatusNames.Running)
             .ToListAsync(cancellationToken);
 
-        var succeededIssueIds = new HashSet<string>(
-            await dbContext.Runs
-                .Where(run => run.Status == RunStatusNames.Succeeded)
-                .Select(run => run.IssueId)
-                .ToListAsync(cancellationToken),
-            StringComparer.OrdinalIgnoreCase);
+        // Issues finalized during this tick (legacy continuation drain) must not be
+        // re-dispatched in the same tick; the next tick's phase-aware checks govern them.
+        var finalizedThisTick = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         var countsByState = runningIssues
             .GroupBy(run => NormalizeStateKey(run.State), StringComparer.OrdinalIgnoreCase)
@@ -61,28 +58,30 @@ public sealed partial class OrchestrationTickService
             .ToListAsync(cancellationToken);
 
         var candidatesById = issues.ToDictionary(issue => issue.Id, StringComparer.OrdinalIgnoreCase);
+
+        await ReconcileAbandonedReleasedRunsAsync(workflowDefinition, query, candidatesById, cancellationToken);
+
         foreach (var retryEntry in dueRetries)
         {
             if (string.Equals(retryEntry.DelayType, RetryDelayTypes.Continuation, StringComparison.OrdinalIgnoreCase))
             {
                 await CompleteSuccessfulDispatchAsync(retryEntry, instanceId, cancellationToken);
-                succeededIssueIds.Add(retryEntry.IssueId);
+                finalizedThisTick.Add(retryEntry.IssueId);
                 continue;
             }
 
             if (!candidatesById.TryGetValue(retryEntry.IssueId, out var retryIssue))
             {
-                await ReleaseRetryReservationAsync(
-                    retryEntry.IssueId,
-                    retryEntry.IssueIdentifier,
+                await HandleMissingRetryCandidateAsync(
+                    retryEntry,
+                    query,
+                    workflowDefinition,
                     instanceId,
-                    "retry candidate missing",
                     cancellationToken);
                 continue;
             }
 
-            if (succeededIssueIds.Contains(retryIssue.Id) ||
-                !IsDispatchEligible(retryIssue, workflowDefinition, runningIssueIds, countsByState))
+            if (!IsDispatchEligible(retryIssue, workflowDefinition, runningIssueIds, countsByState))
             {
                 await ReleaseRetryReservationAsync(
                     retryEntry.IssueId,
@@ -118,6 +117,8 @@ public sealed partial class OrchestrationTickService
             }
         }
 
+        var latestRunByIssueId = await LoadLatestRunByIssueAsync(candidatesById.Keys, cancellationToken);
+
         foreach (var issue in OrderIssuesForDispatch(issues))
         {
             if (!HasGlobalSlot(workflowDefinition, runningIssueIds.Count))
@@ -125,8 +126,13 @@ public sealed partial class OrchestrationTickService
                 break;
             }
 
-            if (succeededIssueIds.Contains(issue.Id) ||
+            if (finalizedThisTick.Contains(issue.Id) ||
                 !IsDispatchEligible(issue, workflowDefinition, runningIssueIds, countsByState))
+            {
+                continue;
+            }
+
+            if (await ShouldBlockImplementationRedispatchAsync(issue, latestRunByIssueId, cancellationToken))
             {
                 continue;
             }
@@ -136,6 +142,92 @@ public sealed partial class OrchestrationTickService
                 runningIssueIds.Add(issue.Id);
             }
         }
+    }
+
+    private async Task<Dictionary<string, RunEntity>> LoadLatestRunByIssueAsync(
+        IEnumerable<string> issueIds,
+        CancellationToken cancellationToken)
+    {
+        var ids = issueIds.ToList();
+        if (ids.Count == 0)
+        {
+            return new Dictionary<string, RunEntity>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        var runs = await dbContext.Runs
+            .Where(run => ids.Contains(run.IssueId))
+            .ToListAsync(cancellationToken);
+
+        // SQLite cannot ORDER BY DateTimeOffset reliably; order in memory.
+        return runs
+            .GroupBy(run => run.IssueId, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(
+                group => group.Key,
+                group => group.OrderByDescending(run => run.StartedAtUtc).First(),
+                StringComparer.OrdinalIgnoreCase);
+    }
+
+    private async Task<bool> ShouldBlockImplementationRedispatchAsync(
+        NormalizedIssue issue,
+        IReadOnlyDictionary<string, RunEntity> latestRunByIssueId,
+        CancellationToken cancellationToken)
+    {
+        if (!latestRunByIssueId.TryGetValue(issue.Id, out var latestRun))
+        {
+            return false;
+        }
+
+        // A prior escalation must be resolved by the Commander before automation resumes.
+        if (string.Equals(latestRun.Status, RunStatusNames.NeedsCommandCenter, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        // An issue whose implementation already succeeded and whose PR is still open must
+        // not be silently reimplemented. It is NOT suppressed forever: once the PR is
+        // merged or closed (or the issue is explicitly re-dispatched for a later phase),
+        // dispatch becomes possible again.
+        if (!string.Equals(latestRun.Status, RunStatusNames.Succeeded, StringComparison.OrdinalIgnoreCase) ||
+            !string.Equals(latestRun.Phase, RunPhaseNames.Implementation, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if (!HasOpenPullRequest(issue))
+        {
+            return false;
+        }
+
+        var alreadyLogged = await dbContext.EventLog.AnyAsync(
+            entry => entry.RunId == latestRun.Id && entry.EventName == "implementation_redispatch_blocked",
+            cancellationToken);
+        if (!alreadyLogged)
+        {
+            dbContext.EventLog.Add(new EventLogEntity
+            {
+                IssueId = issue.Id,
+                IssueIdentifier = issue.Identifier,
+                RunId = latestRun.Id,
+                EventName = "implementation_redispatch_blocked",
+                Level = LogLevel.Warning.ToString(),
+                Message = $"Issue {issue.Identifier} already has a completed implementation with an open pull request. " +
+                          "Automatic reimplementation is blocked; the Commander must dispatch an explicit repair/review phase or close the PR.",
+                OccurredAtUtc = timeProvider.GetUtcNow()
+            });
+            await dbContext.SaveChangesAsync(cancellationToken);
+        }
+
+        logger.LogWarning(
+            "Blocked implementation redispatch for issue {IssueIdentifier}: implementation already succeeded and a pull request is still open.",
+            issue.Identifier);
+        return true;
+    }
+
+    private static bool HasOpenPullRequest(NormalizedIssue issue)
+    {
+        return issue.PullRequests.Any(pullRequest =>
+            string.IsNullOrWhiteSpace(pullRequest.State) ||
+            pullRequest.State.Trim().Equals("open", StringComparison.OrdinalIgnoreCase));
     }
 
     private async Task<bool> DispatchIssueAsync(
@@ -176,6 +268,7 @@ public sealed partial class OrchestrationTickService
                 OwnerInstanceId = instanceId,
                 Status = RunStatusNames.Running,
                 State = issue.State,
+                Phase = RunPhaseNames.Implementation,
                 CurrentRetryAttempt = attempt,
                 StartedAtUtc = nowUtc
             };
@@ -186,6 +279,7 @@ public sealed partial class OrchestrationTickService
             run.OwnerInstanceId = instanceId;
             run.Status = RunStatusNames.Running;
             run.State = issue.State;
+            run.Phase = RunPhaseNames.Implementation;
             run.CurrentRetryAttempt = attempt;
             run.CompletedAtUtc = null;
             run.RequestedStopReason = null;
@@ -390,6 +484,305 @@ public sealed partial class OrchestrationTickService
             RunStatusNames.Succeeded,
             cancellationToken);
         await dbContext.SaveChangesAsync(cancellationToken);
+    }
+
+    private async Task HandleMissingRetryCandidateAsync(
+        RetryQueueEntity retryEntry,
+        TrackerQuery query,
+        WorkflowDefinition workflowDefinition,
+        string instanceId,
+        CancellationToken cancellationToken)
+    {
+        IssueStateSnapshot? snapshot;
+        try
+        {
+            var snapshots = await trackerClient.FetchIssueStatesByIdsAsync(query, [retryEntry.IssueId], cancellationToken);
+            snapshot = snapshots.FirstOrDefault(item =>
+                string.Equals(item.Id, retryEntry.IssueId, StringComparison.OrdinalIgnoreCase));
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // Fail closed: without a fresh read of the issue we cannot distinguish
+            // "work finished" from "work vanished", so keep the reservation.
+            logger.LogWarning(
+                ex,
+                "Could not reload issue {IssueIdentifier} to validate a missing retry candidate. Keeping the retry reservation.",
+                retryEntry.IssueIdentifier);
+            await RescheduleRetryAsync(
+                retryEntry,
+                instanceId,
+                "retry candidate reload failed; failing closed",
+                workflowDefinition.Runtime.Agent.MaxRetryBackoffMs,
+                cancellationToken);
+            return;
+        }
+
+        if (snapshot is not null &&
+            MatchesTerminalState(snapshot.State, workflowDefinition.Runtime.Tracker.TerminalStates))
+        {
+            await ReleaseRetryReservationAsync(
+                retryEntry.IssueId,
+                retryEntry.IssueIdentifier,
+                instanceId,
+                "issue reached a terminal state",
+                cancellationToken);
+            return;
+        }
+
+        var retryingRun = await FindLatestRunWithStatusAsync(retryEntry.IssueId, RunStatusNames.Retrying, cancellationToken);
+
+        if (snapshot is null)
+        {
+            await EscalateRunToCommandCenterAsync(
+                retryingRun,
+                retryEntry.IssueId,
+                retryEntry.IssueIdentifier,
+                instanceId,
+                $"Issue {retryEntry.IssueIdentifier} has a due retry reservation but could not be reloaded by id from the tracker.",
+                cancellationToken);
+            return;
+        }
+
+        if (retryingRun is not null && await HasDurableUnfinishedWorkEvidenceAsync(retryingRun, cancellationToken))
+        {
+            await EscalateRunToCommandCenterAsync(
+                retryingRun,
+                retryEntry.IssueId,
+                retryEntry.IssueIdentifier,
+                instanceId,
+                $"Issue {retryEntry.IssueIdentifier} is still open with durable evidence of unfinished work, " +
+                "but it is no longer dispatchable (missing from the candidate query). Refusing to silently release the run.",
+                cancellationToken);
+            return;
+        }
+
+        await ReleaseRetryReservationAsync(
+            retryEntry.IssueId,
+            retryEntry.IssueIdentifier,
+            instanceId,
+            "retry candidate missing",
+            cancellationToken);
+    }
+
+    private async Task<RunEntity?> FindLatestRunWithStatusAsync(
+        string issueId,
+        string status,
+        CancellationToken cancellationToken)
+    {
+        var runs = await dbContext.Runs
+            .Where(runEntity => runEntity.IssueId == issueId && runEntity.Status == status)
+            .ToListAsync(cancellationToken);
+
+        return runs
+            .OrderByDescending(runEntity => runEntity.StartedAtUtc)
+            .FirstOrDefault();
+    }
+
+    private async Task<bool> HasDurableUnfinishedWorkEvidenceAsync(RunEntity run, CancellationToken cancellationToken)
+    {
+        if (!string.IsNullOrWhiteSpace(run.SessionId) || run.TurnCount > 0)
+        {
+            return true;
+        }
+
+        var cachedIssue = await dbContext.IssueCache.SingleOrDefaultAsync(
+            entry => entry.IssueId == run.IssueId,
+            cancellationToken);
+
+        return cachedIssue is not null &&
+               !string.IsNullOrWhiteSpace(cachedIssue.PullRequestsJson) &&
+               !string.Equals(cachedIssue.PullRequestsJson.Trim(), "[]", StringComparison.Ordinal);
+    }
+
+    private async Task EscalateRunToCommandCenterAsync(
+        RunEntity? run,
+        string issueId,
+        string issueIdentifier,
+        string instanceId,
+        string reason,
+        CancellationToken cancellationToken)
+    {
+        var nowUtc = timeProvider.GetUtcNow();
+
+        if (run is not null)
+        {
+            run.Status = RunStatusNames.NeedsCommandCenter;
+            run.CompletedAtUtc ??= nowUtc;
+            run.LastEvent = "needs_command_center";
+            run.LastMessage = reason;
+            run.LastEventAtUtc = nowUtc;
+        }
+
+        var retryEntry = await dbContext.RetryQueue.SingleOrDefaultAsync(
+            retry => retry.IssueId == issueId,
+            cancellationToken);
+        if (retryEntry is not null)
+        {
+            dbContext.RetryQueue.Remove(retryEntry);
+        }
+
+        dbContext.EventLog.Add(new EventLogEntity
+        {
+            IssueId = issueId,
+            IssueIdentifier = issueIdentifier,
+            RunId = run?.Id,
+            EventName = "needs_command_center",
+            Level = LogLevel.Error.ToString(),
+            Message = reason,
+            OccurredAtUtc = nowUtc
+        });
+
+        await coordinationStore.ReleaseIssueClaimAsync(
+            issueId,
+            instanceId,
+            RunStatusNames.NeedsCommandCenter,
+            cancellationToken);
+        await dbContext.SaveChangesAsync(cancellationToken);
+
+        logger.LogError(
+            "Issue {IssueIdentifier} needs Command Center attention: {Reason}",
+            issueIdentifier,
+            reason);
+    }
+
+    private async Task ReconcileAbandonedReleasedRunsAsync(
+        WorkflowDefinition workflowDefinition,
+        TrackerQuery query,
+        IReadOnlyDictionary<string, NormalizedIssue> candidatesById,
+        CancellationToken cancellationToken)
+    {
+        // The #88 failure signature: execution started (a Codex session exists), the run
+        // was finalized as released_ineligible, the issue is still open on GitHub, the
+        // execution label is gone (absent from the candidate query), and no live run
+        // exists. That is abandoned work and must surface to the Command Center instead
+        // of idling silently.
+        var releasedRuns = await dbContext.Runs
+            .Where(run => run.Status == RunStatusNames.ReleasedIneligible && run.SessionId != null)
+            .ToListAsync(cancellationToken);
+        if (releasedRuns.Count == 0)
+        {
+            return;
+        }
+
+        var issueIds = releasedRuns
+            .Select(run => run.IssueId)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        var allRunsForIssues = await dbContext.Runs
+            .Where(run => issueIds.Contains(run.IssueId))
+            .ToListAsync(cancellationToken);
+
+        var suspects = new List<RunEntity>();
+        foreach (var issueRuns in allRunsForIssues.GroupBy(run => run.IssueId, StringComparer.OrdinalIgnoreCase))
+        {
+            if (issueRuns.Any(run => string.Equals(run.Status, RunStatusNames.NeedsCommandCenter, StringComparison.OrdinalIgnoreCase)))
+            {
+                continue;
+            }
+
+            var latestRun = issueRuns.OrderByDescending(run => run.StartedAtUtc).First();
+            if (!string.Equals(latestRun.Status, RunStatusNames.ReleasedIneligible, StringComparison.OrdinalIgnoreCase) ||
+                string.IsNullOrWhiteSpace(latestRun.SessionId))
+            {
+                continue;
+            }
+
+            if (candidatesById.ContainsKey(latestRun.IssueId))
+            {
+                // Still dispatchable; the ordinary dispatch path (with the phase-aware
+                // redispatch guard) governs this issue.
+                continue;
+            }
+
+            suspects.Add(latestRun);
+        }
+
+        if (suspects.Count == 0)
+        {
+            return;
+        }
+
+        var suspectIds = suspects.Select(run => run.IssueId).ToList();
+        var cachedIssues = await dbContext.IssueCache
+            .Where(entry => suspectIds.Contains(entry.IssueId))
+            .ToListAsync(cancellationToken);
+        var cachedById = cachedIssues.ToDictionary(entry => entry.IssueId, StringComparer.OrdinalIgnoreCase);
+
+        var toVerify = suspects
+            .Where(run =>
+                !cachedById.TryGetValue(run.IssueId, out var cached) ||
+                !MatchesTerminalState(cached.State, workflowDefinition.Runtime.Tracker.TerminalStates))
+            .ToList();
+        if (toVerify.Count == 0)
+        {
+            return;
+        }
+
+        IReadOnlyList<IssueStateSnapshot> snapshots;
+        try
+        {
+            snapshots = await trackerClient.FetchIssueStatesByIdsAsync(
+                query,
+                toVerify.Select(run => run.IssueId).ToList(),
+                cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Abandoned-work reconciliation could not reload issue states; will retry next tick.");
+            return;
+        }
+
+        var snapshotById = snapshots.ToDictionary(snapshot => snapshot.Id, StringComparer.OrdinalIgnoreCase);
+        var nowUtc = timeProvider.GetUtcNow();
+        var escalated = false;
+        foreach (var run in toVerify)
+        {
+            if (!snapshotById.TryGetValue(run.IssueId, out var snapshot) ||
+                MatchesTerminalState(snapshot.State, workflowDefinition.Runtime.Tracker.TerminalStates))
+            {
+                continue;
+            }
+
+            var reason =
+                $"Abandoned work detected for issue {run.IssueIdentifier}: the issue is still open, execution had " +
+                "already started, but the issue is no longer dispatchable (execution label removed) and no live run exists.";
+
+            run.Status = RunStatusNames.NeedsCommandCenter;
+            run.CompletedAtUtc ??= nowUtc;
+            run.LastEvent = "needs_command_center";
+            run.LastMessage = reason;
+            run.LastEventAtUtc = nowUtc;
+
+            dbContext.EventLog.Add(new EventLogEntity
+            {
+                IssueId = run.IssueId,
+                IssueIdentifier = run.IssueIdentifier,
+                RunId = run.Id,
+                EventName = "needs_command_center",
+                Level = LogLevel.Error.ToString(),
+                Message = reason,
+                OccurredAtUtc = nowUtc
+            });
+
+            logger.LogError(
+                "Issue {IssueIdentifier} needs Command Center attention: {Reason}",
+                run.IssueIdentifier,
+                reason);
+            escalated = true;
+        }
+
+        if (escalated)
+        {
+            await dbContext.SaveChangesAsync(cancellationToken);
+        }
     }
 
     private async Task ReleaseRetryReservationAsync(

@@ -278,13 +278,16 @@ public sealed class CodexAgentRunnerTests
     }
 
     [Fact]
-    public async Task RunIssueAsync_ShouldReuseThreadAcrossContinuationTurnsUntilIssueStopsBeingActive()
+    public async Task RunIssueAsync_ShouldExecuteExactlyOneTurnPerBoundedDispatch()
     {
         if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
             return;
         }
 
+        // One Symphony dispatch owns exactly one Codex turn. Even when the workflow asks
+        // for a larger turn budget, the bounded request must not run continuation turns
+        // or re-poll the tracker for an implicit next turn.
         var tracker = new SequencedTrackerClient(["Open", "Closed"]);
         var runner = CreateRunner(tracker);
         using var harness = CreateAppServerHarness(StandardCompletionScript());
@@ -300,8 +303,8 @@ public sealed class CodexAgentRunnerTests
                 trackerQuery: CreateTrackerQuery()));
 
         Assert.True(result.Success, result.Stderr);
-        Assert.Equal(2, tracker.RefreshCount);
-        Assert.Equal(2, CountOccurrences(result.Stdout, "\"turn/completed\""));
+        Assert.Equal(0, tracker.RefreshCount);
+        Assert.Equal(1, CountOccurrences(result.Stdout, "\"turn/completed\""));
     }
 
     [Fact]
