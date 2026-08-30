@@ -454,6 +454,34 @@ public sealed partial class OrchestrationTickService
             pullRequest.State.Trim().Equals("open", StringComparison.OrdinalIgnoreCase));
     }
 
+    // M3: dispatch a directive-authorized issue outside the ordinary candidate
+    // loop (escalated issues are usually delabeled, so they never appear in the
+    // label-filtered candidate query). Slot limits were checked by the directive
+    // processor; the claim gate inside DispatchIssueAsync still applies.
+    private async Task<bool> DispatchDirectiveIssueAsync(
+        NormalizedIssue issue,
+        WorkflowDefinition workflowDefinition,
+        string instanceId,
+        DirectiveDispatchContext directive,
+        CancellationToken cancellationToken)
+    {
+        var runningRuns = await dbContext.Runs
+            .Where(run => run.Status == RunStatusNames.Running)
+            .ToListAsync(cancellationToken);
+        var countsByState = runningRuns
+            .GroupBy(run => NormalizeStateKey(run.State), StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(group => group.Key, group => group.Count(), StringComparer.OrdinalIgnoreCase);
+
+        return await DispatchIssueAsync(
+            issue,
+            workflowDefinition,
+            instanceId,
+            attempt: null,
+            countsByState,
+            cancellationToken,
+            directive: directive);
+    }
+
     private async Task<bool> DispatchIssueAsync(
         NormalizedIssue issue,
         WorkflowDefinition workflowDefinition,
@@ -461,7 +489,8 @@ public sealed partial class OrchestrationTickService
         int? attempt,
         Dictionary<string, int> countsByState,
         CancellationToken cancellationToken,
-        bool resetContinuousTurnBudget = false)
+        bool resetContinuousTurnBudget = false,
+        DirectiveDispatchContext? directive = null)
     {
         AddIssueEvent(
             issue.Id,
@@ -518,6 +547,7 @@ public sealed partial class OrchestrationTickService
                 (runEntity.Status == RunStatusNames.Running || runEntity.Status == RunStatusNames.Retrying))
             .SingleOrDefaultAsync(cancellationToken);
 
+        var dispatchPhase = directive?.Phase ?? RunPhaseNames.Implementation;
         if (run is null)
         {
             run = new RunEntity
@@ -528,7 +558,7 @@ public sealed partial class OrchestrationTickService
                 OwnerInstanceId = instanceId,
                 Status = RunStatusNames.Running,
                 State = issue.State,
-                Phase = RunPhaseNames.Implementation,
+                Phase = dispatchPhase,
                 CurrentRetryAttempt = attempt,
                 StartedAtUtc = nowUtc
             };
@@ -539,7 +569,7 @@ public sealed partial class OrchestrationTickService
             run.OwnerInstanceId = instanceId;
             run.Status = RunStatusNames.Running;
             run.State = issue.State;
-            run.Phase = RunPhaseNames.Implementation;
+            run.Phase = dispatchPhase;
             run.CurrentRetryAttempt = attempt;
             run.CompletedAtUtc = null;
             run.RequestedStopReason = null;
@@ -603,7 +633,10 @@ public sealed partial class OrchestrationTickService
                 instanceId,
                 attempt,
                 issue,
-                workflowDefinition),
+                workflowDefinition,
+                DirectiveInstructions: directive?.Instructions,
+                DirectiveAction: directive?.Action,
+                DirectivePhase: directive?.Phase),
             cancellationToken);
 
         if (!started)

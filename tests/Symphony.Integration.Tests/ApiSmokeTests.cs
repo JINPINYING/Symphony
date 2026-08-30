@@ -1232,6 +1232,30 @@ public sealed class ApiSmokeTests
         {
             return Task.FromResult<string?>(null);
         }
+
+        public Task<IReadOnlyList<NormalizedIssueComment>> FetchIssueCommentsAsync(
+            TrackerQuery query,
+            string issueId,
+            CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult<IReadOnlyList<NormalizedIssueComment>>([]);
+        }
+
+        public Task<IReadOnlyList<NormalizedIssue>> FetchIssuesByIdsAsync(
+            TrackerQuery query,
+            IReadOnlyList<string> issueIds,
+            CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult<IReadOnlyList<NormalizedIssue>>([]);
+        }
+
+        public Task CloseIssueAsync(
+            TrackerQuery query,
+            string issueId,
+            CancellationToken cancellationToken = default)
+        {
+            return Task.CompletedTask;
+        }
     }
 
     private static void TryDeleteFile(string path)

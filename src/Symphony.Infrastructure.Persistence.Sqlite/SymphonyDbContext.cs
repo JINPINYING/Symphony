@@ -15,6 +15,7 @@ public sealed class SymphonyDbContext(DbContextOptions<SymphonyDbContext> option
     public DbSet<RetryQueueEntity> RetryQueue => Set<RetryQueueEntity>();
     public DbSet<WorkspaceRecordEntity> WorkspaceRecords => Set<WorkspaceRecordEntity>();
     public DbSet<EventLogEntity> EventLog => Set<EventLogEntity>();
+    public DbSet<DirectiveLogEntity> DirectiveLog => Set<DirectiveLogEntity>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -170,6 +171,21 @@ public sealed class SymphonyDbContext(DbContextOptions<SymphonyDbContext> option
             entity.Property(x => x.LastPreparedAtUtc).IsRequired();
             entity.Property(x => x.LastCleanupReason).HasMaxLength(100);
             entity.HasIndex(x => x.IssueIdentifier);
+        });
+
+        modelBuilder.Entity<DirectiveLogEntity>(entity =>
+        {
+            entity.ToTable("directive_log");
+            entity.HasKey(x => x.CommentId);
+            entity.Property(x => x.CommentId).HasMaxLength(200).IsRequired();
+            entity.Property(x => x.IssueId).HasMaxLength(200).IsRequired();
+            entity.Property(x => x.IssueIdentifier).HasMaxLength(200).IsRequired();
+            entity.Property(x => x.Action).HasMaxLength(50).IsRequired();
+            entity.Property(x => x.Phase).HasMaxLength(50);
+            entity.Property(x => x.Outcome).HasMaxLength(50).IsRequired();
+            entity.Property(x => x.Detail).HasMaxLength(2000);
+            entity.Property(x => x.ConsumedAtUtc).IsRequired();
+            entity.HasIndex(x => x.IssueId);
         });
 
         modelBuilder.Entity<EventLogEntity>(entity =>

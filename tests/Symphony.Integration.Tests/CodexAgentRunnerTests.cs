@@ -717,6 +717,15 @@ public sealed class CodexAgentRunnerTests
 
         public Task<string?> PostIssueCommentAsync(TrackerQuery query, string issueId, string body, CancellationToken cancellationToken = default)
             => Task.FromResult<string?>(null);
+
+        public Task<IReadOnlyList<NormalizedIssueComment>> FetchIssueCommentsAsync(TrackerQuery query, string issueId, CancellationToken cancellationToken = default)
+            => Task.FromResult<IReadOnlyList<NormalizedIssueComment>>([]);
+
+        public Task<IReadOnlyList<NormalizedIssue>> FetchIssuesByIdsAsync(TrackerQuery query, IReadOnlyList<string> issueIds, CancellationToken cancellationToken = default)
+            => Task.FromResult<IReadOnlyList<NormalizedIssue>>([]);
+
+        public Task CloseIssueAsync(TrackerQuery query, string issueId, CancellationToken cancellationToken = default)
+            => Task.CompletedTask;
     }
 
     private static AgentRunUpdate CreateProtocolUpdate(string json)

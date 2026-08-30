@@ -19,6 +19,7 @@ public sealed partial class OrchestrationTickService
     private readonly IWorkspaceManager workspaceManager;
     private readonly IIssueExecutionCoordinator issueExecutionCoordinator;
     private readonly EscalationPublisher escalationPublisher;
+    private readonly DirectiveProcessor directiveProcessor;
     private readonly OrchestrationOptions orchestrationOptions;
     private readonly TimeProvider timeProvider;
     private readonly ILogger<OrchestrationTickService> logger;
@@ -31,6 +32,7 @@ public sealed partial class OrchestrationTickService
         IWorkspaceManager workspaceManager,
         IIssueExecutionCoordinator issueExecutionCoordinator,
         EscalationPublisher escalationPublisher,
+        DirectiveProcessor directiveProcessor,
         IOptions<OrchestrationOptions> orchestrationOptions,
         TimeProvider timeProvider,
         ILogger<OrchestrationTickService> logger)
@@ -42,6 +44,7 @@ public sealed partial class OrchestrationTickService
         this.workspaceManager = workspaceManager;
         this.issueExecutionCoordinator = issueExecutionCoordinator;
         this.escalationPublisher = escalationPublisher;
+        this.directiveProcessor = directiveProcessor;
         this.orchestrationOptions = orchestrationOptions.Value;
         this.timeProvider = timeProvider;
         this.logger = logger;
@@ -152,6 +155,14 @@ public sealed partial class OrchestrationTickService
             // escalation reaches the owner within one tick.
             await escalationPublisher.PublishPendingEscalationsAsync(
                 BuildTrackerQuery(workflowDefinition, apiKey),
+                cancellationToken);
+
+            // M3: command-center directives on escalated issues are consumed and
+            // acted on — one comment un-parks a stuck issue.
+            await directiveProcessor.ProcessPendingDirectivesAsync(
+                workflowDefinition,
+                BuildTrackerQuery(workflowDefinition, apiKey),
+                (issue, directive, token) => DispatchDirectiveIssueAsync(issue, workflowDefinition, instanceId, directive, token),
                 cancellationToken);
             return workflowDefinition.Runtime.Polling.IntervalMs;
         }

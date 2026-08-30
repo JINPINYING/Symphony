@@ -35,4 +35,19 @@ public interface ITrackerClient
         string issueId,
         string body,
         CancellationToken cancellationToken = default);
+
+    Task<IReadOnlyList<NormalizedIssueComment>> FetchIssueCommentsAsync(
+        TrackerQuery query,
+        string issueId,
+        CancellationToken cancellationToken = default);
+
+    Task<IReadOnlyList<NormalizedIssue>> FetchIssuesByIdsAsync(
+        TrackerQuery query,
+        IReadOnlyList<string> issueIds,
+        CancellationToken cancellationToken = default);
+
+    Task CloseIssueAsync(
+        TrackerQuery query,
+        string issueId,
+        CancellationToken cancellationToken = default);
 }
