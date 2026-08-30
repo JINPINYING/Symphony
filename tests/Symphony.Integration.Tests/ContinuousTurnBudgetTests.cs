@@ -1,4 +1,5 @@
 using System.Reflection;
+using Symphony.Core.Models;
 using Symphony.Host.Services;
 using Symphony.Infrastructure.Persistence.Sqlite.Entities;
 using Symphony.Infrastructure.Workflows.Models;
@@ -31,6 +32,29 @@ public sealed class ContinuousTurnBudgetTests
         var actual = (bool)method!.Invoke(null, [run, workflow])!;
 
         Assert.Equal(expected, actual);
+    }
+
+    [Theory]
+    [InlineData(1, 1)]
+    [InlineData(6, 1)]
+    [InlineData(20, 1)]
+    public void AgentRunRequest_ShouldEnforceOneTurnPerDispatch(int configuredMaxTurns, int expectedMaxTurns)
+    {
+        var request = new AgentRunRequest(
+            IssueId: "issue-id",
+            IssueIdentifier: "#88",
+            IssueTitle: "bounded execution",
+            WorkspacePath: ".",
+            Prompt: "work once",
+            Command: "codex app-server",
+            TimeoutMs: 900_000,
+            MaxTurns: configuredMaxTurns,
+            ApprovalPolicy: "never",
+            ThreadSandbox: "danger-full-access",
+            TurnSandboxPolicy: "danger-full-access",
+            ReadTimeoutMs: 5_000);
+
+        Assert.Equal(expectedMaxTurns, request.MaxTurns);
     }
 
     private static WorkflowDefinition BuildWorkflowDefinition(int maxTurns)
