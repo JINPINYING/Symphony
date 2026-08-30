@@ -150,12 +150,13 @@ public sealed partial class OrchestrationTickService
         var latestRunByIssueId = await LoadLatestRunByIssueAsync(candidatesById.Keys, cancellationToken);
 
         var orderedIssues = OrderIssuesForDispatch(issues).ToList();
-        foreach (var issue in orderedIssues)
+        for (var issueIndex = 0; issueIndex < orderedIssues.Count; issueIndex++)
         {
+            var issue = orderedIssues[issueIndex];
             if (!HasGlobalSlot(workflowDefinition, runningIssueIds.Count))
             {
                 var remainingIssues = orderedIssues
-                    .Skip(orderedIssues.IndexOf(issue))
+                    .Skip(issueIndex)
                     .ToList();
                 await RecordRemainingCapacityRefusalsAsync(
                     remainingIssues,
@@ -171,10 +172,11 @@ public sealed partial class OrchestrationTickService
             {
                 if (!finalizedThisTick.Contains(issue.Id))
                 {
-                    await RecordCandidateRefusalAsync(
-                        issue,
-                        DetermineIneligibilityReason(issue, workflowDefinition, runningIssueIds, countsByState),
-                        cancellationToken);
+                    var reason = DetermineIneligibilityReason(issue, workflowDefinition, runningIssueIds, countsByState);
+                    if (!string.Equals(reason, "already_running", StringComparison.OrdinalIgnoreCase))
+                    {
+                        await RecordCandidateRefusalAsync(issue, reason, cancellationToken);
+                    }
                 }
 
                 continue;
@@ -480,14 +482,19 @@ public sealed partial class OrchestrationTickService
 
         if (!claimResult.Claimed)
         {
-            AddIssueEvent(
-                issue.Id,
-                issue.Identifier,
-                null,
-                null,
-                "claim_refused",
-                LogLevel.Warning,
-                $"Claim refused for issue {issue.Identifier}: {claimResult.Reason}.");
+            var claimRefusalReason = claimResult.Reason ?? "claim_refused";
+            if (await ShouldRecordCandidateRefusalAsync(issue.Id, claimRefusalReason, cancellationToken))
+            {
+                AddIssueEvent(
+                    issue.Id,
+                    issue.Identifier,
+                    null,
+                    null,
+                    "claim_refused",
+                    LogLevel.Warning,
+                    $"Claim refused for issue {issue.Identifier}: {claimResult.Reason}.");
+            }
+
             if (await ShouldWarnDelayedAcquisitionAsync(issue.Id, cancellationToken))
             {
                 AddIssueEvent(
@@ -585,6 +592,7 @@ public sealed partial class OrchestrationTickService
             "claim_succeeded",
             LogLevel.Information,
             $"Claim succeeded for issue {issue.Identifier}.");
+        await ClearEligibleSeenAsync(issue.Id, cancellationToken);
 
         await dbContext.SaveChangesAsync(cancellationToken);
 
@@ -655,14 +663,17 @@ public sealed partial class OrchestrationTickService
         string reason,
         CancellationToken cancellationToken)
     {
-        AddIssueEvent(
-            issue.Id,
-            issue.Identifier,
-            null,
-            null,
-            "claim_refused",
-            LogLevel.Warning,
-            $"Issue {issue.Identifier} was not claimable this tick: {reason}.");
+        if (await ShouldRecordCandidateRefusalAsync(issue.Id, reason, cancellationToken))
+        {
+            AddIssueEvent(
+                issue.Id,
+                issue.Identifier,
+                null,
+                null,
+                "claim_refused",
+                LogLevel.Warning,
+                $"Issue {issue.Identifier} was not claimable this tick: {reason}.");
+        }
 
         if (await ShouldWarnDelayedAcquisitionAsync(issue.Id, cancellationToken))
         {
@@ -679,6 +690,31 @@ public sealed partial class OrchestrationTickService
         await dbContext.SaveChangesAsync(cancellationToken);
     }
 
+    private async Task<bool> ShouldRecordCandidateRefusalAsync(
+        string issueId,
+        string reason,
+        CancellationToken cancellationToken)
+    {
+        var cachedIssue = await dbContext.IssueCache.SingleOrDefaultAsync(
+            issue => issue.IssueId == issueId,
+            cancellationToken);
+        if (cachedIssue?.EligibleSeenAtUtc is null)
+        {
+            return true;
+        }
+
+        var refusalEvents = await dbContext.EventLog
+            .Where(entry =>
+                entry.IssueId == issueId &&
+                entry.EventName == "claim_refused")
+            .Select(entry => new { entry.OccurredAtUtc, entry.Message })
+            .ToListAsync(cancellationToken);
+
+        return !refusalEvents.Any(entry =>
+            entry.OccurredAtUtc >= cachedIssue.EligibleSeenAtUtc.Value &&
+            entry.Message.Contains(reason, StringComparison.Ordinal));
+    }
+
     private async Task<bool> ShouldWarnDelayedAcquisitionAsync(string issueId, CancellationToken cancellationToken)
     {
         var cachedIssue = await dbContext.IssueCache.SingleOrDefaultAsync(
@@ -690,20 +726,27 @@ public sealed partial class OrchestrationTickService
         }
 
         var eligibleSeenAtUtc = cachedIssue.EligibleSeenAtUtc.Value;
-        var issueRuns = await dbContext.Runs
-            .Where(run => run.IssueId == issueId)
+        var warningEvents = await dbContext.EventLog
+            .Where(entry =>
+                entry.IssueId == issueId &&
+                entry.EventName == "candidate_acquisition_delayed")
+            .Select(entry => entry.OccurredAtUtc)
             .ToListAsync(cancellationToken);
-        var acquiredSinceSeen = issueRuns.Any(run => run.StartedAtUtc >= eligibleSeenAtUtc);
-        if (acquiredSinceSeen)
-        {
-            return false;
-        }
+        var alreadyWarned = warningEvents.Any(occurredAtUtc => occurredAtUtc >= eligibleSeenAtUtc);
 
-        var alreadyWarned = await dbContext.EventLog.AnyAsync(
-            entry => entry.IssueId == issueId && entry.EventName == "candidate_acquisition_delayed",
-            cancellationToken);
         return !alreadyWarned &&
                timeProvider.GetUtcNow() - cachedIssue.EligibleSeenAtUtc.Value >= AcquisitionDiagnosticThreshold;
+    }
+
+    private async Task ClearEligibleSeenAsync(string issueId, CancellationToken cancellationToken)
+    {
+        var cachedIssue = await dbContext.IssueCache.SingleOrDefaultAsync(
+            issue => issue.IssueId == issueId,
+            cancellationToken);
+        if (cachedIssue is not null)
+        {
+            cachedIssue.EligibleSeenAtUtc = null;
+        }
     }
 
     private bool IsDispatchEligible(

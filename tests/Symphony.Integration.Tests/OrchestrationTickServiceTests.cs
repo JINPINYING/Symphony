@@ -423,7 +423,7 @@ public sealed class OrchestrationTickServiceTests
         await harness.Service.RunTickAsync(CancellationToken.None);
 
         var cachedIssue = await harness.DbContext.IssueCache.SingleAsync();
-        Assert.Equal(now, cachedIssue.EligibleSeenAtUtc);
+        Assert.Null(cachedIssue.EligibleSeenAtUtc);
 
         var eventNames = (await harness.DbContext.EventLog.ToListAsync())
             .Select(entry => entry.EventName)
@@ -432,6 +432,54 @@ public sealed class OrchestrationTickServiceTests
         Assert.Contains("claim_attempted", eventNames);
         Assert.Contains("claim_succeeded", eventNames);
         Assert.Single(harness.Coordinator.StartRequests);
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldNotRecordContradictoryRefusalAfterRetryClaimSucceeds()
+    {
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 5),
+            tracker: new FakeTrackerClient([BuildIssue("issue-86", "#86", "Open", null)]),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await harness.InsertRetryingRunAsync("issue-86", "#86", "Open", "instance-1");
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var events = await harness.DbContext.EventLog.ToListAsync();
+        Assert.Contains(events, entry => entry.EventName == "claim_succeeded");
+        Assert.DoesNotContain(
+            events,
+            entry => entry.EventName == "claim_refused" && entry.Message.Contains("already_running"));
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldDeduplicateCapacityRefusalsWithinEligibilityEpisode()
+    {
+        var now = DateTimeOffset.Parse("2026-08-29T18:35:00Z");
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: new FakeTrackerClient([BuildIssue("issue-86", "#86", "Open", null)]),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning, stopReturnsFalse: true),
+            timeProvider: new FixedTimeProvider(now));
+
+        await harness.InsertIssueCacheAsync(
+            "issue-86",
+            "#86",
+            "Open",
+            cachedAtUtc: now.AddMinutes(-3),
+            eligibleSeenAtUtc: now.AddMinutes(-3));
+        await harness.InsertRunningRunAsync("issue-1", "#1", "Open", "instance-1");
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var refusalCount = await harness.DbContext.EventLog.CountAsync(
+            entry => entry.EventName == "claim_refused" && entry.Message.Contains("concurrency_limit"));
+        var warningCount = await harness.DbContext.EventLog.CountAsync(
+            entry => entry.EventName == "candidate_acquisition_delayed");
+        Assert.Equal(1, refusalCount);
+        Assert.Equal(1, warningCount);
     }
 
     [Fact]
@@ -453,6 +501,82 @@ public sealed class OrchestrationTickServiceTests
         Assert.Contains(
             await harness.DbContext.EventLog.ToListAsync(),
             entry => entry.EventName == "stale_reservation_reconciled");
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldAcquireNextEligibleIssueAfterPriorIssueBecomesTerminal()
+    {
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: new FakeTrackerClient(
+                [BuildIssue("issue-2", "#2", "Open", null)],
+                issueStatesById: new Dictionary<string, string>
+                {
+                    ["issue-1"] = "Closed"
+                }),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning, stopReturnsFalse: true));
+
+        await harness.InsertRunningRunAsync("issue-1", "#1", "Open", "instance-1");
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Single(harness.Coordinator.StartRequests);
+        Assert.Equal("issue-2", harness.Coordinator.StartRequests.Single().Issue.Id);
+        Assert.Equal(RunStatusNames.CanceledByReconciliation, (await harness.DbContext.Runs.SingleAsync(run => run.IssueId == "issue-1")).Status);
+        Assert.Equal(RunStatusNames.Running, (await harness.DbContext.Runs.SingleAsync(run => run.IssueId == "issue-2")).Status);
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldAcquireQueuedIssueAfterRestartWithoutDuplicateRun()
+    {
+        var now = DateTimeOffset.Parse("2026-08-29T18:32:24Z");
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: new FakeTrackerClient([BuildIssue("issue-86", "#86", "Open", null)]),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning),
+            timeProvider: new FixedTimeProvider(now));
+
+        await harness.InsertIssueCacheAsync(
+            "issue-86",
+            "#86",
+            "Open",
+            cachedAtUtc: now.AddMinutes(-1),
+            eligibleSeenAtUtc: now.AddMinutes(-1));
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Single(harness.Coordinator.StartRequests);
+        Assert.Single(await harness.DbContext.Runs.Where(run => run.IssueId == "issue-86").ToListAsync());
+        Assert.Single(await harness.DbContext.DispatchClaims.Where(claim => claim.IssueId == "issue-86" && claim.Status == "active").ToListAsync());
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldAcquireQueuedIssueWhenCapacityFrees()
+    {
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: new FakeTrackerClient([BuildIssue("issue-86", "#86", "Open", null)]),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await harness.InsertRunningRunAsync("issue-1", "#1", "Open", "instance-1");
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        Assert.Empty(harness.Coordinator.StartRequests);
+
+        var priorRun = await harness.DbContext.Runs.SingleAsync(run => run.IssueId == "issue-1");
+        priorRun.Status = RunStatusNames.Succeeded;
+        priorRun.CompletedAtUtc = DateTimeOffset.UtcNow;
+        var priorClaim = await harness.DbContext.DispatchClaims.SingleAsync(claim => claim.IssueId == "issue-1");
+        priorClaim.Status = RunStatusNames.Succeeded;
+        priorClaim.ReleasedAtUtc = DateTimeOffset.UtcNow;
+        priorClaim.UpdatedAtUtc = DateTimeOffset.UtcNow;
+        await harness.DbContext.SaveChangesAsync();
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Single(harness.Coordinator.StartRequests);
+        Assert.Equal("issue-86", harness.Coordinator.StartRequests.Single().Issue.Id);
     }
 
     [Fact]
@@ -500,10 +624,11 @@ public sealed class OrchestrationTickServiceTests
     public async Task RunTickAsync_ShouldAcquireIssueAfterTwoHourDelaySignature()
     {
         var now = DateTimeOffset.Parse("2026-08-29T18:32:24Z");
+        var coordinator = new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning, stopReturnsFalse: true);
         await using var harness = await TestHarness.CreateAsync(
             BuildWorkflowDefinition(maxConcurrentAgents: 1),
             tracker: new FakeTrackerClient([BuildIssue("issue-86", "#86", "Open", null)]),
-            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning),
+            coordinator,
             timeProvider: new FixedTimeProvider(now));
 
         await harness.InsertIssueCacheAsync(
@@ -512,16 +637,25 @@ public sealed class OrchestrationTickServiceTests
             "Open",
             cachedAtUtc: now.AddHours(-2),
             eligibleSeenAtUtc: now.AddHours(-2));
-        await harness.InsertActiveClaimAsync("issue-86", "#86", "instance-1", now.AddHours(-2));
+        await harness.InsertRunningRunAsync(
+            "issue-1",
+            "#1",
+            "Open",
+            "instance-1",
+            startedAtUtc: now.AddHours(-2),
+            lastEventAtUtc: now.AddHours(-2));
 
         await harness.Service.RunTickAsync(CancellationToken.None);
 
+        var retryingRun = await harness.DbContext.Runs.SingleAsync(run => run.IssueId == "issue-1");
+        Assert.Equal(RunStatusNames.Retrying, retryingRun.Status);
         Assert.Single(harness.Coordinator.StartRequests);
+        Assert.Equal("issue-86", harness.Coordinator.StartRequests.Single().Issue.Id);
         var run = await harness.DbContext.Runs.SingleAsync(run => run.IssueId == "issue-86");
         Assert.Equal(RunStatusNames.Running, run.Status);
         Assert.Contains(
             await harness.DbContext.EventLog.ToListAsync(),
-            entry => entry.EventName == "stale_reservation_reconciled");
+            entry => entry.EventName == "claim_succeeded" && entry.IssueId == "issue-86");
     }
 
     [Fact]

@@ -106,9 +106,16 @@ public sealed partial class OrchestrationTickService
         CancellationToken cancellationToken)
     {
         var cachedAtUtc = timeProvider.GetUtcNow();
+        var activeIssueIds = await dbContext.Runs
+            .Where(run => run.Status == RunStatusNames.Running || run.Status == RunStatusNames.Retrying)
+            .Select(run => run.IssueId)
+            .ToListAsync(cancellationToken);
+        var activeIssueIdSet = new HashSet<string>(activeIssueIds, StringComparer.OrdinalIgnoreCase);
+
         foreach (var issue in issues)
         {
             var isEligible = IsCandidateEligibleForAcquisitionSlo(issue, workflowDefinition);
+            var isUnclaimedEligibilityEpisode = isEligible && !activeIssueIdSet.Contains(issue.Id);
             var existing = await dbContext.IssueCache.SingleOrDefaultAsync(
                 entity => entity.IssueId == issue.Id,
                 cancellationToken);
@@ -116,7 +123,7 @@ public sealed partial class OrchestrationTickService
             if (existing is null)
             {
                 var entity = CreateIssueCacheEntity(issue, cachedAtUtc);
-                if (isEligible)
+                if (isUnclaimedEligibilityEpisode)
                 {
                     entity.EligibleSeenAtUtc = cachedAtUtc;
                     AddIssueEvent(
@@ -153,7 +160,7 @@ public sealed partial class OrchestrationTickService
             existing.BlockedByJson = JsonSerializer.Serialize(issue.BlockedBy);
             existing.CreatedAtUtc = issue.CreatedAt;
             existing.UpdatedAtUtc = issue.UpdatedAt;
-            if (isEligible && existing.EligibleSeenAtUtc is null)
+            if (isUnclaimedEligibilityEpisode && existing.EligibleSeenAtUtc is null)
             {
                 existing.EligibleSeenAtUtc = cachedAtUtc;
                 AddIssueEvent(
