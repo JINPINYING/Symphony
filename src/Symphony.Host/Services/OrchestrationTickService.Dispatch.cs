@@ -92,6 +92,16 @@ public sealed partial class OrchestrationTickService
                 continue;
             }
 
+            if (await TryBlockImplementationRetryRedispatchAsync(
+                    retryEntry,
+                    retryIssue,
+                    workflowDefinition,
+                    instanceId,
+                    cancellationToken))
+            {
+                continue;
+            }
+
             if (!HasGlobalSlot(workflowDefinition, runningIssueIds.Count) ||
                 !HasStateSlot(retryIssue.State, workflowDefinition, countsByState))
             {
@@ -132,7 +142,7 @@ public sealed partial class OrchestrationTickService
                 continue;
             }
 
-            if (await ShouldBlockImplementationRedispatchAsync(issue, latestRunByIssueId, cancellationToken))
+            if (await ShouldBlockImplementationRedispatchAsync(issue, latestRunByIssueId, workflowDefinition, cancellationToken))
             {
                 continue;
             }
@@ -170,6 +180,7 @@ public sealed partial class OrchestrationTickService
     private async Task<bool> ShouldBlockImplementationRedispatchAsync(
         NormalizedIssue issue,
         IReadOnlyDictionary<string, RunEntity> latestRunByIssueId,
+        WorkflowDefinition workflowDefinition,
         CancellationToken cancellationToken)
     {
         if (!latestRunByIssueId.TryGetValue(issue.Id, out var latestRun))
@@ -183,18 +194,43 @@ public sealed partial class OrchestrationTickService
             return true;
         }
 
-        // An issue whose implementation already succeeded and whose PR is still open must
-        // not be silently reimplemented. It is NOT suppressed forever: once the PR is
-        // merged or closed (or the issue is explicitly re-dispatched for a later phase),
-        // dispatch becomes possible again.
+        // An issue whose implementation already succeeded must not be silently
+        // reimplemented. Automatic redispatch is allowed only when pull request evidence
+        // affirmatively shows the implementation's PR has been resolved: PR data was
+        // fetched, linkage exists, and none of the linked PRs are still open. Anything
+        // less fails closed and requires the Commander to dispatch an explicit later
+        // phase.
         if (!string.Equals(latestRun.Status, RunStatusNames.Succeeded, StringComparison.OrdinalIgnoreCase) ||
-            !string.Equals(latestRun.Phase, RunPhaseNames.Implementation, StringComparison.OrdinalIgnoreCase))
+            !IsImplementationPhase(latestRun.Phase))
         {
             return false;
         }
 
-        if (!HasOpenPullRequest(issue))
+        string blockMessage;
+        if (!workflowDefinition.Runtime.Tracker.IncludePullRequests)
         {
+            blockMessage =
+                $"Issue {issue.Identifier} already has a completed implementation, but pull request evidence is " +
+                "unavailable because tracker include_pull_requests is disabled. An existing pull request cannot be " +
+                "ruled out, so automatic reimplementation is blocked; Commander/review handling is required.";
+        }
+        else if (HasOpenPullRequest(issue))
+        {
+            blockMessage =
+                $"Issue {issue.Identifier} already has a completed implementation with an open pull request. " +
+                "Automatic reimplementation is blocked; the Commander must dispatch an explicit repair/review phase or close the PR.";
+        }
+        else if (issue.PullRequests.Count == 0)
+        {
+            blockMessage =
+                $"Issue {issue.Identifier} already has a completed implementation, but the tracker reports no pull " +
+                "request linkage for it. \"No linked PR\" is not proof that reimplementation is safe, so automatic " +
+                "reimplementation is blocked; Commander/review handling is required.";
+        }
+        else
+        {
+            // Linked PRs exist and none are open (merged or closed): the implementation's
+            // output has been resolved, so a later-phase dispatch may proceed.
             return false;
         }
 
@@ -210,17 +246,93 @@ public sealed partial class OrchestrationTickService
                 RunId = latestRun.Id,
                 EventName = "implementation_redispatch_blocked",
                 Level = LogLevel.Warning.ToString(),
-                Message = $"Issue {issue.Identifier} already has a completed implementation with an open pull request. " +
-                          "Automatic reimplementation is blocked; the Commander must dispatch an explicit repair/review phase or close the PR.",
+                Message = blockMessage,
                 OccurredAtUtc = timeProvider.GetUtcNow()
             });
             await dbContext.SaveChangesAsync(cancellationToken);
         }
 
         logger.LogWarning(
-            "Blocked implementation redispatch for issue {IssueIdentifier}: implementation already succeeded and a pull request is still open.",
-            issue.Identifier);
+            "Blocked implementation redispatch for issue {IssueIdentifier}: {Reason}",
+            issue.Identifier,
+            blockMessage);
         return true;
+    }
+
+    private async Task<bool> TryBlockImplementationRetryRedispatchAsync(
+        RetryQueueEntity retryEntry,
+        NormalizedIssue issue,
+        WorkflowDefinition workflowDefinition,
+        string instanceId,
+        CancellationToken cancellationToken)
+    {
+        var retryingRun = await FindLatestRunWithStatusAsync(retryEntry.IssueId, RunStatusNames.Retrying, cancellationToken);
+        if (retryingRun is null || !IsImplementationPhase(retryingRun.Phase))
+        {
+            return false;
+        }
+
+        // The retry path must honor the same durable-work/open-PR protection as the
+        // fresh-dispatch path: an implementation retry that would reimplement work whose
+        // pull request already exists (or cannot be ruled out) fails closed and goes to
+        // the Command Center. The PR and workspace are preserved for review.
+        string blockReason;
+        if (HasOpenPullRequest(issue))
+        {
+            blockReason =
+                $"Issue {retryEntry.IssueIdentifier} has a pending implementation retry, but the issue already has an " +
+                "open pull request. Re-running the implementation would reimplement existing work, so the retry is " +
+                "blocked; the Commander must review the pull request or dispatch an explicit later phase.";
+        }
+        else if (!workflowDefinition.Runtime.Tracker.IncludePullRequests &&
+                 await HasDurableUnfinishedWorkEvidenceAsync(retryingRun, cancellationToken))
+        {
+            blockReason =
+                $"Issue {retryEntry.IssueIdentifier} has a pending implementation retry with durable implementation " +
+                "evidence, but pull request evidence is unavailable because tracker include_pull_requests is disabled. " +
+                "An existing pull request cannot be ruled out, so the retry is blocked; Commander/review handling is required.";
+        }
+        else if (workflowDefinition.Runtime.Tracker.IncludePullRequests &&
+                 issue.PullRequests.Count == 0 &&
+                 await HasCachedPullRequestEvidenceAsync(retryEntry.IssueId, cancellationToken))
+        {
+            blockReason =
+                $"Issue {retryEntry.IssueIdentifier} has a pending implementation retry and previously recorded pull " +
+                "request evidence, but the tracker no longer reports any pull request linkage. \"No linked PR\" is not " +
+                "proof that reimplementation is safe, so the retry is blocked; Commander/review handling is required.";
+        }
+        else
+        {
+            return false;
+        }
+
+        dbContext.EventLog.Add(new EventLogEntity
+        {
+            IssueId = retryEntry.IssueId,
+            IssueIdentifier = retryEntry.IssueIdentifier,
+            RunId = retryingRun.Id,
+            EventName = "implementation_redispatch_blocked",
+            Level = LogLevel.Warning.ToString(),
+            Message = blockReason,
+            OccurredAtUtc = timeProvider.GetUtcNow()
+        });
+
+        await EscalateRunToCommandCenterAsync(
+            retryingRun,
+            retryEntry.IssueId,
+            retryEntry.IssueIdentifier,
+            instanceId,
+            blockReason,
+            cancellationToken);
+        return true;
+    }
+
+    private static bool IsImplementationPhase(string? phase)
+    {
+        // Legacy runs may predate the phase column; fail closed by treating an absent
+        // phase as implementation.
+        return string.IsNullOrWhiteSpace(phase) ||
+               string.Equals(phase, RunPhaseNames.Implementation, StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool HasOpenPullRequest(NormalizedIssue issue)
@@ -589,8 +701,13 @@ public sealed partial class OrchestrationTickService
             return true;
         }
 
+        return await HasCachedPullRequestEvidenceAsync(run.IssueId, cancellationToken);
+    }
+
+    private async Task<bool> HasCachedPullRequestEvidenceAsync(string issueId, CancellationToken cancellationToken)
+    {
         var cachedIssue = await dbContext.IssueCache.SingleOrDefaultAsync(
-            entry => entry.IssueId == run.IssueId,
+            entry => entry.IssueId == issueId,
             cancellationToken);
 
         return cachedIssue is not null &&
@@ -745,15 +862,20 @@ public sealed partial class OrchestrationTickService
         var escalated = false;
         foreach (var run in toVerify)
         {
-            if (!snapshotById.TryGetValue(run.IssueId, out var snapshot) ||
-                MatchesTerminalState(snapshot.State, workflowDefinition.Runtime.Tracker.TerminalStates))
+            var snapshotFound = snapshotById.TryGetValue(run.IssueId, out var snapshot);
+            if (snapshotFound && MatchesTerminalState(snapshot!.State, workflowDefinition.Runtime.Tracker.TerminalStates))
             {
                 continue;
             }
 
-            var reason =
-                $"Abandoned work detected for issue {run.IssueIdentifier}: the issue is still open, execution had " +
-                "already started, but the issue is no longer dispatchable (execution label removed) and no live run exists.";
+            // A suspect the tracker reload cannot account for must not be skipped
+            // silently forever: without a fresh read we cannot distinguish "work
+            // finished" from "work vanished", so fail closed and surface it.
+            var reason = snapshotFound
+                ? $"Abandoned work detected for issue {run.IssueIdentifier}: the issue is still open, execution had " +
+                  "already started, but the issue is no longer dispatchable (execution label removed) and no live run exists."
+                : $"Abandoned work detected for issue {run.IssueIdentifier}: execution had already started and the run " +
+                  "was released, but the issue could not be reloaded by id from the tracker. Refusing to silently skip it.";
 
             run.Status = RunStatusNames.NeedsCommandCenter;
             run.CompletedAtUtc ??= nowUtc;
