@@ -156,12 +156,13 @@ public sealed class IssueExecutionCoordinator(
 
             if (result.Success)
             {
+                // A successful bounded execution is terminal for this dispatch. Further work
+                // (verify/review/repair) must arrive as an explicit new phase dispatch, never
+                // as an implicit continuation retry of the implementation run.
                 finalStatus = RunStatusNames.Succeeded;
-                retryPlan = new RetryPlan(
-                    Attempt: 1,
-                    DueAtUtc: timeProvider.GetUtcNow().AddMilliseconds(1_000),
-                    DelayType: RetryDelayTypes.Continuation,
-                    Error: null);
+                retryPlan = null;
+                releaseClaim = true;
+                releaseStatus = RunStatusNames.Succeeded;
             }
             else
             {

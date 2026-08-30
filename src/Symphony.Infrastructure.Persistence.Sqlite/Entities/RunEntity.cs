@@ -8,6 +8,11 @@ public sealed class RunEntity
     public string OwnerInstanceId { get; set; } = string.Empty;
     public string Status { get; set; } = string.Empty;
     public string State { get; set; } = string.Empty;
+
+    // Durable workflow phase for this run (see RunPhaseNames). Lets restart-time
+    // reconciliation distinguish an unfinished IMPLEMENTATION from later
+    // VERIFY/REVIEW/FINAL_REVIEW work so an existing PR is never reimplemented.
+    public string Phase { get; set; } = "implementation";
     public int? CurrentRetryAttempt { get; set; }
     public string? WorkspacePath { get; set; }
     public string? SessionId { get; set; }

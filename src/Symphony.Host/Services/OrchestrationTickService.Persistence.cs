@@ -124,7 +124,14 @@ public sealed partial class OrchestrationTickService
             existing.Url = issue.Url;
             existing.Milestone = issue.Milestone;
             existing.LabelsJson = JsonSerializer.Serialize(issue.Labels);
-            existing.PullRequestsJson = JsonSerializer.Serialize(issue.PullRequests);
+            // An empty incoming PR list may mean "not fetched" (include_pull_requests
+            // disabled) or "linkage lost", not "no PR ever existed". Cached pull request
+            // evidence is durable implementation evidence for the redispatch guards, so
+            // never replace non-empty evidence with an empty list.
+            if (issue.PullRequests.Count > 0)
+            {
+                existing.PullRequestsJson = JsonSerializer.Serialize(issue.PullRequests);
+            }
             existing.BlockedByJson = JsonSerializer.Serialize(issue.BlockedBy);
             existing.CreatedAtUtc = issue.CreatedAt;
             existing.UpdatedAtUtc = issue.UpdatedAt;

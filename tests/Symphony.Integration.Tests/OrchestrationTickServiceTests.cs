@@ -16,7 +16,7 @@ namespace Symphony.Integration.Tests;
 public sealed class OrchestrationTickServiceTests
 {
     [Fact]
-    public async Task RunTickAsync_ShouldScheduleContinuationRetryAfterSuccessfulDispatch()
+    public async Task RunTickAsync_ShouldFinalizeSuccessfulDispatchWithoutSchedulingContinuation()
     {
         await using var harness = await TestHarness.CreateAsync(
             BuildWorkflowDefinition(maxConcurrentAgents: 1),
@@ -25,11 +25,372 @@ public sealed class OrchestrationTickServiceTests
 
         await harness.Service.RunTickAsync(CancellationToken.None);
 
-        var retryEntry = await harness.DbContext.RetryQueue.SingleAsync();
-        Assert.Equal("issue-1", retryEntry.IssueId);
-        Assert.Equal(1, retryEntry.Attempt);
-        Assert.Equal(RetryDelayTypes.Continuation, retryEntry.DelayType);
+        var run = await harness.DbContext.Runs.SingleAsync();
+        Assert.Equal(RunStatusNames.Succeeded, run.Status);
+        Assert.NotNull(run.CompletedAtUtc);
+        Assert.Equal(RunPhaseNames.Implementation, run.Phase);
+        Assert.Empty(await harness.DbContext.RetryQueue.ToListAsync());
+        Assert.Equal(RunStatusNames.Succeeded, (await harness.DbContext.DispatchClaims.SingleAsync()).Status);
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldDrainLegacyContinuationEntriesWithoutRedispatching()
+    {
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: new FakeTrackerClient([BuildIssue("issue-1", "#1", "Open", null)]),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await harness.InsertRetryingRunAsync("issue-1", "#1", "Open", "instance-1", delayType: RetryDelayTypes.Continuation);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Empty(harness.Coordinator.StartRequests);
+        Assert.Equal(RunStatusNames.Succeeded, (await harness.DbContext.Runs.SingleAsync()).Status);
+        Assert.Empty(await harness.DbContext.RetryQueue.ToListAsync());
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldEscalateMissingRetryCandidateWithUnfinishedWork()
+    {
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: new FakeTrackerClient([], issueStatesById: new Dictionary<string, string>
+            {
+                ["issue-1"] = "Open"
+            }),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await harness.InsertRetryingRunAsync("issue-1", "#1", "Open", "instance-1", sessionId: "session-1");
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var run = await harness.DbContext.Runs.SingleAsync();
+        Assert.Equal(RunStatusNames.NeedsCommandCenter, run.Status);
+        Assert.NotNull(run.CompletedAtUtc);
+        Assert.Empty(await harness.DbContext.RetryQueue.ToListAsync());
+        Assert.Equal(RunStatusNames.NeedsCommandCenter, (await harness.DbContext.DispatchClaims.SingleAsync()).Status);
+        Assert.Contains(
+            await harness.DbContext.EventLog.ToListAsync(),
+            entry => entry.EventName == "needs_command_center");
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldReleaseMissingRetryCandidateWhenIssueIsTerminal()
+    {
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: new FakeTrackerClient([], issueStatesById: new Dictionary<string, string>
+            {
+                ["issue-1"] = "Closed"
+            }),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await harness.InsertRetryingRunAsync("issue-1", "#1", "Open", "instance-1", sessionId: "session-1");
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Equal(RunStatusNames.ReleasedIneligible, (await harness.DbContext.Runs.SingleAsync()).Status);
+        Assert.Empty(await harness.DbContext.RetryQueue.ToListAsync());
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldKeepRetryReservationWhenCandidateReloadFails()
+    {
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: new FakeTrackerClient([], throwOnFetchStatesByIds: true),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await harness.InsertRetryingRunAsync("issue-1", "#1", "Open", "instance-1", sessionId: "session-1");
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
         Assert.Equal(RunStatusNames.Retrying, (await harness.DbContext.Runs.SingleAsync()).Status);
+        var retryEntry = await harness.DbContext.RetryQueue.SingleAsync();
+        Assert.True(retryEntry.DueAtUtc > DateTimeOffset.UtcNow);
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldEscalateAbandonedReleasedRunForOpenUnlabeledIssue()
+    {
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: new FakeTrackerClient([], issueStatesById: new Dictionary<string, string>
+            {
+                ["issue-88"] = "Open"
+            }),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await harness.InsertRunAsync(
+            "issue-88",
+            "#88",
+            "Open",
+            "instance-1",
+            status: RunStatusNames.ReleasedIneligible,
+            sessionId: "session-88",
+            completedAtUtc: DateTimeOffset.UtcNow.AddMinutes(-5));
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var run = await harness.DbContext.Runs.SingleAsync();
+        Assert.Equal(RunStatusNames.NeedsCommandCenter, run.Status);
+        Assert.Contains(
+            await harness.DbContext.EventLog.ToListAsync(),
+            entry => entry.EventName == "needs_command_center");
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldBlockImplementationRedispatchWhileSucceededRunHasOpenPullRequest()
+    {
+        var issueWithOpenPr = BuildIssue(
+            "issue-1",
+            "#1",
+            "Open",
+            null,
+            pullRequests: [new PullRequestRef("pr-1", 89, "OPEN", null, null, null)]);
+
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: new FakeTrackerClient([issueWithOpenPr]),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await harness.InsertRunAsync(
+            "issue-1",
+            "#1",
+            "Open",
+            "instance-1",
+            status: RunStatusNames.Succeeded,
+            sessionId: "session-1",
+            completedAtUtc: DateTimeOffset.UtcNow.AddMinutes(-5));
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Empty(harness.Coordinator.StartRequests);
+        Assert.Contains(
+            await harness.DbContext.EventLog.ToListAsync(),
+            entry => entry.EventName == "implementation_redispatch_blocked");
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldAllowRedispatchOfSucceededIssueOncePullRequestIsNoLongerOpen()
+    {
+        var issueWithMergedPr = BuildIssue(
+            "issue-1",
+            "#1",
+            "Open",
+            null,
+            pullRequests: [new PullRequestRef("pr-1", 89, "MERGED", null, null, null)]);
+
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: new FakeTrackerClient([issueWithMergedPr]),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await harness.InsertRunAsync(
+            "issue-1",
+            "#1",
+            "Open",
+            "instance-1",
+            status: RunStatusNames.Succeeded,
+            sessionId: "session-1",
+            completedAtUtc: DateTimeOffset.UtcNow.AddMinutes(-5));
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Single(harness.Coordinator.StartRequests);
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldNotReimplementRecoveredOrphanRetryWhenIssueHasOpenPullRequest()
+    {
+        var issueWithOpenPr = BuildIssue(
+            "issue-1",
+            "#1",
+            "Open",
+            null,
+            pullRequests: [new PullRequestRef("pr-1", 89, "OPEN", null, null, null)]);
+
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: new FakeTrackerClient([issueWithOpenPr]),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        // Implementation already produced the open PR, but the owning host died before
+        // the final success state was persisted: a running run with a live Codex
+        // session owned by a dead instance.
+        await harness.InsertRunningRunAsync("issue-1", "#1", "Open", "instance-2", sessionId: "session-1");
+
+        // Restart tick: orphan recovery converts the run into a backoff retry.
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Empty(harness.Coordinator.StartRequests);
+        var recoveredRetry = await harness.DbContext.RetryQueue.SingleAsync();
+        Assert.Equal(RetryDelayTypes.Backoff, recoveredRetry.DelayType);
+        Assert.Equal(RunStatusNames.Retrying, (await harness.DbContext.Runs.SingleAsync()).Status);
+
+        // Next tick with the retry due: the open PR must suppress any new
+        // implementation dispatch and escalate instead.
+        recoveredRetry.DueAtUtc = DateTimeOffset.UtcNow.AddSeconds(-1);
+        await harness.DbContext.SaveChangesAsync();
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Empty(harness.Coordinator.StartRequests);
+        var run = await harness.DbContext.Runs.SingleAsync();
+        Assert.Equal(RunStatusNames.NeedsCommandCenter, run.Status);
+        Assert.Empty(await harness.DbContext.RetryQueue.ToListAsync());
+        Assert.Empty(harness.WorkspaceManager.CleanupRequests);
+        Assert.Equal(RunStatusNames.NeedsCommandCenter, (await harness.DbContext.DispatchClaims.SingleAsync()).Status);
+        var events = await harness.DbContext.EventLog.ToListAsync();
+        Assert.Contains(events, entry => entry.EventName == "implementation_redispatch_blocked");
+        Assert.Contains(events, entry => entry.EventName == "needs_command_center");
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldNotReimplementRetryWhenPullRequestEvidenceUnavailable()
+    {
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1, includePullRequests: false),
+            tracker: new FakeTrackerClient([BuildIssue("issue-1", "#1", "Open", null)]),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await harness.InsertRetryingRunAsync("issue-1", "#1", "Open", "instance-1", sessionId: "session-1");
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Empty(harness.Coordinator.StartRequests);
+        Assert.Equal(RunStatusNames.NeedsCommandCenter, (await harness.DbContext.Runs.SingleAsync()).Status);
+        Assert.Empty(await harness.DbContext.RetryQueue.ToListAsync());
+        Assert.Empty(harness.WorkspaceManager.CleanupRequests);
+        Assert.Contains(
+            await harness.DbContext.EventLog.ToListAsync(),
+            entry => entry.EventName == "implementation_redispatch_blocked" &&
+                     entry.Message.Contains("include_pull_requests"));
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldStillRetryWithoutDurableEvidenceWhenPullRequestDataDisabled()
+    {
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1, includePullRequests: false),
+            tracker: new FakeTrackerClient([BuildIssue("issue-1", "#1", "Open", null)]),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await harness.InsertRetryingRunAsync("issue-1", "#1", "Open", "instance-1");
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Single(harness.Coordinator.StartRequests);
+        Assert.Equal(RunStatusNames.Running, (await harness.DbContext.Runs.SingleAsync()).Status);
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldNotReimplementRetryWhenPullRequestLinkageDisappears()
+    {
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: new FakeTrackerClient([BuildIssue("issue-1", "#1", "Open", null)]),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        // Durable evidence that a PR was linked earlier, even though the live tracker
+        // data no longer reports any linkage.
+        await harness.InsertIssueCacheAsync(
+            "issue-1",
+            "#1",
+            "Open",
+            pullRequestsJson: "[{\"id\":\"pr-1\",\"number\":89,\"state\":\"OPEN\"}]");
+        await harness.InsertRetryingRunAsync("issue-1", "#1", "Open", "instance-1", sessionId: "session-1");
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Empty(harness.Coordinator.StartRequests);
+        Assert.Equal(RunStatusNames.NeedsCommandCenter, (await harness.DbContext.Runs.SingleAsync()).Status);
+        Assert.Empty(await harness.DbContext.RetryQueue.ToListAsync());
+        Assert.Contains(
+            await harness.DbContext.EventLog.ToListAsync(),
+            entry => entry.EventName == "implementation_redispatch_blocked" &&
+                     entry.Message.Contains("no longer reports any pull request linkage"));
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldBlockSucceededImplementationRedispatchWhenPullRequestEvidenceUnavailable()
+    {
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1, includePullRequests: false),
+            tracker: new FakeTrackerClient([BuildIssue("issue-1", "#1", "Open", null)]),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await harness.InsertRunAsync(
+            "issue-1",
+            "#1",
+            "Open",
+            "instance-1",
+            status: RunStatusNames.Succeeded,
+            sessionId: "session-1",
+            completedAtUtc: DateTimeOffset.UtcNow.AddMinutes(-5));
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Empty(harness.Coordinator.StartRequests);
+        Assert.Equal(RunStatusNames.Succeeded, (await harness.DbContext.Runs.SingleAsync()).Status);
+        Assert.Contains(
+            await harness.DbContext.EventLog.ToListAsync(),
+            entry => entry.EventName == "implementation_redispatch_blocked" &&
+                     entry.Message.Contains("include_pull_requests"));
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldBlockSucceededImplementationRedispatchWithoutPullRequestLinkage()
+    {
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: new FakeTrackerClient([BuildIssue("issue-1", "#1", "Open", null)]),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await harness.InsertRunAsync(
+            "issue-1",
+            "#1",
+            "Open",
+            "instance-1",
+            status: RunStatusNames.Succeeded,
+            sessionId: "session-1",
+            completedAtUtc: DateTimeOffset.UtcNow.AddMinutes(-5));
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Empty(harness.Coordinator.StartRequests);
+        Assert.Contains(
+            await harness.DbContext.EventLog.ToListAsync(),
+            entry => entry.EventName == "implementation_redispatch_blocked" &&
+                     entry.Message.Contains("no pull request linkage"));
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldEscalateAbandonedReleasedRunMissingFromTrackerReload()
+    {
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: new FakeTrackerClient([]),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await harness.InsertRunAsync(
+            "issue-88",
+            "#88",
+            "Open",
+            "instance-1",
+            status: RunStatusNames.ReleasedIneligible,
+            sessionId: "session-88",
+            completedAtUtc: DateTimeOffset.UtcNow.AddMinutes(-5));
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var run = await harness.DbContext.Runs.SingleAsync();
+        Assert.Equal(RunStatusNames.NeedsCommandCenter, run.Status);
+        Assert.Contains(
+            await harness.DbContext.EventLog.ToListAsync(),
+            entry => entry.EventName == "needs_command_center" &&
+                     entry.Message.Contains("could not be reloaded"));
     }
 
     [Fact]
@@ -307,7 +668,8 @@ public sealed class OrchestrationTickServiceTests
         int maxConcurrentAgents,
         IReadOnlyList<string>? activeStates = null,
         IReadOnlyDictionary<string, int>? maxConcurrentByState = null,
-        string apiKey = "test-token")
+        string apiKey = "test-token",
+        bool includePullRequests = true)
     {
         var runtime = new WorkflowRuntimeSettings(
             new WorkflowTrackerSettings(
@@ -317,7 +679,7 @@ public sealed class OrchestrationTickServiceTests
                 Owner: "released",
                 Repo: "symphony",
                 Milestone: null,
-                IncludePullRequests: true,
+                IncludePullRequests: includePullRequests,
                 Labels: [],
                 ActiveStates: activeStates ?? ["Open"],
                 TerminalStates: ["Closed"]),
@@ -335,7 +697,12 @@ public sealed class OrchestrationTickServiceTests
         return new WorkflowDefinition(new Dictionary<string, object?>(), "Prompt body", runtime, "WORKFLOW.md", DateTimeOffset.UtcNow);
     }
 
-    private static NormalizedIssue BuildIssue(string id, string identifier, string state, IReadOnlyList<BlockerRef>? blockedBy)
+    private static NormalizedIssue BuildIssue(
+        string id,
+        string identifier,
+        string state,
+        IReadOnlyList<BlockerRef>? blockedBy,
+        IReadOnlyList<PullRequestRef>? pullRequests = null)
     {
         return new NormalizedIssue(
             id,
@@ -348,7 +715,7 @@ public sealed class OrchestrationTickServiceTests
             null,
             null,
             [],
-            [],
+            pullRequests ?? [],
             blockedBy ?? [],
             DateTimeOffset.UtcNow,
             DateTimeOffset.UtcNow);
@@ -422,7 +789,8 @@ public sealed class OrchestrationTickServiceTests
             string state,
             string instanceId,
             DateTimeOffset? startedAtUtc = null,
-            DateTimeOffset? lastEventAtUtc = null)
+            DateTimeOffset? lastEventAtUtc = null,
+            string? sessionId = null)
         {
             var run = new RunEntity
             {
@@ -432,6 +800,7 @@ public sealed class OrchestrationTickServiceTests
                 OwnerInstanceId = instanceId,
                 Status = RunStatusNames.Running,
                 State = state,
+                SessionId = sessionId,
                 StartedAtUtc = startedAtUtc ?? DateTimeOffset.UtcNow
             };
             run.LastEventAtUtc = lastEventAtUtc;
@@ -476,7 +845,8 @@ public sealed class OrchestrationTickServiceTests
             string issueId,
             string identifier,
             string state,
-            DateTimeOffset? cachedAtUtc = null)
+            DateTimeOffset? cachedAtUtc = null,
+            string pullRequestsJson = "[]")
         {
             var nowUtc = cachedAtUtc ?? DateTimeOffset.UtcNow;
             DbContext.IssueCache.Add(new IssueCacheEntity
@@ -486,10 +856,35 @@ public sealed class OrchestrationTickServiceTests
                 Title = $"Issue {identifier}",
                 State = state,
                 LabelsJson = "[]",
-                PullRequestsJson = "[]",
+                PullRequestsJson = pullRequestsJson,
                 BlockedByJson = "[]",
                 CachedAtUtc = nowUtc,
                 UpdatedAtUtc = nowUtc
+            });
+
+            await DbContext.SaveChangesAsync();
+        }
+
+        public async Task InsertRunAsync(
+            string issueId,
+            string identifier,
+            string state,
+            string instanceId,
+            string status,
+            string? sessionId = null,
+            DateTimeOffset? completedAtUtc = null)
+        {
+            DbContext.Runs.Add(new RunEntity
+            {
+                Id = Guid.NewGuid().ToString("N"),
+                IssueId = issueId,
+                IssueIdentifier = identifier,
+                OwnerInstanceId = instanceId,
+                Status = status,
+                State = state,
+                SessionId = sessionId,
+                StartedAtUtc = DateTimeOffset.UtcNow.AddMinutes(-10),
+                CompletedAtUtc = completedAtUtc
             });
 
             await DbContext.SaveChangesAsync();
@@ -505,7 +900,9 @@ public sealed class OrchestrationTickServiceTests
             int totalTokens = 0,
             int lastReportedInputTokens = 0,
             int lastReportedOutputTokens = 0,
-            int lastReportedTotalTokens = 0)
+            int lastReportedTotalTokens = 0,
+            string delayType = RetryDelayTypes.Backoff,
+            string? sessionId = null)
         {
             var nowUtc = DateTimeOffset.UtcNow;
             var run = new RunEntity
@@ -517,6 +914,7 @@ public sealed class OrchestrationTickServiceTests
                 Status = RunStatusNames.Retrying,
                 State = state,
                 CurrentRetryAttempt = 1,
+                SessionId = sessionId,
                 StartedAtUtc = nowUtc.AddMinutes(-1),
                 InputTokens = inputTokens,
                 OutputTokens = outputTokens,
@@ -535,7 +933,7 @@ public sealed class OrchestrationTickServiceTests
                 OwnerInstanceId = instanceId,
                 Attempt = 1,
                 DueAtUtc = nowUtc.AddSeconds(-1),
-                DelayType = RetryDelayTypes.Continuation,
+                DelayType = delayType,
                 MaxBackoffMs = 300_000,
                 CreatedAtUtc = nowUtc.AddMinutes(-1),
                 UpdatedAtUtc = nowUtc.AddMinutes(-1)
@@ -594,7 +992,8 @@ public sealed class OrchestrationTickServiceTests
 
     private sealed class FakeTrackerClient(
         IReadOnlyList<NormalizedIssue> issues,
-        IReadOnlyDictionary<string, string>? issueStatesById = null) : IGitHubTrackerClient
+        IReadOnlyDictionary<string, string>? issueStatesById = null,
+        bool throwOnFetchStatesByIds = false) : IGitHubTrackerClient
     {
         private readonly Dictionary<string, string> statesById = issueStatesById is null
             ? new(StringComparer.OrdinalIgnoreCase)
@@ -613,6 +1012,11 @@ public sealed class OrchestrationTickServiceTests
 
         public Task<IReadOnlyList<IssueStateSnapshot>> FetchIssueStatesByIdsAsync(TrackerQuery query, IReadOnlyList<string> issueIds, CancellationToken cancellationToken = default)
         {
+            if (throwOnFetchStatesByIds)
+            {
+                throw new InvalidOperationException("simulated tracker outage");
+            }
+
             var snapshots = issueIds
                 .Where(id => statesById.ContainsKey(id))
                 .Select(id => new IssueStateSnapshot(id, statesById[id]))
@@ -683,23 +1087,23 @@ public sealed class OrchestrationTickServiceTests
 
             if (outcome == FakeDispatchOutcome.Success)
             {
-                run.Status = RunStatusNames.Retrying;
-                run.CurrentRetryAttempt = 1;
+                // Mirrors IssueExecutionCoordinator: a successful bounded execution is
+                // terminal for the dispatch — no continuation retry, claim released.
+                run.Status = RunStatusNames.Succeeded;
+                run.CurrentRetryAttempt = null;
+                run.CompletedAtUtc = nowUtc;
                 attempt.Status = RunStatusNames.Succeeded;
                 attempt.CompletedAtUtc = nowUtc;
-                dbContext.RetryQueue.Add(new RetryQueueEntity
+
+                var claim = await dbContext.DispatchClaims.SingleOrDefaultAsync(
+                    entity => entity.IssueId == request.Issue.Id && entity.Status == "active",
+                    cancellationToken);
+                if (claim is not null)
                 {
-                    IssueId = request.Issue.Id,
-                    IssueIdentifier = request.Issue.Identifier,
-                    RunId = request.RunId,
-                    OwnerInstanceId = request.InstanceId,
-                    Attempt = 1,
-                    DueAtUtc = nowUtc.AddSeconds(1),
-                    DelayType = RetryDelayTypes.Continuation,
-                    MaxBackoffMs = request.WorkflowDefinition.Runtime.Agent.MaxRetryBackoffMs,
-                    CreatedAtUtc = nowUtc,
-                    UpdatedAtUtc = nowUtc
-                });
+                    claim.Status = RunStatusNames.Succeeded;
+                    claim.ReleasedAtUtc = nowUtc;
+                    claim.UpdatedAtUtc = nowUtc;
+                }
             }
             else
             {
