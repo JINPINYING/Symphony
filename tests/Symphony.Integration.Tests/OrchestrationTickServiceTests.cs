@@ -365,6 +365,8 @@ public sealed class OrchestrationTickServiceTests
             coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success));
 
         await harness.InsertRunAsync("issue-1", "#1", "Open", "instance-1", RunStatusNames.Succeeded);
+        await harness.InsertWorkspaceRecordAsync("issue-1", "#1", "symphony/1");
+        tracker.OpenPullRequestNumberByHeadBranch["symphony/1"] = 5;
 
         await harness.Service.RunTickAsync(CancellationToken.None); // seed + verify passes
         await harness.Service.RunTickAsync(CancellationToken.None); // review dispatch
@@ -382,6 +384,52 @@ public sealed class OrchestrationTickServiceTests
     }
 
     [Fact]
+    public async Task RunTickAsync_ShouldSeedLedgerFromSymphonyBranchWhenIssueHasNoLinkedPullRequest()
+    {
+        // Regression: the first live M4 run never entered the phases because the
+        // issue had no GitHub PR linkage (no closing keyword) and the workflow
+        // sets include_pull_requests: false. Symphony created the branch itself,
+        // so an open PR on that head must be discovered from the workspace record.
+        var tracker = new FakeTrackerClient([]);
+        tracker.IssuesById["issue-1"] = BuildIssue("issue-1", "#1", "Open", null, pullRequests: []);
+        tracker.PullRequestStatusByNumber[5] = new PullRequestStatus(5, "OPEN", false, "aaa111", "SUCCESS", "MERGEABLE");
+        tracker.OpenPullRequestNumberByHeadBranch["symphony/1"] = 5;
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success));
+
+        await harness.InsertRunAsync("issue-1", "#1", "Open", "instance-1", RunStatusNames.Succeeded);
+        await harness.InsertWorkspaceRecordAsync("issue-1", "#1", "symphony/1");
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var ledger = Assert.Single(await harness.DbContext.PhaseLedger.ToListAsync());
+        Assert.Equal(5, ledger.PrNumber);
+        Assert.Equal(PhaseStages.AwaitingReview, ledger.Stage);
+        Assert.Equal("aaa111", ledger.HeadSha);
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldNotSeedLedgerWhenNoOpenPullRequestExists()
+    {
+        var tracker = new FakeTrackerClient([]);
+        tracker.IssuesById["issue-1"] = BuildIssue("issue-1", "#1", "Open", null, pullRequests: []);
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success));
+
+        await harness.InsertRunAsync("issue-1", "#1", "Open", "instance-1", RunStatusNames.Succeeded);
+        await harness.InsertWorkspaceRecordAsync("issue-1", "#1", "symphony/1");
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Empty(await harness.DbContext.PhaseLedger.ToListAsync());
+        Assert.Empty(harness.Coordinator.StartRequests);
+    }
+
+    [Fact]
     public async Task RunTickAsync_ShouldMarkReadyOnApprovedVerdict()
     {
         var tracker = new FakeTrackerClient([]);
@@ -395,6 +443,8 @@ public sealed class OrchestrationTickServiceTests
             coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success));
 
         await harness.InsertRunAsync("issue-1", "#1", "Open", "instance-1", RunStatusNames.Succeeded);
+        await harness.InsertWorkspaceRecordAsync("issue-1", "#1", "symphony/1");
+        tracker.OpenPullRequestNumberByHeadBranch["symphony/1"] = 5;
 
         await harness.Service.RunTickAsync(CancellationToken.None);
         await harness.Service.RunTickAsync(CancellationToken.None);
@@ -429,6 +479,8 @@ public sealed class OrchestrationTickServiceTests
             coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success));
 
         await harness.InsertRunAsync("issue-1", "#1", "Open", "instance-1", RunStatusNames.Succeeded);
+        await harness.InsertWorkspaceRecordAsync("issue-1", "#1", "symphony/1");
+        tracker.OpenPullRequestNumberByHeadBranch["symphony/1"] = 5;
 
         await harness.Service.RunTickAsync(CancellationToken.None); // seed + verify
         await harness.Service.RunTickAsync(CancellationToken.None); // review dispatch
@@ -471,6 +523,8 @@ public sealed class OrchestrationTickServiceTests
             coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success));
 
         await harness.InsertRunAsync("issue-1", "#1", "Open", "instance-1", RunStatusNames.Succeeded);
+        await harness.InsertWorkspaceRecordAsync("issue-1", "#1", "symphony/1");
+        tracker.OpenPullRequestNumberByHeadBranch["symphony/1"] = 5;
 
         await harness.Service.RunTickAsync(CancellationToken.None); // seed + verify
         await harness.Service.RunTickAsync(CancellationToken.None); // review dispatch
@@ -525,6 +579,8 @@ public sealed class OrchestrationTickServiceTests
             coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success));
 
         await harness.InsertRunAsync("issue-1", "#1", "Open", "instance-1", RunStatusNames.Succeeded);
+        await harness.InsertWorkspaceRecordAsync("issue-1", "#1", "symphony/1");
+        tracker.OpenPullRequestNumberByHeadBranch["symphony/1"] = 5;
 
         await harness.Service.RunTickAsync(CancellationToken.None);
 
@@ -1648,6 +1704,20 @@ public sealed class OrchestrationTickServiceTests
             await DbContext.SaveChangesAsync();
         }
 
+        public async Task InsertWorkspaceRecordAsync(string issueId, string identifier, string branchName)
+        {
+            DbContext.WorkspaceRecords.Add(new WorkspaceRecordEntity
+            {
+                IssueId = issueId,
+                IssueIdentifier = identifier,
+                WorkspacePath = $"C:\\tmp\\{identifier}",
+                BranchName = branchName,
+                LastPreparedAtUtc = DateTimeOffset.UtcNow
+            });
+
+            await DbContext.SaveChangesAsync();
+        }
+
         public async Task InsertRunAsync(
             string issueId,
             string identifier,
@@ -1918,6 +1988,24 @@ public sealed class OrchestrationTickServiceTests
         }
 
         public Dictionary<int, PullRequestStatus> PullRequestStatusByNumber { get; } = [];
+
+        public Dictionary<string, int> OpenPullRequestNumberByHeadBranch { get; } =
+            new(StringComparer.OrdinalIgnoreCase);
+
+        public Task<PullRequestStatus?> FetchOpenPullRequestByHeadBranchAsync(
+            TrackerQuery query,
+            string headRefName,
+            CancellationToken cancellationToken = default)
+        {
+            if (OpenPullRequestNumberByHeadBranch.TryGetValue(headRefName, out var number) &&
+                PullRequestStatusByNumber.TryGetValue(number, out var status))
+            {
+                return Task.FromResult<PullRequestStatus?>(status);
+            }
+
+            return Task.FromResult<PullRequestStatus?>(null);
+        }
+
 
         public Task<PullRequestStatus?> FetchPullRequestStatusAsync(
             TrackerQuery query,

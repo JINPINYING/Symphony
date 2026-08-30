@@ -1264,6 +1264,14 @@ public sealed class ApiSmokeTests
         {
             return Task.FromResult<PullRequestStatus?>(null);
         }
+
+        public Task<PullRequestStatus?> FetchOpenPullRequestByHeadBranchAsync(
+            TrackerQuery query,
+            string headRefName,
+            CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult<PullRequestStatus?>(null);
+        }
     }
 
     private static void TryDeleteFile(string path)

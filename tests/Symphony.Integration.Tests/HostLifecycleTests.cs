@@ -396,6 +396,14 @@ public sealed class HostLifecycleTests
         {
             return Task.FromResult<PullRequestStatus?>(null);
         }
+
+        public Task<PullRequestStatus?> FetchOpenPullRequestByHeadBranchAsync(
+            TrackerQuery query,
+            string headRefName,
+            CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult<PullRequestStatus?>(null);
+        }
     }
 
     private sealed class CurrentDirectoryScope : IDisposable

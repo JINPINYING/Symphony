@@ -729,6 +729,9 @@ public sealed class CodexAgentRunnerTests
 
         public Task<PullRequestStatus?> FetchPullRequestStatusAsync(TrackerQuery query, int pullRequestNumber, CancellationToken cancellationToken = default)
             => Task.FromResult<PullRequestStatus?>(null);
+
+        public Task<PullRequestStatus?> FetchOpenPullRequestByHeadBranchAsync(TrackerQuery query, string headRefName, CancellationToken cancellationToken = default)
+            => Task.FromResult<PullRequestStatus?>(null);
     }
 
     private static AgentRunUpdate CreateProtocolUpdate(string json)

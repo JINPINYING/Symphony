@@ -103,11 +103,8 @@ public sealed class PhaseOrchestrator(
                 continue;
             }
 
-            var pullRequest = issue.PullRequests
-                .Where(pr => pr.Number.HasValue && string.Equals(pr.State, "OPEN", StringComparison.OrdinalIgnoreCase))
-                .OrderByDescending(pr => pr.Number!.Value)
-                .FirstOrDefault();
-            if (pullRequest is null)
+            var prNumber = await ResolvePullRequestNumberAsync(query, issue, cancellationToken);
+            if (prNumber is null)
             {
                 // Implementation finished without an open PR; nothing to verify or
                 // review. Not an error — e.g. the agent determined no change was
@@ -121,15 +118,46 @@ public sealed class PhaseOrchestrator(
                 IssueId = issue.Id,
                 IssueIdentifier = issue.Identifier,
                 Stage = PhaseStages.AwaitingVerify,
-                PrNumber = pullRequest.Number!.Value,
+                PrNumber = prNumber.Value,
                 ImplementerRunner = AgentRunnerNames.IsKnown(latestRun.Runner) ? latestRun.Runner : AgentRunnerNames.Codex,
                 CreatedAtUtc = nowUtc,
                 UpdatedAtUtc = nowUtc
             });
             AddPhaseEvent(issue.Id, issue.Identifier, "phase_ledger_created",
-                $"Implementation durable; PR #{pullRequest.Number} enters verify/review phases (implementer: {latestRun.Runner}).");
+                $"Implementation durable; PR #{prNumber} enters verify/review phases (implementer: {latestRun.Runner}).");
             await dbContext.SaveChangesAsync(cancellationToken);
         }
+    }
+
+    // Finding the PR for a finished implementation, most authoritative first:
+    //   1. The branch Symphony itself prepared for the issue (workspace record) —
+    //      it created the branch, so an open PR on that head is definitive.
+    //   2. GitHub's issue->PR linkage, which only exists when the PR body uses a
+    //      closing keyword AND the tracker query includes pull requests
+    //      (include_pull_requests). Neither is guaranteed, so it is the fallback.
+    private async Task<int?> ResolvePullRequestNumberAsync(
+        TrackerQuery query,
+        NormalizedIssue issue,
+        CancellationToken cancellationToken)
+    {
+        var workspaceRecord = await dbContext.WorkspaceRecords
+            .SingleOrDefaultAsync(record => record.IssueId == issue.Id, cancellationToken);
+        var branchName = workspaceRecord?.BranchName ?? issue.BranchName;
+
+        if (!string.IsNullOrWhiteSpace(branchName))
+        {
+            var byBranch = await trackerClient.FetchOpenPullRequestByHeadBranchAsync(query, branchName, cancellationToken);
+            if (byBranch is not null)
+            {
+                return byBranch.Number;
+            }
+        }
+
+        return issue.PullRequests
+            .Where(pr => pr.Number.HasValue && string.Equals(pr.State, "OPEN", StringComparison.OrdinalIgnoreCase))
+            .OrderByDescending(pr => pr.Number!.Value)
+            .Select(pr => (int?)pr.Number!.Value)
+            .FirstOrDefault();
     }
 
     private async Task AdvanceLedgersAsync(

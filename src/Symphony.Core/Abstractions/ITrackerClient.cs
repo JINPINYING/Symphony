@@ -55,4 +55,13 @@ public interface ITrackerClient
         TrackerQuery query,
         int pullRequestNumber,
         CancellationToken cancellationToken = default);
+
+    // Finds the newest OPEN pull request whose head branch is exactly
+    // headRefName. Symphony creates the branch itself, so this is more reliable
+    // than issue->PR linkage, which depends on closing keywords in the PR body
+    // and on include_pull_requests being enabled.
+    Task<PullRequestStatus?> FetchOpenPullRequestByHeadBranchAsync(
+        TrackerQuery query,
+        string headRefName,
+        CancellationToken cancellationToken = default);
 }
