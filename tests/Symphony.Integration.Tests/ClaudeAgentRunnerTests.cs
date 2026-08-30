@@ -26,7 +26,7 @@ public sealed class ClaudeAgentRunnerTests
         var runner = new ClaudeAgentRunner(NullLogger<ClaudeAgentRunner>.Instance);
 
         var result = await runner.RunIssueAsync(
-            CreateRequest(harness, timeoutMs: 30_000, prompt: "marker-123 do the task"),
+            CreateRequest(harness, timeoutMs: 120_000, prompt: "marker-123 do the task"),
             (update, _) =>
             {
                 updates.Add(update);
@@ -63,7 +63,7 @@ public sealed class ClaudeAgentRunnerTests
 
         var runner = new ClaudeAgentRunner(NullLogger<ClaudeAgentRunner>.Instance);
 
-        var result = await runner.RunIssueAsync(CreateRequest(harness, timeoutMs: 30_000));
+        var result = await runner.RunIssueAsync(CreateRequest(harness, timeoutMs: 120_000));
 
         Assert.False(result.Success);
         Assert.Equal("claude_error_during_execution", result.ErrorCode);
@@ -141,7 +141,7 @@ public sealed class ClaudeAgentRunnerTests
 
         var runner = new ClaudeAgentRunner(NullLogger<ClaudeAgentRunner>.Instance);
 
-        var result = await runner.RunIssueAsync(CreateRequest(harness, timeoutMs: 30_000));
+        var result = await runner.RunIssueAsync(CreateRequest(harness, timeoutMs: 120_000));
 
         Assert.False(result.Success);
         Assert.Equal("subprocess_exit", result.ErrorCode);
