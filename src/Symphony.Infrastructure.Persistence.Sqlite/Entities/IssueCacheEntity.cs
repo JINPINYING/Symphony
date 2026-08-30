@@ -16,5 +16,6 @@ public sealed class IssueCacheEntity
     public string BlockedByJson { get; set; } = "[]";
     public DateTimeOffset? CreatedAtUtc { get; set; }
     public DateTimeOffset? UpdatedAtUtc { get; set; }
+    public DateTimeOffset? EligibleSeenAtUtc { get; set; }
     public DateTimeOffset CachedAtUtc { get; set; }
 }
