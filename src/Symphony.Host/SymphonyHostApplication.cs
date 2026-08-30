@@ -131,6 +131,7 @@ internal static class SymphonyHostApplication
         services.AddSymphonyWorkspaceServices();
         services.AddSingleton<IIssueExecutionCoordinator, IssueExecutionCoordinator>();
         services.AddSingleton<RefreshSignalService>();
+        services.AddScoped<EscalationPublisher>();
         services.AddScoped<OrchestrationTickService>();
         services.AddScoped<RuntimeStateService>();
 

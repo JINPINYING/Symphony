@@ -23,4 +23,16 @@ public interface ITrackerClient
         string graphQlDocument,
         string? variablesJson,
         CancellationToken cancellationToken = default);
+
+    Task<IssueCommentMarkerSnapshot?> FetchIssueCommentMarkerAsync(
+        TrackerQuery query,
+        string issueId,
+        string marker,
+        CancellationToken cancellationToken = default);
+
+    Task<string?> PostIssueCommentAsync(
+        TrackerQuery query,
+        string issueId,
+        string body,
+        CancellationToken cancellationToken = default);
 }

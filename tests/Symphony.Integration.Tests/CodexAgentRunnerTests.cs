@@ -711,6 +711,12 @@ public sealed class CodexAgentRunnerTests
         {
             return Task.FromResult(configuredGraphQlResult);
         }
+
+        public Task<IssueCommentMarkerSnapshot?> FetchIssueCommentMarkerAsync(TrackerQuery query, string issueId, string marker, CancellationToken cancellationToken = default)
+            => Task.FromResult<IssueCommentMarkerSnapshot?>(new IssueCommentMarkerSnapshot(issueId, "Open", null, MarkerFound: false));
+
+        public Task<string?> PostIssueCommentAsync(TrackerQuery query, string issueId, string body, CancellationToken cancellationToken = default)
+            => Task.FromResult<string?>(null);
     }
 
     private static AgentRunUpdate CreateProtocolUpdate(string json)
