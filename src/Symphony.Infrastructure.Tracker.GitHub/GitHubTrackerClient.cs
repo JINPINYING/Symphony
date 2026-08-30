@@ -562,10 +562,9 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
         return result;
     }
 
-    private const string GraphQlPullRequestStatusQuery = """
-        query($owner: String!, $repo: String!, $number: Int!) {
-          repository(owner: $owner, name: $repo) {
-            pullRequest(number: $number) {
+    // Shared PR field selection so the by-number and by-branch queries parse
+    // through the same code path (ParsePullRequestNode).
+    private const string GraphQlPullRequestNodeFields = """
               number
               state
               isDraft
@@ -579,6 +578,27 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
                     }
                   }
                 }
+              }
+        """;
+
+    private const string GraphQlPullRequestStatusQuery = """
+        query($owner: String!, $repo: String!, $number: Int!) {
+          repository(owner: $owner, name: $repo) {
+            pullRequest(number: $number) {
+        """ + GraphQlPullRequestNodeFields + """
+
+            }
+          }
+        }
+        """;
+
+    private const string GraphQlOpenPullRequestByHeadBranchQuery = """
+        query($owner: String!, $repo: String!, $headRefName: String!) {
+          repository(owner: $owner, name: $repo) {
+            pullRequests(headRefName: $headRefName, states: OPEN, first: 5, orderBy: { field: CREATED_AT, direction: DESC }) {
+              nodes {
+        """ + GraphQlPullRequestNodeFields + """
+
               }
             }
           }
@@ -615,9 +635,67 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
             return null;
         }
 
+        return ParsePullRequestNode(prNode);
+    }
+
+    public async Task<PullRequestStatus?> FetchOpenPullRequestByHeadBranchAsync(
+        TrackerQuery query,
+        string headRefName,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(headRefName))
+        {
+            return null;
+        }
+
+        var endpoint = string.IsNullOrWhiteSpace(query.Endpoint) ? "https://api.github.com/graphql" : query.Endpoint;
+
+        using var request = BuildGraphQlRequest(
+            endpoint,
+            query.ApiKey,
+            GraphQlOpenPullRequestByHeadBranchQuery,
+            new
+            {
+                owner = query.Owner,
+                repo = query.Repo,
+                headRefName
+            });
+
+        using var response = await SendAsync(request, cancellationToken);
+        using var document = await ParseGraphQlDocumentAsync(response, cancellationToken);
+
+        var dataElement = GetRequiredObject(document.RootElement, "data");
+        if (!dataElement.TryGetProperty("repository", out var repositoryNode) ||
+            repositoryNode.ValueKind != JsonValueKind.Object ||
+            !repositoryNode.TryGetProperty("pullRequests", out var listNode) ||
+            listNode.ValueKind != JsonValueKind.Object)
+        {
+            return null;
+        }
+
+        foreach (var prNode in GetRequiredArray(listNode, "nodes").EnumerateArray())
+        {
+            if (prNode.ValueKind != JsonValueKind.Object)
+            {
+                continue;
+            }
+
+            var parsed = ParsePullRequestNode(prNode);
+            if (parsed is not null)
+            {
+                return parsed;
+            }
+        }
+
+        return null;
+    }
+
+    private static PullRequestStatus? ParsePullRequestNode(JsonElement prNode)
+    {
         var headSha = GetOptionalString(prNode, "headRefOid");
         var state = GetOptionalString(prNode, "state");
-        if (string.IsNullOrWhiteSpace(headSha) || string.IsNullOrWhiteSpace(state))
+        var number = GetOptionalInt(prNode, "number");
+        if (string.IsNullOrWhiteSpace(headSha) || string.IsNullOrWhiteSpace(state) || number is null)
         {
             return null;
         }
@@ -643,7 +721,7 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
 
         var isDraft = prNode.TryGetProperty("isDraft", out var draftNode) && draftNode.ValueKind == JsonValueKind.True;
         return new PullRequestStatus(
-            pullRequestNumber,
+            number.Value,
             state,
             isDraft,
             headSha,
