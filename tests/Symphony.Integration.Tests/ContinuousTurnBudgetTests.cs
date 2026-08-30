@@ -38,6 +38,7 @@ public sealed class ContinuousTurnBudgetTests
     [InlineData(1, 1)]
     [InlineData(6, 1)]
     [InlineData(20, 1)]
+    [InlineData(100, 1)]
     public void AgentRunRequest_ShouldEnforceOneTurnPerDispatch(int configuredMaxTurns, int expectedMaxTurns)
     {
         var request = new AgentRunRequest(
