@@ -353,12 +353,14 @@ public sealed partial class OrchestrationTickService
         CancellationToken cancellationToken)
     {
         var nowUtc = timeProvider.GetUtcNow();
-        var run = await dbContext.Runs
+        var retryingRuns = await dbContext.Runs
             .Where(runEntity =>
                 runEntity.IssueId == retryEntry.IssueId &&
                 runEntity.Status == RunStatusNames.Retrying)
+            .ToListAsync(cancellationToken);
+        var run = retryingRuns
             .OrderByDescending(runEntity => runEntity.StartedAtUtc)
-            .FirstOrDefaultAsync(cancellationToken);
+            .FirstOrDefault();
 
         if (run is not null)
         {
