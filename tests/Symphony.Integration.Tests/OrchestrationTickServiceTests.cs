@@ -1245,11 +1245,14 @@ public sealed class OrchestrationTickServiceTests
                 MaxConcurrentAgents: maxConcurrentAgents,
                 MaxTurns: 20,
                 MaxRetryBackoffMs: 300_000,
-                MaxConcurrentAgentsByState: maxConcurrentByState ?? new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase)),
+                MaxConcurrentAgentsByState: maxConcurrentByState ?? new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase),
+                DefaultRunner: "codex",
+                RunnerByLabel: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)),
             new WorkflowServerSettings(Port: null),
             new WorkflowWorkspaceSettings("./workspaces", "./workspaces/repo", "./workspaces/worktrees", "main", null),
             new WorkflowHooksSettings(null, null, null, null, 60_000),
-            new WorkflowCodexSettings("codex app-server", 30_000, "never", "danger-full-access", "danger-full-access", 5_000, 300_000));
+            new WorkflowCodexSettings("codex app-server", 30_000, "never", "danger-full-access", "danger-full-access", 5_000, 300_000),
+            new WorkflowClaudeSettings("claude", 30_000, "bypassPermissions", null, 600_000));
 
         return new WorkflowDefinition(new Dictionary<string, object?>(), "Prompt body", runtime, "WORKFLOW.md", DateTimeOffset.UtcNow);
     }

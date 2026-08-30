@@ -10,6 +10,7 @@ using Symphony.Core.Metadata;
 using Symphony.Host.Services;
 using Symphony.Host.Setup;
 using Symphony.Host.Workers;
+using Symphony.Infrastructure.Agent.Claude;
 using Symphony.Infrastructure.Agent.Codex;
 using Symphony.Infrastructure.Persistence.Sqlite;
 using Symphony.Infrastructure.Persistence.Sqlite.Storage;
@@ -128,6 +129,8 @@ internal static class SymphonyHostApplication
         services.AddSymphonyWorkflowServices(configuration);
         services.AddSymphonyGitHubTrackerClient();
         services.AddSymphonyCodexAgentRunner();
+        services.AddSymphonyClaudeAgentRunner();
+        services.AddScoped<IAgentRunnerResolver, AgentRunnerResolver>();
         services.AddSymphonyWorkspaceServices();
         services.AddSingleton<IIssueExecutionCoordinator, IssueExecutionCoordinator>();
         services.AddSingleton<RefreshSignalService>();

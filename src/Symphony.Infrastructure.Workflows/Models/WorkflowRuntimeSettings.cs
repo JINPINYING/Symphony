@@ -7,7 +7,8 @@ public sealed record WorkflowRuntimeSettings(
     WorkflowServerSettings Server,
     WorkflowWorkspaceSettings Workspace,
     WorkflowHooksSettings Hooks,
-    WorkflowCodexSettings Codex);
+    WorkflowCodexSettings Codex,
+    WorkflowClaudeSettings Claude);
 
 public sealed record WorkflowTrackerSettings(
     string Kind,
@@ -27,7 +28,12 @@ public sealed record WorkflowAgentSettings(
     int MaxConcurrentAgents,
     int MaxTurns,
     int MaxRetryBackoffMs,
-    IReadOnlyDictionary<string, int> MaxConcurrentAgentsByState);
+    IReadOnlyDictionary<string, int> MaxConcurrentAgentsByState,
+    // M4 rollout (blueprint decision 7): which agent runner implements an issue.
+    // DefaultRunner applies unless one of the issue's labels appears in
+    // RunnerByLabel (first matching label wins). Valid runners: codex, claude.
+    string DefaultRunner,
+    IReadOnlyDictionary<string, string> RunnerByLabel);
 
 public sealed record WorkflowServerSettings(int? Port);
 
@@ -52,4 +58,14 @@ public sealed record WorkflowCodexSettings(
     string ThreadSandbox,
     string TurnSandboxPolicy,
     int ReadTimeoutMs,
+    int StallTimeoutMs);
+
+// M4: headless Claude Code as an agent runner. Timeouts are tuned separately
+// from Codex — Claude emits stream events at a different cadence and a slower
+// implementer must not trip false stall detection.
+public sealed record WorkflowClaudeSettings(
+    string Command,
+    int TurnTimeoutMs,
+    string PermissionMode,
+    string? Model,
     int StallTimeoutMs);
