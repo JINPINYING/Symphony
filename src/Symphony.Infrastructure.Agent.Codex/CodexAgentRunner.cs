@@ -1708,3 +1708,5 @@ public sealed partial class CodexAgentRunner(
 
     private sealed record UsageSnapshot(int? InputTokens, int? OutputTokens, int? TotalTokens, bool IsDelta);
 }
+
+// build-stamp: m4b-1788130263

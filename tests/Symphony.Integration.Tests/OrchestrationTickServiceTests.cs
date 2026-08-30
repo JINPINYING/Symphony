@@ -430,6 +430,84 @@ public sealed class OrchestrationTickServiceTests
     }
 
     [Fact]
+    public async Task RunTickAsync_ShouldNotDispatchIssueOwnedByThePhaseOrchestrator()
+    {
+        // Regression: on the first live M4 review the ordinary candidate loop
+        // claimed the same still-labelled issue in the same tick and overwrote the
+        // review run's phase and runner, so the cross-vendor review never ran.
+        var issue = BuildIssue("issue-1", "#1", "Open", null,
+            pullRequests: [new PullRequestRef("pr-5", 5, "OPEN", null, "symphony/1", "main")]);
+        var tracker = new FakeTrackerClient([issue]);
+        tracker.IssuesById["issue-1"] = issue;
+        tracker.PullRequestStatusByNumber[5] = new PullRequestStatus(5, "OPEN", false, "aaa111", "SUCCESS", "MERGEABLE");
+        tracker.OpenPullRequestNumberByHeadBranch["symphony/1"] = 5;
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success));
+
+        await harness.InsertRunAsync("issue-1", "#1", "Open", "instance-1", RunStatusNames.Succeeded);
+        await harness.InsertWorkspaceRecordAsync("issue-1", "#1", "symphony/1");
+
+        // Tick 1 seeds the ledger and passes verify; tick 2 dispatches the review.
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var ledger = Assert.Single(await harness.DbContext.PhaseLedger.ToListAsync());
+        Assert.Equal(PhaseStages.Reviewing, ledger.Stage);
+
+        // The issue is still an eligible candidate, but the phase machine owns it.
+        var reviewRequest = Assert.Single(harness.Coordinator.StartRequests);
+        Assert.Equal("claude", reviewRequest.RunnerOverride);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        // Still exactly one dispatch: no implementation hijacked the review.
+        Assert.Single(harness.Coordinator.StartRequests);
+        Assert.DoesNotContain(
+            await harness.DbContext.Runs.ToListAsync(),
+            run => run.Phase == RunPhaseNames.Implementation && run.Status == RunStatusNames.Running);
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldRedispatchReviewWhenItsRunDisappeared()
+    {
+        var tracker = new FakeTrackerClient([]);
+        tracker.IssuesById["issue-1"] = BuildIssue("issue-1", "#1", "Open", null, pullRequests: []);
+        tracker.PullRequestStatusByNumber[5] = new PullRequestStatus(5, "OPEN", false, "aaa111", "SUCCESS", "MERGEABLE");
+        tracker.OpenPullRequestNumberByHeadBranch["symphony/1"] = 5;
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success));
+
+        await harness.InsertRunAsync("issue-1", "#1", "Open", "instance-1", RunStatusNames.Succeeded);
+        await harness.InsertWorkspaceRecordAsync("issue-1", "#1", "symphony/1");
+
+        await harness.Service.RunTickAsync(CancellationToken.None); // seed + verify
+        await harness.Service.RunTickAsync(CancellationToken.None); // review dispatched
+
+        var ledger = Assert.Single(await harness.DbContext.PhaseLedger.ToListAsync());
+        Assert.Equal(PhaseStages.Reviewing, ledger.Stage);
+
+        // Simulate the run row being taken over: no review-phase run remains.
+        foreach (var run in await harness.DbContext.Runs.Where(r => r.Phase == RunPhaseNames.Review).ToListAsync())
+        {
+            run.Phase = RunPhaseNames.Implementation;
+        }
+        await harness.DbContext.SaveChangesAsync();
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        ledger = Assert.Single(await harness.DbContext.PhaseLedger.ToListAsync());
+        Assert.Equal(PhaseStages.AwaitingReview, ledger.Stage);
+        Assert.Contains(
+            await harness.DbContext.EventLog.ToListAsync(),
+            entry => entry.EventName == "phase_review_redispatch");
+    }
+
+    [Fact]
     public async Task RunTickAsync_ShouldMarkReadyOnApprovedVerdict()
     {
         var tracker = new FakeTrackerClient([]);

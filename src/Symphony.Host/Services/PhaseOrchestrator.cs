@@ -346,14 +346,24 @@ public sealed class PhaseOrchestrator(
             var latestReview = reviewRuns
                 .OrderByDescending(run => run.StartedAtUtc)
                 .FirstOrDefault();
-            if (latestReview is not null &&
-                latestReview.Status is RunStatusNames.Failed or RunStatusNames.TimedOut or RunStatusNames.Stalled)
+            if (latestReview is null)
+            {
+                // No review run exists for this stage at all — the dispatch never
+                // landed, or its row was taken over by another dispatch. Recover
+                // by re-dispatching the review rather than waiting forever.
+                ledger.Stage = PhaseStages.AwaitingReview;
+                ledger.UpdatedAtUtc = timeProvider.GetUtcNow();
+                AddPhaseEvent(ledger.IssueId, ledger.IssueIdentifier, "phase_review_redispatch",
+                    $"No {reviewPhase} run found for PR #{ledger.PrNumber}; re-dispatching the review.");
+                await dbContext.SaveChangesAsync(cancellationToken);
+            }
+            else if (latestReview.Status is RunStatusNames.Failed or RunStatusNames.TimedOut or RunStatusNames.Stalled)
             {
                 await EscalateAsync(ledger,
                     $"The {reviewPhase} run for PR #{ledger.PrNumber} ended '{latestReview.Status}' without posting a verdict comment.",
                     cancellationToken);
             }
-            else if (latestReview is not null && latestReview.Status == RunStatusNames.Succeeded)
+            else if (latestReview.Status == RunStatusNames.Succeeded)
             {
                 await EscalateAsync(ledger,
                     $"The {reviewPhase} run for PR #{ledger.PrNumber} succeeded but posted no verdict comment with the exact-head marker — contract violation.",

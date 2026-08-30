@@ -393,3 +393,5 @@ public sealed class ClaudeAgentRunner(ILogger<ClaudeAgentRunner> logger) : IAgen
             ? property.GetInt32()
             : null;
 }
+
+// build-stamp: m4b-1788130263
