@@ -39,6 +39,13 @@ public sealed partial class OrchestrationTickService
             .Where(run => run.Status == RunStatusNames.Running)
             .ToListAsync(cancellationToken);
 
+        var succeededIssueIds = new HashSet<string>(
+            await dbContext.Runs
+                .Where(run => run.Status == RunStatusNames.Succeeded)
+                .Select(run => run.IssueId)
+                .ToListAsync(cancellationToken),
+            StringComparer.OrdinalIgnoreCase);
+
         var countsByState = runningIssues
             .GroupBy(run => NormalizeStateKey(run.State), StringComparer.OrdinalIgnoreCase)
             .ToDictionary(group => group.Key, group => group.Count(), StringComparer.OrdinalIgnoreCase);
@@ -56,6 +63,13 @@ public sealed partial class OrchestrationTickService
         var candidatesById = issues.ToDictionary(issue => issue.Id, StringComparer.OrdinalIgnoreCase);
         foreach (var retryEntry in dueRetries)
         {
+            if (string.Equals(retryEntry.DelayType, RetryDelayTypes.Continuation, StringComparison.OrdinalIgnoreCase))
+            {
+                await CompleteSuccessfulDispatchAsync(retryEntry, instanceId, cancellationToken);
+                succeededIssueIds.Add(retryEntry.IssueId);
+                continue;
+            }
+
             if (!candidatesById.TryGetValue(retryEntry.IssueId, out var retryIssue))
             {
                 await ReleaseRetryReservationAsync(
@@ -67,7 +81,8 @@ public sealed partial class OrchestrationTickService
                 continue;
             }
 
-            if (!IsDispatchEligible(retryIssue, workflowDefinition, runningIssueIds, countsByState))
+            if (succeededIssueIds.Contains(retryIssue.Id) ||
+                !IsDispatchEligible(retryIssue, workflowDefinition, runningIssueIds, countsByState))
             {
                 await ReleaseRetryReservationAsync(
                     retryEntry.IssueId,
@@ -110,7 +125,8 @@ public sealed partial class OrchestrationTickService
                 break;
             }
 
-            if (!IsDispatchEligible(issue, workflowDefinition, runningIssueIds, countsByState))
+            if (succeededIssueIds.Contains(issue.Id) ||
+                !IsDispatchEligible(issue, workflowDefinition, runningIssueIds, countsByState))
             {
                 continue;
             }
@@ -329,6 +345,49 @@ public sealed partial class OrchestrationTickService
         }
 
         return currentCount < limit;
+    }
+
+    private async Task CompleteSuccessfulDispatchAsync(
+        RetryQueueEntity retryEntry,
+        string instanceId,
+        CancellationToken cancellationToken)
+    {
+        var nowUtc = timeProvider.GetUtcNow();
+        var run = await dbContext.Runs
+            .Where(runEntity =>
+                runEntity.IssueId == retryEntry.IssueId &&
+                runEntity.Status == RunStatusNames.Retrying)
+            .OrderByDescending(runEntity => runEntity.StartedAtUtc)
+            .FirstOrDefaultAsync(cancellationToken);
+
+        if (run is not null)
+        {
+            run.Status = RunStatusNames.Succeeded;
+            run.CurrentRetryAttempt = null;
+            run.CompletedAtUtc = nowUtc;
+            run.LastEvent = "run_completed";
+            run.LastMessage = "Successful bounded execution completed; implicit continuation suppressed.";
+            run.LastEventAtUtc = nowUtc;
+        }
+
+        dbContext.RetryQueue.Remove(retryEntry);
+        dbContext.EventLog.Add(new EventLogEntity
+        {
+            IssueId = retryEntry.IssueId,
+            IssueIdentifier = retryEntry.IssueIdentifier,
+            RunId = retryEntry.RunId,
+            EventName = "implicit_continuation_suppressed",
+            Level = LogLevel.Information.ToString(),
+            Message = "Successful Codex execution was finalized without starting another implementation run.",
+            OccurredAtUtc = nowUtc
+        });
+
+        await coordinationStore.ReleaseIssueClaimAsync(
+            retryEntry.IssueId,
+            instanceId,
+            RunStatusNames.Succeeded,
+            cancellationToken);
+        await dbContext.SaveChangesAsync(cancellationToken);
     }
 
     private async Task ReleaseRetryReservationAsync(
