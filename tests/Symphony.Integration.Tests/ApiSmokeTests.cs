@@ -1213,6 +1213,25 @@ public sealed class ApiSmokeTests
         {
             return Task.FromResult(new GitHubGraphQlExecutionResult(true, "{\"data\":{}}"));
         }
+
+        public Task<IssueCommentMarkerSnapshot?> FetchIssueCommentMarkerAsync(
+            TrackerQuery query,
+            string issueId,
+            string marker,
+            CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult<IssueCommentMarkerSnapshot?>(
+                new IssueCommentMarkerSnapshot(issueId, "Open", null, MarkerFound: false));
+        }
+
+        public Task<string?> PostIssueCommentAsync(
+            TrackerQuery query,
+            string issueId,
+            string body,
+            CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult<string?>(null);
+        }
     }
 
     private static void TryDeleteFile(string path)

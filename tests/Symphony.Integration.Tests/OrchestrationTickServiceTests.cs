@@ -76,6 +76,111 @@ public sealed class OrchestrationTickServiceTests
     }
 
     [Fact]
+    public async Task RunTickAsync_ShouldPublishEscalationCommentWithinSameTick()
+    {
+        var tracker = new FakeTrackerClient([], issueStatesById: new Dictionary<string, string>
+        {
+            ["issue-1"] = "Open"
+        });
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await harness.InsertRetryingRunAsync("issue-1", "#1", "Open", "instance-1", sessionId: "session-1");
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var run = await harness.DbContext.Runs.SingleAsync();
+        Assert.Equal(RunStatusNames.NeedsCommandCenter, run.Status);
+        Assert.NotNull(run.EscalationPostedAtUtc);
+
+        var posted = Assert.Single(tracker.PostedComments);
+        Assert.Equal("issue-1", posted.IssueId);
+        Assert.Contains(EscalationPublisher.MarkerFor(run.Id), posted.Body);
+        Assert.Contains("needs command center", posted.Body);
+        Assert.Contains(
+            await harness.DbContext.EventLog.ToListAsync(),
+            entry => entry.EventName == "escalation_posted");
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldNotDuplicateEscalationCommentOnRetick()
+    {
+        var tracker = new FakeTrackerClient([]);
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await harness.InsertRunAsync("issue-1", "#1", "Open", "instance-1", RunStatusNames.NeedsCommandCenter);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Single(tracker.PostedComments);
+        Assert.NotNull((await harness.DbContext.Runs.SingleAsync()).EscalationPostedAtUtc);
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldKeepEscalationPendingWhenPostFails()
+    {
+        var tracker = new FakeTrackerClient([]) { ThrowOnPostComment = true };
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await harness.InsertRunAsync("issue-1", "#1", "Open", "instance-1", RunStatusNames.NeedsCommandCenter);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Empty(tracker.PostedComments);
+        Assert.Null((await harness.DbContext.Runs.SingleAsync()).EscalationPostedAtUtc);
+
+        // The escalation is not lost: once the tracker recovers, the next tick posts it.
+        tracker.ThrowOnPostComment = false;
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Single(tracker.PostedComments);
+        Assert.NotNull((await harness.DbContext.Runs.SingleAsync()).EscalationPostedAtUtc);
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldMarkPostedWithoutPostingWhenMarkerAlreadyPresent()
+    {
+        var tracker = new FakeTrackerClient([]) { MarkerAlreadyPresent = true };
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await harness.InsertRunAsync("issue-1", "#1", "Open", "instance-1", RunStatusNames.NeedsCommandCenter);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Empty(tracker.PostedComments);
+        Assert.NotNull((await harness.DbContext.Runs.SingleAsync()).EscalationPostedAtUtc);
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldKeepEscalationPendingWhenIssueCannotBeResolved()
+    {
+        var tracker = new FakeTrackerClient([]) { ReturnNullCommentMarkerSnapshot = true };
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await harness.InsertRunAsync("issue-1", "#1", "Open", "instance-1", RunStatusNames.NeedsCommandCenter);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Empty(tracker.PostedComments);
+        Assert.Null((await harness.DbContext.Runs.SingleAsync()).EscalationPostedAtUtc);
+    }
+
+    [Fact]
     public async Task RunTickAsync_ShouldReleaseMissingRetryCandidateWhenIssueIsTerminal()
     {
         await using var harness = await TestHarness.CreateAsync(
@@ -771,6 +876,11 @@ public sealed class OrchestrationTickServiceTests
                 dbContext,
                 workspaceManager,
                 coordinator,
+                new EscalationPublisher(
+                    dbContext,
+                    tracker,
+                    TimeProvider.System,
+                    NullLogger<EscalationPublisher>.Instance),
                 Options.Create(new OrchestrationOptions
                 {
                     InstanceId = "instance-1",
@@ -1031,6 +1141,54 @@ public sealed class OrchestrationTickServiceTests
             CancellationToken cancellationToken = default)
         {
             return Task.FromResult(new GitHubGraphQlExecutionResult(true, "{\"data\":{}}"));
+        }
+
+        public List<(string IssueId, string Body)> PostedComments { get; } = [];
+        public bool ThrowOnPostComment { get; set; }
+        public bool ThrowOnFetchCommentMarker { get; set; }
+        public bool ReturnNullCommentMarkerSnapshot { get; set; }
+        public bool MarkerAlreadyPresent { get; set; }
+
+        public Task<IssueCommentMarkerSnapshot?> FetchIssueCommentMarkerAsync(
+            TrackerQuery query,
+            string issueId,
+            string marker,
+            CancellationToken cancellationToken = default)
+        {
+            if (ThrowOnFetchCommentMarker)
+            {
+                throw new InvalidOperationException("simulated tracker outage on comment scan");
+            }
+
+            if (ReturnNullCommentMarkerSnapshot)
+            {
+                return Task.FromResult<IssueCommentMarkerSnapshot?>(null);
+            }
+
+            // Behaves like the real scan: a comment posted earlier through this fake
+            // is visible to later marker checks.
+            var found = MarkerAlreadyPresent ||
+                PostedComments.Any(comment =>
+                    string.Equals(comment.IssueId, issueId, StringComparison.OrdinalIgnoreCase) &&
+                    comment.Body.Contains(marker, StringComparison.Ordinal));
+            var state = statesById.TryGetValue(issueId, out var issueState) ? issueState : "Open";
+            return Task.FromResult<IssueCommentMarkerSnapshot?>(
+                new IssueCommentMarkerSnapshot(issueId, state, null, found));
+        }
+
+        public Task<string?> PostIssueCommentAsync(
+            TrackerQuery query,
+            string issueId,
+            string body,
+            CancellationToken cancellationToken = default)
+        {
+            if (ThrowOnPostComment)
+            {
+                throw new InvalidOperationException("simulated comment post failure");
+            }
+
+            PostedComments.Add((issueId, body));
+            return Task.FromResult<string?>($"https://example.test/comments/{PostedComments.Count}");
         }
     }
 

@@ -18,6 +18,7 @@ public sealed partial class OrchestrationTickService
     private readonly SymphonyDbContext dbContext;
     private readonly IWorkspaceManager workspaceManager;
     private readonly IIssueExecutionCoordinator issueExecutionCoordinator;
+    private readonly EscalationPublisher escalationPublisher;
     private readonly OrchestrationOptions orchestrationOptions;
     private readonly TimeProvider timeProvider;
     private readonly ILogger<OrchestrationTickService> logger;
@@ -29,6 +30,7 @@ public sealed partial class OrchestrationTickService
         SymphonyDbContext dbContext,
         IWorkspaceManager workspaceManager,
         IIssueExecutionCoordinator issueExecutionCoordinator,
+        EscalationPublisher escalationPublisher,
         IOptions<OrchestrationOptions> orchestrationOptions,
         TimeProvider timeProvider,
         ILogger<OrchestrationTickService> logger)
@@ -39,6 +41,7 @@ public sealed partial class OrchestrationTickService
         this.dbContext = dbContext;
         this.workspaceManager = workspaceManager;
         this.issueExecutionCoordinator = issueExecutionCoordinator;
+        this.escalationPublisher = escalationPublisher;
         this.orchestrationOptions = orchestrationOptions.Value;
         this.timeProvider = timeProvider;
         this.logger = logger;
@@ -143,6 +146,13 @@ public sealed partial class OrchestrationTickService
             }
 
             await DispatchCandidatesAsync(workflowDefinition, apiKey, instanceId, cancellationToken);
+
+            // M1: escalations created this tick (or still pending from earlier
+            // ticks) are published to GitHub before the tick ends, so a parked
+            // escalation reaches the owner within one tick.
+            await escalationPublisher.PublishPendingEscalationsAsync(
+                BuildTrackerQuery(workflowDefinition, apiKey),
+                cancellationToken);
             return workflowDefinition.Runtime.Polling.IntervalMs;
         }
         finally

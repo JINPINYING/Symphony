@@ -20,6 +20,11 @@ public sealed class RunEntity
     public bool CleanupWorkspaceOnStop { get; set; }
     public string? LastEvent { get; set; }
     public string? LastMessage { get; set; }
+
+    // When the needs_command_center escalation for this run was durably published
+    // as a GitHub comment (M1). Null while the escalation is still pending
+    // publication; the tick loop retries until set.
+    public DateTimeOffset? EscalationPostedAtUtc { get; set; }
     public DateTimeOffset StartedAtUtc { get; set; }
     public DateTimeOffset? LastEventAtUtc { get; set; }
     public DateTimeOffset? CompletedAtUtc { get; set; }

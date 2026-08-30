@@ -193,6 +193,161 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
         return result;
     }
 
+    private const string GraphQlIssueCommentMarkerQuery = """
+        query($id: ID!, $after: String) {
+          node(id: $id) {
+            ... on Issue {
+              id
+              state
+              url
+              comments(first: 100, after: $after) {
+                pageInfo {
+                  hasNextPage
+                  endCursor
+                }
+                nodes {
+                  body
+                }
+              }
+            }
+          }
+        }
+        """;
+
+    private const string GraphQlAddIssueCommentMutation = """
+        mutation($subjectId: ID!, $body: String!) {
+          addComment(input: { subjectId: $subjectId, body: $body }) {
+            commentEdge {
+              node {
+                url
+              }
+            }
+          }
+        }
+        """;
+
+    // Upper bound on comment pages scanned for the idempotency marker. At 100
+    // comments per page this covers issues far beyond anything Symphony manages.
+    // Hitting the cap reports the marker as not found: the caller's durable
+    // posted-flag remains the primary dedupe, so the worst case is one duplicate
+    // comment on a pathological thread — never a silently swallowed escalation.
+    private const int MaxCommentMarkerPages = 20;
+
+    public async Task<IssueCommentMarkerSnapshot?> FetchIssueCommentMarkerAsync(
+        TrackerQuery query,
+        string issueId,
+        string marker,
+        CancellationToken cancellationToken = default)
+    {
+        var endpoint = string.IsNullOrWhiteSpace(query.Endpoint) ? "https://api.github.com/graphql" : query.Endpoint;
+
+        string? state = null;
+        string? url = null;
+        string? after = null;
+        var pagesScanned = 0;
+
+        while (true)
+        {
+            using var request = BuildGraphQlRequest(
+                endpoint,
+                query.ApiKey,
+                GraphQlIssueCommentMarkerQuery,
+                new
+                {
+                    id = issueId,
+                    after
+                });
+
+            using var response = await SendAsync(request, cancellationToken);
+            using var document = await ParseGraphQlDocumentAsync(response, cancellationToken);
+
+            var dataElement = GetRequiredObject(document.RootElement, "data");
+            if (!dataElement.TryGetProperty("node", out var nodeElement) ||
+                nodeElement.ValueKind != JsonValueKind.Object)
+            {
+                return null;
+            }
+
+            var nodeIssueId = GetOptionalString(nodeElement, "id");
+            if (string.IsNullOrWhiteSpace(nodeIssueId))
+            {
+                // The node resolved to something that is not an Issue.
+                return null;
+            }
+
+            state ??= NormalizeState(GetOptionalString(nodeElement, "state")) ?? "Open";
+            url ??= GetOptionalString(nodeElement, "url");
+
+            var commentsElement = GetRequiredObject(nodeElement, "comments");
+            var commentNodes = GetRequiredArray(commentsElement, "nodes");
+            foreach (var commentNode in commentNodes.EnumerateArray())
+            {
+                if (commentNode.ValueKind != JsonValueKind.Object)
+                {
+                    continue;
+                }
+
+                var body = GetOptionalString(commentNode, "body");
+                if (body is not null && body.Contains(marker, StringComparison.Ordinal))
+                {
+                    return new IssueCommentMarkerSnapshot(issueId, state, url, MarkerFound: true);
+                }
+            }
+
+            var pageInfo = GetRequiredObject(commentsElement, "pageInfo");
+            pagesScanned++;
+            if (!GetRequiredBoolean(pageInfo, "hasNextPage"))
+            {
+                return new IssueCommentMarkerSnapshot(issueId, state, url, MarkerFound: false);
+            }
+
+            if (pagesScanned >= MaxCommentMarkerPages)
+            {
+                return new IssueCommentMarkerSnapshot(issueId, state, url, MarkerFound: false);
+            }
+
+            after = GetOptionalString(pageInfo, "endCursor");
+            if (string.IsNullOrWhiteSpace(after))
+            {
+                return new IssueCommentMarkerSnapshot(issueId, state, url, MarkerFound: false);
+            }
+        }
+    }
+
+    public async Task<string?> PostIssueCommentAsync(
+        TrackerQuery query,
+        string issueId,
+        string body,
+        CancellationToken cancellationToken = default)
+    {
+        var endpoint = string.IsNullOrWhiteSpace(query.Endpoint) ? "https://api.github.com/graphql" : query.Endpoint;
+
+        using var request = BuildGraphQlRequest(
+            endpoint,
+            query.ApiKey,
+            GraphQlAddIssueCommentMutation,
+            new
+            {
+                subjectId = issueId,
+                body
+            });
+
+        using var response = await SendAsync(request, cancellationToken);
+        using var document = await ParseGraphQlDocumentAsync(response, cancellationToken);
+
+        var dataElement = GetRequiredObject(document.RootElement, "data");
+        var addCommentElement = GetRequiredObject(dataElement, "addComment");
+        if (!addCommentElement.TryGetProperty("commentEdge", out var edgeElement) ||
+            edgeElement.ValueKind != JsonValueKind.Object ||
+            !edgeElement.TryGetProperty("node", out var commentNode) ||
+            commentNode.ValueKind != JsonValueKind.Object)
+        {
+            return null;
+        }
+
+        return GetOptionalString(commentNode, "url");
+    }
+
     public async Task<GitHubGraphQlExecutionResult> ExecuteGitHubGraphQlAsync(
         TrackerQuery query,
         string graphQlDocument,

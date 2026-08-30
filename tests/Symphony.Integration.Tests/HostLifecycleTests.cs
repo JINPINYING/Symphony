@@ -345,6 +345,25 @@ public sealed class HostLifecycleTests
         {
             return Task.FromResult(new GitHubGraphQlExecutionResult(true, "{\"data\":{}}"));
         }
+
+        public Task<IssueCommentMarkerSnapshot?> FetchIssueCommentMarkerAsync(
+            TrackerQuery query,
+            string issueId,
+            string marker,
+            CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult<IssueCommentMarkerSnapshot?>(
+                new IssueCommentMarkerSnapshot(issueId, "Open", null, MarkerFound: false));
+        }
+
+        public Task<string?> PostIssueCommentAsync(
+            TrackerQuery query,
+            string issueId,
+            string body,
+            CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult<string?>(null);
+        }
     }
 
     private sealed class CurrentDirectoryScope : IDisposable
