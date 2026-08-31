@@ -72,7 +72,12 @@ public sealed class WorkflowPromptRendererTests
                 ReadTimeoutMs: 5000,
                 StallTimeoutMs: 300_000),
             new WorkflowClaudeSettings("claude", 30_000, "bypassPermissions", null, 600_000),
-            new WorkflowMergePolicySettings(false, "squash", [], 50));
+            new WorkflowMergePolicySettings(false, "squash", [], 50),
+            new WorkflowEventLogRetentionSettings(
+                Enabled: false,
+                ProtocolRetentionDays: 3,
+                OperationalRetentionDays: 180,
+                MaxRows: 250_000));
 
         return new WorkflowDefinition(
             Config: new Dictionary<string, object?>(),
