@@ -303,8 +303,16 @@ function mountRoadmap() {
 function renderAttention() {
   const a = state.snapshot?.attention;
   if (!a) return "";
-  const tone = a.level === "down" ? "att-down" : a.level === "attention" ? "att-warn" : "att-clear";
-  const word = a.level === "down" ? "Needs you now" : a.level === "attention" ? "Needs you" : "All clear";
+
+  // Word first, colour second. The status has to be legible as text before any
+  // colour registers - colour alone is not a signal everyone can read.
+  const map = {
+    clear:     { tone: "att-clear", word: "All clear",  mark: "&#10003;" },
+    attention: { tone: "att-warn",  word: "Needs you",  mark: "!" },
+    down:      { tone: "att-down",  word: "Blocked",    mark: "&#10005;" }
+  };
+  const m = map[a.level] || map.clear;
+
   const items = (a.items || []).map(item => `
     <li class="att-item">
       <span class="att-sev ${item.severity === "down" ? "att-down" : "att-warn"}">${escapeHtml(item.severity === "down" ? "Blocking" : "Decide")}</span>
@@ -315,9 +323,9 @@ function renderAttention() {
     </li>`).join("");
 
   return `
-    <div class="attention ${tone}">
-      <div class="att-word">${escapeHtml(word)}</div>
-      <h2 class="att-headline">${escapeHtml(a.headline)}</h2>
+    <div class="attention ${m.tone}">
+      <div class="att-status"><span class="att-mark">${m.mark}</span><span class="att-word">${escapeHtml(m.word)}</span></div>
+      <h1 class="att-headline">${escapeHtml(a.headline)}</h1>
       <p class="att-detail">${escapeHtml(a.detail)}</p>
       ${items ? `<ul class="att-list">${items}</ul>` : ""}
     </div>`;
@@ -325,71 +333,29 @@ function renderAttention() {
 
 function renderHeroPanel() {
   const workflow = state.runtime?.workflow;
-  const summary = state.snapshot
-    ? `${formatNumber(state.snapshot.counts.running)} active, ${formatNumber(state.snapshot.counts.retrying)} retrying, ${formatNumber(state.snapshot.counts.tracked)} tracked`
-    : "Waiting for orchestration telemetry";
+  const counts = state.snapshot?.counts;
   const refreshLabel = state.refreshQueued ? "Queuing tick..." : state.loading ? "Syncing..." : "Refresh now";
 
+  // Everything here is metadata and controls. It used to carry a 5xl product
+  // name above the actual answer, which read as decoration outranking content.
   return `
-    <div class="panel-body px-6 py-6 sm:px-8 sm:py-8">
-      <div class="grid gap-8 lg:grid-cols-[minmax(0,1.25fr)_minmax(0,0.75fr)] lg:items-start">
-        <div>
-          <div class="section-kicker">Symphony Instance</div>
-          <div class="mt-3 flex flex-wrap items-center gap-3">
-            <h1 class="font-display text-4xl font-semibold tracking-tight text-white text-glow sm:text-5xl">Watchtower</h1>
-            <span class="status-chip ${getHealthTone()}">${escapeHtml(state.health?.label || (state.loading ? "Syncing" : "Unknown"))}</span>
-          </div>
-          <p class="mt-4 max-w-2xl text-base leading-7 text-slate-300 sm:text-lg">
-            The live view. Everything below the summary is detail you only need when something looks wrong.
-          </p>
-          <div class="mt-6 flex flex-wrap gap-3 text-sm text-slate-300">
-            <span class="glass-badge">${escapeHtml(`v${state.runtime?.application?.version || "unknown"}`)}</span>
-            <span class="glass-badge">${escapeHtml(state.runtime?.orchestration?.instanceId || "instance auto-id")}</span>
-            <span class="glass-badge">${escapeHtml(summary)}</span>
-            <span class="glass-badge">${escapeHtml(workflow?.sourcePath || "workflow unavailable")}</span>
-          </div>
-        </div>
-
-        <div class="panel rounded-[24px] border-white/12 bg-white/[0.045]">
-          <div class="panel-body p-5 sm:p-6">
-            <div class="flex items-start justify-between gap-4">
-              <div>
-                <div class="section-kicker">Current Pulse</div>
-                <p class="mt-3 font-display text-2xl font-semibold text-white">${escapeHtml(summary)}</p>
-              </div>
-              <button
-                type="button"
-                data-action="refresh"
-                class="inline-flex items-center rounded-full border border-cyan-300/25 bg-cyan-300/10 px-4 py-2 text-sm font-medium text-cyan-100 transition hover:border-cyan-200/40 hover:bg-cyan-300/15 disabled:cursor-not-allowed disabled:opacity-60"
-                ${state.loading ? "disabled" : ""}>
-                ${escapeHtml(refreshLabel)}
-              </button>
-            </div>
-
-            <div class="mt-6 grid gap-4 sm:grid-cols-2">
-              <div class="rounded-2xl border border-white/10 bg-slate-950/55 p-4">
-                <div class="text-xs uppercase tracking-[0.22em] text-slate-400">Workflow</div>
-                <div class="mt-2 text-sm text-slate-200">${escapeHtml(workflow?.tracker?.owner || "owner")}/${escapeHtml(workflow?.tracker?.repo || "repo")}</div>
-                <div class="mt-1 text-sm text-slate-400">Poll every ${formatDurationFromMilliseconds(workflow?.polling?.intervalMs || state.runtime?.runtimeDefaults?.polling?.intervalMs || 0)}</div>
-              </div>
-              <label class="flex cursor-pointer items-center justify-between rounded-2xl border border-white/10 bg-slate-950/55 p-4 text-sm text-slate-200">
-                <span>
-                  <span class="block text-xs uppercase tracking-[0.22em] text-slate-400">Auto refresh</span>
-                  <span class="mt-1 block text-sm text-slate-200">Refresh every 15 seconds</span>
-                </span>
-                <input id="auto-refresh" type="checkbox" class="h-5 w-5 rounded border-white/20 bg-slate-900 text-cyan-300 focus:ring-cyan-300/40">
-              </label>
-            </div>
-
-            <div class="mt-4 flex flex-wrap gap-3 text-xs text-slate-400">
-              <span>Updated ${escapeHtml(formatRelativeTime(state.snapshot?.generated_at || state.lastLoadedAt))}</span>
-              <span>Workflow loaded ${escapeHtml(formatRelativeTime(workflow?.loadedAtUtc))}</span>
-            </div>
-          </div>
-        </div>
+    <div class="metastrip">
+      <div class="ms-line">
+        <span class="ms-name">Watchtower</span>
+        <span class="status-chip ${getHealthTone()}">${escapeHtml(state.health?.label || (state.loading ? "Syncing" : "Unknown"))}</span>
+        <span class="ms-sep"></span>
+        <span class="ms-fact"><b>${escapeHtml(workflow?.tracker?.owner || "owner")}/${escapeHtml(workflow?.tracker?.repo || "repo")}</b></span>
+        <span class="ms-fact">${counts ? `${escapeHtml(formatNumber(counts.running))} active &middot; ${escapeHtml(formatNumber(counts.retrying))} retrying &middot; ${escapeHtml(formatNumber(counts.tracked))} tracked` : "waiting for telemetry"}</span>
+        <span class="ms-fact">polls every ${escapeHtml(formatDurationFromMilliseconds(workflow?.polling?.intervalMs || state.runtime?.runtimeDefaults?.polling?.intervalMs || 0))}</span>
+        <span class="ms-fact">updated ${escapeHtml(formatRelativeTime(state.snapshot?.generated_at || state.lastLoadedAt))}</span>
+      </div>
+      <div class="ms-controls">
+        <label class="ms-auto"><input id="auto-refresh" type="checkbox"><span>Auto refresh</span></label>
+        <button type="button" data-action="refresh" class="ms-refresh" ${state.loading ? "disabled" : ""}>${escapeHtml(refreshLabel)}</button>
       </div>
     </div>`;
 }
+
 
 function renderAlert() {
   if (!state.error) {
