@@ -411,6 +411,83 @@ public sealed class OrchestrationTickServiceTests
     }
 
     [Fact]
+    public async Task RunTickAsync_ShouldClearExecutionLabelsWhenTheMergeGateMerges()
+    {
+        // Regression: the merge gate merged the PR but nothing removed the
+        // execution label, so the issue still matched the candidate query and was
+        // re-dispatched on the next tick - burning a whole agent run on finished
+        // work before reconciliation cancelled it. Observed live on #97 at
+        // 2026-08-31T01:38Z, three minutes after its PR was merged.
+        var tracker = new FakeTrackerClient([]);
+        tracker.IssuesById["issue-1"] = BuildIssue("issue-1", "#1", "Open", null, pullRequests: []);
+        tracker.PullRequestStatusByNumber[5] = new PullRequestStatus(5, "OPEN", false, "aaa111", "SUCCESS", "MERGEABLE");
+        tracker.PullRequestFilesByNumber[5] = ["docs/notes.md"];
+
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1, mergePolicyEnabled: true, trackerLabels: ["symphony-ready"]),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success));
+
+        await SeedReadyLedgerAsync(harness, prNumber: 5, headSha: "aaa111");
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var merged = Assert.Single(tracker.MergedPullRequests);
+        Assert.Equal(5, merged.Number);
+        Assert.Equal("aaa111", merged.HeadSha);
+
+        var ledger = Assert.Single(await harness.DbContext.PhaseLedger.ToListAsync());
+        Assert.Equal(PhaseStages.Merged, ledger.Stage);
+
+        var removed = Assert.Contains("issue-1", tracker.RemovedLabelsByIssue);
+        Assert.Contains("symphony-ready", removed);
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldNotClearExecutionLabelsWhenTheMergeIsRefused()
+    {
+        // The label is the only thing keeping the issue eligible for a retry, so
+        // it must survive any path that does not actually merge.
+        var tracker = new FakeTrackerClient([]);
+        tracker.IssuesById["issue-1"] = BuildIssue("issue-1", "#1", "Open", null, pullRequests: []);
+        tracker.PullRequestStatusByNumber[5] = new PullRequestStatus(5, "OPEN", false, "aaa111", "SUCCESS", "MERGEABLE");
+        tracker.PullRequestFilesByNumber[5] = ["docs/notes.md"];
+        tracker.MergeRefusal = "head moved";
+
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1, mergePolicyEnabled: true, trackerLabels: ["symphony-ready"]),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success));
+
+        await SeedReadyLedgerAsync(harness, prNumber: 5, headSha: "aaa111");
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Empty(tracker.MergedPullRequests);
+        Assert.Empty(tracker.RemovedLabelsByIssue);
+    }
+
+    private static async Task SeedReadyLedgerAsync(TestHarness harness, int prNumber, string headSha)
+    {
+        harness.DbContext.PhaseLedger.Add(new PhaseLedgerEntity
+        {
+            IssueId = "issue-1",
+            IssueIdentifier = "#1",
+            Stage = PhaseStages.Ready,
+            PrNumber = prNumber,
+            HeadSha = headSha,
+            ImplementerRunner = "claude",
+            RepairCount = 0,
+            LastVerdict = ReviewVerdicts.Approved,
+            LastVerdictHeadSha = headSha,
+            CreatedAtUtc = DateTimeOffset.UtcNow,
+            UpdatedAtUtc = DateTimeOffset.UtcNow,
+        });
+
+        await harness.DbContext.SaveChangesAsync();
+    }
+
+    [Fact]
     public async Task RunTickAsync_ShouldNotSeedLedgerWhenNoOpenPullRequestExists()
     {
         var tracker = new FakeTrackerClient([]);
@@ -1547,7 +1624,8 @@ public sealed class OrchestrationTickServiceTests
         string apiKey = "test-token",
         bool includePullRequests = true,
         bool mergePolicyEnabled = false,
-        IReadOnlyList<string>? protectedPaths = null)
+        IReadOnlyList<string>? protectedPaths = null,
+        IReadOnlyList<string>? trackerLabels = null)
     {
         var runtime = new WorkflowRuntimeSettings(
             new WorkflowTrackerSettings(
@@ -1558,7 +1636,7 @@ public sealed class OrchestrationTickServiceTests
                 Repo: "symphony",
                 Milestone: null,
                 IncludePullRequests: includePullRequests,
-                Labels: [],
+                Labels: trackerLabels ?? [],
                 ActiveStates: activeStates ?? ["Open"],
                 TerminalStates: ["Closed"]),
             new WorkflowPollingSettings(600_000),
@@ -2088,6 +2166,24 @@ public sealed class OrchestrationTickServiceTests
         {
             return Task.FromResult<IReadOnlyList<string>>(
                 PullRequestFilesByNumber.TryGetValue(pullRequestNumber, out var files) ? [.. files] : []);
+        }
+
+        public Dictionary<string, List<string>> RemovedLabelsByIssue { get; } = [];
+
+        public Task RemoveIssueLabelsAsync(
+            TrackerQuery query,
+            string issueId,
+            IReadOnlyList<string> labelNames,
+            CancellationToken cancellationToken = default)
+        {
+            if (!RemovedLabelsByIssue.TryGetValue(issueId, out var removed))
+            {
+                removed = [];
+                RemovedLabelsByIssue[issueId] = removed;
+            }
+
+            removed.AddRange(labelNames);
+            return Task.CompletedTask;
         }
 
         public Task<string?> MergePullRequestAsync(

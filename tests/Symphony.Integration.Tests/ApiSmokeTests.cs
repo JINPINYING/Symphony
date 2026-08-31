@@ -1290,6 +1290,15 @@ public sealed class ApiSmokeTests
         {
             return Task.FromResult<string?>("merging is not supported by this fake");
         }
+
+        public Task RemoveIssueLabelsAsync(
+            TrackerQuery query,
+            string issueId,
+            IReadOnlyList<string> labelNames,
+            CancellationToken cancellationToken = default)
+        {
+            return Task.CompletedTask;
+        }
     }
 
     private static void TryDeleteFile(string path)

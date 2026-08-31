@@ -138,5 +138,8 @@ public sealed class AgentRunnerResolverTests
 
         public Task<string?> MergePullRequestAsync(TrackerQuery query, int pullRequestNumber, string expectedHeadSha, string method, CancellationToken cancellationToken = default)
             => Task.FromResult<string?>("merging is not supported by this fake");
+
+        public Task RemoveIssueLabelsAsync(TrackerQuery query, string issueId, IReadOnlyList<string> labelNames, CancellationToken cancellationToken = default)
+            => Task.CompletedTask;
     }
 }

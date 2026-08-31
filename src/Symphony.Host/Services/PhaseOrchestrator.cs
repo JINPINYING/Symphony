@@ -307,11 +307,22 @@ public sealed class PhaseOrchestrator(
             $"**MERGED** — PR #{ledger.PrNumber} merged at exact head `{pullRequest.HeadSha}` under the routine merge policy.\n\n" +
             $"Implementer: `{ledger.ImplementerRunner}` · reviewer: `{OtherVendor(ledger.ImplementerRunner)}` · " +
             $"repairs used: {ledger.RepairCount} · files changed: {changedPaths.Count} · gate: {gate.Reason}.\n\n" +
-            "The source issue is left open for the command center to close.",
+            "Execution labels have been removed, so this issue will not be dispatched again. " +
+            "It is left open for the command center to close.",
+            cancellationToken);
+
+        // Clear the execution label LAST, after the terminal comment is posted -
+        // the workflow contract requires that order. Until this ran, a merged
+        // issue still matched the candidate query and was re-dispatched on the
+        // next tick, burning a full agent run before reconciliation cancelled it.
+        await trackerClient.RemoveIssueLabelsAsync(
+            query,
+            ledger.IssueId,
+            workflowDefinition.Runtime.Tracker.Labels,
             cancellationToken);
 
         logger.LogInformation(
-            "Merged PR #{PrNumber} for {IssueIdentifier} under the routine merge policy.",
+            "Merged PR #{PrNumber} for {IssueIdentifier} under the routine merge policy and cleared its execution labels.",
             ledger.PrNumber,
             ledger.IssueIdentifier);
     }
