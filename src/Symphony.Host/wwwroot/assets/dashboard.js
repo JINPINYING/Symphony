@@ -398,14 +398,24 @@ function renderAttention() {
   };
   const m = map[a.level] || map.clear;
 
-  const items = (a.items || []).map(item => `
+  // An item that names a decision but makes the reader go and find it is only
+  // half an answer, so the label links straight to the thing when there is one.
+  // http(s) only: the URL arrives as data, and a javascript: label would be a
+  // scripting hole dressed up as a convenience.
+  const items = (a.items || []).map(item => {
+    const safeUrl = /^https?:\/\//i.test(item.url || "") ? item.url : null;
+    const label = escapeHtml(item.label);
+    return `
     <li class="att-item">
       <span class="att-sev ${item.severity === "down" ? "att-down" : "att-warn"}">${escapeHtml(item.severity === "down" ? "Blocking" : "Decide")}</span>
       <div>
-        <div class="att-item-label">${escapeHtml(item.label)}</div>
+        <div class="att-item-label">${safeUrl
+          ? `<a class="att-item-link" href="${escapeHtml(safeUrl)}" target="_blank" rel="noopener noreferrer">${label}</a>`
+          : label}</div>
         <div class="att-item-detail">${escapeHtml(item.detail)}</div>
       </div>
-    </li>`).join("");
+    </li>`;
+  }).join("");
 
   return `
     <div class="attention ${m.tone}">

@@ -1,4 +1,4 @@
-using Microsoft.AspNetCore.Builder;
+﻿using Microsoft.AspNetCore.Builder;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
@@ -412,6 +412,12 @@ public sealed class HostLifecycleTests
         {
             return Task.FromResult<IReadOnlyList<string>>([]);
         }
+
+        public Task<IReadOnlyList<OpenPullRequest>> FetchOpenPullRequestsAsync(TrackerQuery query, int limit, CancellationToken cancellationToken = default)
+            => Task.FromResult<IReadOnlyList<OpenPullRequest>>(OpenPullRequests);
+
+        public IReadOnlyList<OpenPullRequest> OpenPullRequests { get; set; } = [];
+
 
         public Task<string?> MergePullRequestAsync(
             TrackerQuery query,

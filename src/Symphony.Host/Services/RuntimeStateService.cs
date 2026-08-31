@@ -12,6 +12,26 @@ public sealed class RuntimeStateService(
     IWorkflowDefinitionProvider workflowDefinitionProvider,
     TimeProvider timeProvider)
 {
+    // A malformed or older snapshot must never take the page down. An empty list
+    // reads as "no pull requests are waiting", which is the safe wrong answer:
+    // the page understates rather than inventing something to act on.
+    private static IReadOnlyList<OpenPullRequest> ReadOpenPullRequests(string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            return [];
+        }
+
+        try
+        {
+            return JsonSerializer.Deserialize<List<OpenPullRequest>>(json) ?? [];
+        }
+        catch (JsonException)
+        {
+            return [];
+        }
+    }
+
     public Task<object> GetStateAsync(CancellationToken cancellationToken) =>
         GetStateAsync(includeRawEvents: false, cancellationToken);
 
@@ -73,12 +93,25 @@ public sealed class RuntimeStateService(
             .Where(run => run.Status == RunStatusNames.NeedsCommandCenter)
             .ToListAsync(cancellationToken);
         var phaseRows = await dbContext.PhaseLedger.AsNoTracking().ToListAsync(cancellationToken);
+
+        // Written by the orchestration tick rather than fetched here: the page is
+        // rendered on every poll, and a GitHub call in this path would make it
+        // slow or blank precisely when the owner is checking on things.
+        var openPullRequests = ReadOpenPullRequests((await dbContext.EventLog
+            .AsNoTracking()
+            .Where(entry => entry.EventName == OrchestrationTickService.OpenPullRequestsEventName && entry.DataJson != null)
+            .ToListAsync(cancellationToken))
+            .OrderByDescending(entry => entry.OccurredAtUtc)
+            .Select(entry => entry.DataJson)
+            .FirstOrDefault());
+
         var attention = OwnerAttentionSummary.Build(
             engineHealthy: true, // this code only runs when the engine is serving
             escalatedRuns: escalatedRuns,
             runningCount: runningRuns.Count,
             retryQueueCount: retryEntries.Count,
             phases: phaseRows,
+            openPullRequests: openPullRequests,
             lastEventAtUtc: recentActivity.Count > 0 ? recentActivity[0].At : null,
             now: generatedAt);
 
@@ -135,9 +168,21 @@ public sealed class RuntimeStateService(
                 {
                     label = item.Label,
                     detail = item.Detail,
-                    severity = item.Severity
+                    severity = item.Severity,
+                    url = item.Url
                 })
             },
+            open_pull_requests = openPullRequests.Select(pr => new
+            {
+                number = pr.Number,
+                title = pr.Title,
+                url = pr.Url,
+                author = pr.Author,
+                is_draft = pr.IsDraft,
+                checks_state = pr.ChecksState,
+                mergeable = pr.Mergeable,
+                updated_at = pr.UpdatedAtUtc == DateTimeOffset.MinValue ? null : pr.UpdatedAtUtc.ToString("o")
+            }),
             roadmap = RoadmapReader.Read(Directory.GetCurrentDirectory()).Select(entry => new
             {
                 status = entry.Status,

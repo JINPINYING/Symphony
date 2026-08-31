@@ -690,6 +690,98 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
         return null;
     }
 
+    private const string GraphQlOpenPullRequestsQuery = """
+        query($owner: String!, $repo: String!, $limit: Int!) {
+          repository(owner: $owner, name: $repo) {
+            pullRequests(states: OPEN, first: $limit, orderBy: { field: UPDATED_AT, direction: DESC }) {
+              nodes {
+                title
+                url
+                updatedAt
+                author { login }
+        """ + GraphQlPullRequestNodeFields + """
+
+              }
+            }
+          }
+        }
+        """;
+
+    public async Task<IReadOnlyList<OpenPullRequest>> FetchOpenPullRequestsAsync(
+        TrackerQuery query,
+        int limit,
+        CancellationToken cancellationToken = default)
+    {
+        // GitHub rejects first: 0 and caps a page at 100. Clamping here stops a
+        // misconfigured limit from turning the status page into an API error.
+        var pageSize = Math.Clamp(limit, 1, 100);
+        var endpoint = string.IsNullOrWhiteSpace(query.Endpoint) ? "https://api.github.com/graphql" : query.Endpoint;
+
+        using var request = BuildGraphQlRequest(
+            endpoint,
+            query.ApiKey,
+            GraphQlOpenPullRequestsQuery,
+            new
+            {
+                owner = query.Owner,
+                repo = query.Repo,
+                limit = pageSize
+            });
+
+        using var response = await SendAsync(request, cancellationToken);
+        using var document = await ParseGraphQlDocumentAsync(response, cancellationToken);
+
+        var dataElement = GetRequiredObject(document.RootElement, "data");
+        if (!dataElement.TryGetProperty("repository", out var repositoryNode) ||
+            repositoryNode.ValueKind != JsonValueKind.Object ||
+            !repositoryNode.TryGetProperty("pullRequests", out var listNode) ||
+            listNode.ValueKind != JsonValueKind.Object)
+        {
+            return [];
+        }
+
+        var results = new List<OpenPullRequest>();
+        foreach (var prNode in GetRequiredArray(listNode, "nodes").EnumerateArray())
+        {
+            if (prNode.ValueKind != JsonValueKind.Object)
+            {
+                continue;
+            }
+
+            // Reuse the shared parser for the fields the merge gate also reads, so
+            // the two views of a pull request cannot drift apart.
+            var status = ParsePullRequestNode(prNode);
+            if (status is null)
+            {
+                continue;
+            }
+
+            string? author = null;
+            if (prNode.TryGetProperty("author", out var authorNode) && authorNode.ValueKind == JsonValueKind.Object)
+            {
+                author = GetOptionalString(authorNode, "login");
+            }
+
+            var updatedAt = DateTimeOffset.MinValue;
+            if (DateTimeOffset.TryParse(GetOptionalString(prNode, "updatedAt"), out var parsedUpdatedAt))
+            {
+                updatedAt = parsedUpdatedAt.ToUniversalTime();
+            }
+
+            results.Add(new OpenPullRequest(
+                status.Number,
+                GetOptionalString(prNode, "title") ?? $"#{status.Number}",
+                GetOptionalString(prNode, "url") ?? string.Empty,
+                author,
+                status.IsDraft,
+                status.ChecksState,
+                status.Mergeable,
+                updatedAt));
+        }
+
+        return results;
+    }
+
     private const string GraphQlPullRequestFilesQuery = """
         query($owner: String!, $repo: String!, $number: Int!, $after: String) {
           repository(owner: $owner, name: $repo) {

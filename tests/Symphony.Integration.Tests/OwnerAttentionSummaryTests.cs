@@ -17,8 +17,12 @@ public sealed class OwnerAttentionSummaryTests
         int running = 0,
         int retrying = 0,
         IReadOnlyList<PhaseLedgerEntity>? phases = null,
+        IReadOnlyList<OpenPullRequest>? openPullRequests = null,
         DateTimeOffset? lastEvent = null) =>
-        OwnerAttentionSummary.Build(healthy, escalated ?? [], running, retrying, phases ?? [], lastEvent, Now);
+        OwnerAttentionSummary.Build(healthy, escalated ?? [], running, retrying, phases ?? [], openPullRequests ?? [], lastEvent, Now);
+
+    private static OpenPullRequest Pr(int number, string? checks, bool draft = false) =>
+        new(number, $"Change {number}", $"https://example.invalid/pull/{number}", "someone", draft, checks, "MERGEABLE", Now.AddHours(-6));
 
     private static RunEntity Escalated(string issue, bool posted) => new()
     {
@@ -28,6 +32,64 @@ public sealed class OwnerAttentionSummaryTests
         Status = RunStatusNames.NeedsCommandCenter,
         EscalationPostedAtUtc = posted ? Now.AddMinutes(-5) : null,
     };
+
+    // The bug this whole input exists to fix: every other signal here is the
+    // engine's own run state, so an empty queue read as "nothing needs you" while
+    // several green pull requests sat open waiting for a merge decision.
+    [Fact]
+    public void AGreenPullRequestIsNotAnIdlePlane()
+    {
+        var result = Build(openPullRequests: [Pr(105, "SUCCESS")], lastEvent: Now.AddHours(-3));
+
+        Assert.Equal(OwnerAttentionSummary.LevelAttention, result.Level);
+        Assert.Equal("One thing is waiting on you", result.Headline);
+        Assert.Contains(result.Items, i => i.Label == "PR #105 is waiting on you");
+    }
+
+    [Fact]
+    public void FailingChecksSaySo()
+    {
+        var result = Build(openPullRequests: [Pr(106, "FAILURE")]);
+
+        var item = Assert.Single(result.Items);
+        Assert.Equal("PR #106 has failing checks", item.Label);
+        Assert.Contains("CI is red", item.Detail);
+    }
+
+    [Fact]
+    public void DraftsAndPendingChecksAreNotWaitingOnAnyone()
+    {
+        // A draft is the author's to finish and a pending check resolves itself.
+        // Listing either is how a status page starts crying wolf.
+        var result = Build(openPullRequests:
+        [
+            Pr(1, "SUCCESS", draft: true),
+            Pr(2, "PENDING"),
+            Pr(3, "EXPECTED")
+        ]);
+
+        Assert.Equal(OwnerAttentionSummary.LevelClear, result.Level);
+        Assert.Empty(result.Items);
+    }
+
+    [Fact]
+    public void APullRequestWithNoChecksStillCounts()
+    {
+        // A repository without CI is not a repository without merge decisions.
+        var result = Build(openPullRequests: [Pr(21, null)]);
+
+        Assert.Contains(result.Items, i => i.Label == "PR #21 is waiting on you");
+    }
+
+    [Fact]
+    public void SeveralPullRequestsAreCountedIndividually()
+    {
+        var result = Build(openPullRequests: [Pr(106, "SUCCESS"), Pr(105, "SUCCESS")]);
+
+        Assert.Equal("2 things are waiting on you", result.Headline);
+        // Listed by number so the page does not reshuffle between polls.
+        Assert.Equal(["PR #105 is waiting on you", "PR #106 is waiting on you"], result.Items.Select(i => i.Label));
+    }
 
     [Fact]
     public void IdleIsClear_NotAProblem()

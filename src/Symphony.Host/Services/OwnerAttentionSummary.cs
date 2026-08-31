@@ -3,8 +3,12 @@ using Symphony.Infrastructure.Persistence.Sqlite.Entities;
 
 namespace Symphony.Host.Services;
 
-/// <summary>One thing the owner may need to act on.</summary>
-public sealed record AttentionItem(string Label, string Detail, string Severity);
+/// <summary>
+/// One thing the owner may need to act on. <paramref name="Url"/> is where to go
+/// and do it, when there is such a place - an item that names a decision but
+/// makes the reader hunt for it is only half an answer.
+/// </summary>
+public sealed record AttentionItem(string Label, string Detail, string Severity, string? Url = null);
 
 /// <summary>
 /// The answer to "does this need me?", computed by the engine rather than
@@ -33,6 +37,7 @@ public static class OwnerAttentionSummary
         int runningCount,
         int retryQueueCount,
         IReadOnlyList<PhaseLedgerEntity> phases,
+        IReadOnlyList<OpenPullRequest> openPullRequests,
         DateTimeOffset? lastEventAtUtc,
         DateTimeOffset now)
     {
@@ -65,6 +70,41 @@ public static class OwnerAttentionSummary
                 $"{phase.IssueIdentifier} stopped at the merge gate",
                 $"PR #{phase.PrNumber} was approved but not merged. The gate escalates rather than merging when a change touches a protected path.",
                 LevelAttention));
+        }
+
+        // An open pull request is the most common way work waits on a person, and
+        // for a long time this summary could not see one: every other input here
+        // is the engine's own run state, so a green PR nobody had merged read as
+        // an empty queue and the page said "nothing needs you".
+        //
+        // Draft and pending-CI PRs are deliberately excluded. A draft is the
+        // author's to finish and a pending check will resolve itself; listing
+        // either would make the page cry wolf, which is how a status page teaches
+        // its reader to stop looking.
+        foreach (var pr in openPullRequests.Where(pr => !pr.IsDraft).OrderBy(pr => pr.Number))
+        {
+            var checks = pr.ChecksState;
+            if (string.Equals(checks, "PENDING", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(checks, "EXPECTED", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var failing = string.Equals(checks, "FAILURE", StringComparison.OrdinalIgnoreCase) ||
+                          string.Equals(checks, "ERROR", StringComparison.OrdinalIgnoreCase);
+            var waited = pr.UpdatedAtUtc > DateTimeOffset.MinValue
+                ? $" Waiting {Humanise(now - pr.UpdatedAtUtc)}."
+                : string.Empty;
+
+            items.Add(new AttentionItem(
+                failing
+                    ? $"PR #{pr.Number} has failing checks"
+                    : $"PR #{pr.Number} is waiting on you",
+                failing
+                    ? $"{pr.Title} - CI is red, so the merge gate will not take it.{waited}"
+                    : $"{pr.Title} - open and not blocked by CI. Nothing will merge it without you.{waited}",
+                LevelAttention,
+                string.IsNullOrWhiteSpace(pr.Url) ? null : pr.Url));
         }
 
         if (retryQueueCount > 0)

@@ -1,4 +1,4 @@
-using Microsoft.EntityFrameworkCore;
+﻿using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
@@ -2195,6 +2195,12 @@ public sealed class OrchestrationTickServiceTests
             return Task.CompletedTask;
         }
 
+        public Task<IReadOnlyList<OpenPullRequest>> FetchOpenPullRequestsAsync(TrackerQuery query, int limit, CancellationToken cancellationToken = default)
+            => Task.FromResult<IReadOnlyList<OpenPullRequest>>(OpenPullRequests);
+
+        public IReadOnlyList<OpenPullRequest> OpenPullRequests { get; set; } = [];
+
+
         public Task<string?> MergePullRequestAsync(
             TrackerQuery query,
             int pullRequestNumber,
@@ -2300,7 +2306,7 @@ public sealed class OrchestrationTickServiceTests
             if (outcome == FakeDispatchOutcome.Success)
             {
                 // Mirrors IssueExecutionCoordinator: a successful bounded execution is
-                // terminal for the dispatch — no continuation retry, claim released.
+                // terminal for the dispatch â€” no continuation retry, claim released.
                 run.Status = RunStatusNames.Succeeded;
                 run.CurrentRetryAttempt = null;
                 run.CompletedAtUtc = nowUtc;
