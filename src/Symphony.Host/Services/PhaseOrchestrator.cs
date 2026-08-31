@@ -307,13 +307,42 @@ public sealed class PhaseOrchestrator(
             $"**MERGED** — PR #{ledger.PrNumber} merged at exact head `{pullRequest.HeadSha}` under the routine merge policy.\n\n" +
             $"Implementer: `{ledger.ImplementerRunner}` · reviewer: `{OtherVendor(ledger.ImplementerRunner)}` · " +
             $"repairs used: {ledger.RepairCount} · files changed: {changedPaths.Count} · gate: {gate.Reason}.\n\n" +
-            "The source issue is left open for the command center to close.",
+            "Execution labels have been removed, so this issue will not be dispatched again. " +
+            "It is left open for the command center to close.",
             cancellationToken);
 
-        logger.LogInformation(
-            "Merged PR #{PrNumber} for {IssueIdentifier} under the routine merge policy.",
-            ledger.PrNumber,
-            ledger.IssueIdentifier);
+        // Clear the execution label LAST, after the terminal comment is posted -
+        // the workflow contract requires that order. Until this ran, a merged
+        // issue still matched the candidate query and was re-dispatched on the
+        // next tick, burning a full agent run before reconciliation cancelled it.
+        //
+        // Failure here must not propagate. The merge has already happened and the
+        // stage is already Merged, so an exception would abort the tick without
+        // ever getting another chance at the label - trading a spent agent run for
+        // a failed tick and the same stale label. Log it loudly instead: the worst
+        // case is the original bug, on this one issue, visibly recorded.
+        try
+        {
+            await trackerClient.RemoveIssueLabelsAsync(
+                query,
+                ledger.IssueId,
+                workflowDefinition.Runtime.Tracker.Labels,
+                cancellationToken);
+
+            logger.LogInformation(
+                "Merged PR #{PrNumber} for {IssueIdentifier} under the routine merge policy and cleared its execution labels.",
+                ledger.PrNumber,
+                ledger.IssueIdentifier);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            logger.LogError(
+                ex,
+                "Merged PR #{PrNumber} for {IssueIdentifier}, but failed to clear its execution labels. "
+                + "The issue will be re-dispatched until the label is removed by hand.",
+                ledger.PrNumber,
+                ledger.IssueIdentifier);
+        }
     }
 
     private async Task HandleVerifyAsync(

@@ -840,6 +840,89 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
         }
     }
 
+    private const string GraphQlRepositoryLabelsQuery = """
+        query($owner: String!, $repo: String!) {
+          repository(owner: $owner, name: $repo) {
+            labels(first: 100) {
+              nodes { id name }
+            }
+          }
+        }
+        """;
+
+    private const string GraphQlRemoveLabelsMutation = """
+        mutation($labelableId: ID!, $labelIds: [ID!]!) {
+          removeLabelsFromLabelable(input: { labelableId: $labelableId, labelIds: $labelIds }) {
+            clientMutationId
+          }
+        }
+        """;
+
+    public async Task RemoveIssueLabelsAsync(
+        TrackerQuery query,
+        string issueId,
+        IReadOnlyList<string> labelNames,
+        CancellationToken cancellationToken = default)
+    {
+        if (labelNames.Count == 0)
+        {
+            return;
+        }
+
+        var endpoint = string.IsNullOrWhiteSpace(query.Endpoint) ? "https://api.github.com/graphql" : query.Endpoint;
+
+        // Resolve names to node ids. A name the repository does not define is
+        // simply absent from the result, which is the correct no-op.
+        var labelIds = new List<string>();
+        using (var labelsRequest = BuildGraphQlRequest(
+                   endpoint,
+                   query.ApiKey,
+                   GraphQlRepositoryLabelsQuery,
+                   new { owner = query.Owner, repo = query.Repo }))
+        using (var labelsResponse = await SendAsync(labelsRequest, cancellationToken))
+        using (var labelsDocument = await ParseGraphQlDocumentAsync(labelsResponse, cancellationToken))
+        {
+            var dataElement = GetRequiredObject(labelsDocument.RootElement, "data");
+            if (!dataElement.TryGetProperty("repository", out var repositoryNode) ||
+                repositoryNode.ValueKind != JsonValueKind.Object ||
+                !repositoryNode.TryGetProperty("labels", out var labelsNode) ||
+                labelsNode.ValueKind != JsonValueKind.Object)
+            {
+                return;
+            }
+
+            foreach (var labelNode in GetRequiredArray(labelsNode, "nodes").EnumerateArray())
+            {
+                var name = GetOptionalString(labelNode, "name");
+                var id = GetOptionalString(labelNode, "id");
+                if (name is null || id is null)
+                {
+                    continue;
+                }
+
+                if (labelNames.Any(candidate => string.Equals(candidate, name, StringComparison.OrdinalIgnoreCase)))
+                {
+                    labelIds.Add(id);
+                }
+            }
+        }
+
+        if (labelIds.Count == 0)
+        {
+            return;
+        }
+
+        using var request = BuildGraphQlRequest(
+            endpoint,
+            query.ApiKey,
+            GraphQlRemoveLabelsMutation,
+            new { labelableId = issueId, labelIds });
+
+        using var response = await SendAsync(request, cancellationToken);
+        using var document = await ParseGraphQlDocumentAsync(response, cancellationToken);
+        GetRequiredObject(document.RootElement, "data");
+    }
+
     private static PullRequestStatus? ParsePullRequestNode(JsonElement prNode)
     {
         var headSha = GetOptionalString(prNode, "headRefOid");

@@ -80,4 +80,13 @@ public interface ITrackerClient
         string expectedHeadSha,
         string method,
         CancellationToken cancellationToken = default);
+
+    // Removes execution labels from an issue. Called once work reaches a terminal
+    // state so the issue stops matching the candidate query; without it a merged
+    // issue stays eligible and is re-dispatched forever.
+    Task RemoveIssueLabelsAsync(
+        TrackerQuery query,
+        string issueId,
+        IReadOnlyList<string> labelNames,
+        CancellationToken cancellationToken = default);
 }
