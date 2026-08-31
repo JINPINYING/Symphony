@@ -21,6 +21,7 @@ public static class PhaseStages
     public const string Reviewing = "reviewing";
     public const string WaitForRepair = "wait_for_repair";
     public const string Ready = "ready";
+    public const string Merged = "merged";
     public const string Escalated = "escalated";
     public const string Closed = "closed";
 }
@@ -167,7 +168,7 @@ public sealed class PhaseOrchestrator(
         CancellationToken cancellationToken)
     {
         var activeLedgers = await dbContext.PhaseLedger
-            .Where(entry => entry.Stage != PhaseStages.Ready &&
+            .Where(entry => entry.Stage != PhaseStages.Merged &&
                             entry.Stage != PhaseStages.Escalated &&
                             entry.Stage != PhaseStages.Closed)
             .ToListAsync(cancellationToken);
@@ -234,7 +235,85 @@ public sealed class PhaseOrchestrator(
             case PhaseStages.WaitForRepair:
                 await HandleWaitForRepairAsync(ledger, pullRequest, cancellationToken);
                 break;
+            case PhaseStages.Ready:
+                await HandleReadyAsync(workflowDefinition, query, ledger, pullRequest, cancellationToken);
+                break;
         }
+    }
+
+    // M6: an approved PR does not sit waiting for a human. The policy gate is
+    // evaluated in code and, if every condition holds, the merge happens on the
+    // next tick — seconds after approval rather than at the next commander slot.
+    private async Task HandleReadyAsync(
+        WorkflowDefinition workflowDefinition,
+        TrackerQuery query,
+        PhaseLedgerEntity ledger,
+        PullRequestStatus pullRequest,
+        CancellationToken cancellationToken)
+    {
+        var policy = workflowDefinition.Runtime.MergePolicy;
+        if (!policy.Enabled)
+        {
+            return; // Ready and waiting for a human; nothing to do, nothing to say.
+        }
+
+        if (!string.Equals(ledger.LastVerdictHeadSha, pullRequest.HeadSha, StringComparison.OrdinalIgnoreCase))
+        {
+            // The branch moved after approval: re-verify and review the new head.
+            ledger.Stage = PhaseStages.AwaitingVerify;
+            ledger.UpdatedAtUtc = timeProvider.GetUtcNow();
+            AddPhaseEvent(ledger.IssueId, ledger.IssueIdentifier, "phase_head_moved_after_approval",
+                $"PR #{ledger.PrNumber} moved past the approved head; re-verifying before it can merge.");
+            await dbContext.SaveChangesAsync(cancellationToken);
+            return;
+        }
+
+        var changedPaths = await trackerClient.FetchPullRequestFilesAsync(query, ledger.PrNumber, cancellationToken);
+        var gate = MergePolicyGate.Evaluate(policy, ledger, pullRequest, changedPaths);
+        if (!gate.Allowed)
+        {
+            if (gate.Escalate)
+            {
+                await EscalateAsync(ledger, $"Merge gate refused PR #{ledger.PrNumber}: {gate.Reason}.", cancellationToken);
+            }
+
+            return;
+        }
+
+        var refusal = await trackerClient.MergePullRequestAsync(
+            query,
+            ledger.PrNumber,
+            pullRequest.HeadSha,
+            policy.Method,
+            cancellationToken);
+
+        if (refusal is not null)
+        {
+            // GitHub refused (expected-head mismatch, branch protection, ...).
+            // Blueprint: treat any refusal as an escalation, never a retry loop.
+            await EscalateAsync(ledger, $"GitHub refused the merge of PR #{ledger.PrNumber}: {refusal}", cancellationToken);
+            return;
+        }
+
+        ledger.Stage = PhaseStages.Merged;
+        ledger.UpdatedAtUtc = timeProvider.GetUtcNow();
+        AddPhaseEvent(ledger.IssueId, ledger.IssueIdentifier, "phase_merged",
+            $"PR #{ledger.PrNumber} merged autonomously at head {Short(pullRequest.HeadSha)} ({gate.Reason}).");
+        await dbContext.SaveChangesAsync(cancellationToken);
+
+        await trackerClient.PostIssueCommentAsync(
+            query,
+            ledger.IssueId,
+            $"**MERGED** — PR #{ledger.PrNumber} merged at exact head `{pullRequest.HeadSha}` under the routine merge policy.\n\n" +
+            $"Implementer: `{ledger.ImplementerRunner}` · reviewer: `{OtherVendor(ledger.ImplementerRunner)}` · " +
+            $"repairs used: {ledger.RepairCount} · files changed: {changedPaths.Count} · gate: {gate.Reason}.\n\n" +
+            "The source issue is left open for the command center to close.",
+            cancellationToken);
+
+        logger.LogInformation(
+            "Merged PR #{PrNumber} for {IssueIdentifier} under the routine merge policy.",
+            ledger.PrNumber,
+            ledger.IssueIdentifier);
     }
 
     private async Task HandleVerifyAsync(

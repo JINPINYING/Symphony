@@ -78,7 +78,7 @@ public sealed partial class OrchestrationTickService
         // first live review dispatch.
         var phaseOwnedIssueIds = new HashSet<string>(
             await dbContext.PhaseLedger
-                .Where(entry => entry.Stage != PhaseStages.Ready &&
+                .Where(entry => entry.Stage != PhaseStages.Merged &&
                                 entry.Stage != PhaseStages.Escalated &&
                                 entry.Stage != PhaseStages.Closed)
                 .Select(entry => entry.IssueId)

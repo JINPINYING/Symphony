@@ -85,7 +85,8 @@ public sealed class AgentRunnerResolverTests
             new WorkflowWorkspaceSettings("./workspaces", "./workspaces/repo", "./workspaces/worktrees", "main", null),
             new WorkflowHooksSettings(null, null, null, null, 60_000),
             new WorkflowCodexSettings("codex app-server", 30_000, "never", "danger-full-access", "danger-full-access", 5_000, 300_000),
-            new WorkflowClaudeSettings("claude", 1_800_000, "acceptEdits", "claude-sonnet-5", 480_000));
+            new WorkflowClaudeSettings("claude", 1_800_000, "acceptEdits", "claude-sonnet-5", 480_000),
+            new WorkflowMergePolicySettings(false, "squash", [], 50));
 
         return new WorkflowDefinition(new Dictionary<string, object?>(), "Prompt", runtime, "WORKFLOW.md", DateTimeOffset.UtcNow);
     }
@@ -131,5 +132,11 @@ public sealed class AgentRunnerResolverTests
 
         public Task<PullRequestStatus?> FetchOpenPullRequestByHeadBranchAsync(TrackerQuery query, string headRefName, CancellationToken cancellationToken = default)
             => Task.FromResult<PullRequestStatus?>(null);
+
+        public Task<IReadOnlyList<string>> FetchPullRequestFilesAsync(TrackerQuery query, int pullRequestNumber, CancellationToken cancellationToken = default)
+            => Task.FromResult<IReadOnlyList<string>>([]);
+
+        public Task<string?> MergePullRequestAsync(TrackerQuery query, int pullRequestNumber, string expectedHeadSha, string method, CancellationToken cancellationToken = default)
+            => Task.FromResult<string?>("merging is not supported by this fake");
     }
 }

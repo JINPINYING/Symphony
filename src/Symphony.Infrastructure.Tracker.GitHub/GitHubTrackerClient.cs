@@ -690,6 +690,156 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
         return null;
     }
 
+    private const string GraphQlPullRequestFilesQuery = """
+        query($owner: String!, $repo: String!, $number: Int!, $after: String) {
+          repository(owner: $owner, name: $repo) {
+            pullRequest(number: $number) {
+              files(first: 100, after: $after) {
+                pageInfo { hasNextPage endCursor }
+                nodes { path }
+              }
+            }
+          }
+        }
+        """;
+
+    private const string GraphQlMergePullRequestMutation = """
+        mutation($pullRequestId: ID!, $expectedHeadOid: GitObjectID!, $method: PullRequestMergeMethod!) {
+          mergePullRequest(input: { pullRequestId: $pullRequestId, expectedHeadOid: $expectedHeadOid, mergeMethod: $method }) {
+            pullRequest { number state merged }
+          }
+        }
+        """;
+
+    private const string GraphQlPullRequestIdQuery = """
+        query($owner: String!, $repo: String!, $number: Int!) {
+          repository(owner: $owner, name: $repo) {
+            pullRequest(number: $number) { id }
+          }
+        }
+        """;
+
+    public async Task<IReadOnlyList<string>> FetchPullRequestFilesAsync(
+        TrackerQuery query,
+        int pullRequestNumber,
+        CancellationToken cancellationToken = default)
+    {
+        var endpoint = string.IsNullOrWhiteSpace(query.Endpoint) ? "https://api.github.com/graphql" : query.Endpoint;
+        var paths = new List<string>();
+        string? after = null;
+        var pages = 0;
+
+        while (true)
+        {
+            using var request = BuildGraphQlRequest(
+                endpoint,
+                query.ApiKey,
+                GraphQlPullRequestFilesQuery,
+                new { owner = query.Owner, repo = query.Repo, number = pullRequestNumber, after });
+
+            using var response = await SendAsync(request, cancellationToken);
+            using var document = await ParseGraphQlDocumentAsync(response, cancellationToken);
+
+            var dataElement = GetRequiredObject(document.RootElement, "data");
+            if (!dataElement.TryGetProperty("repository", out var repositoryNode) ||
+                repositoryNode.ValueKind != JsonValueKind.Object ||
+                !repositoryNode.TryGetProperty("pullRequest", out var prNode) ||
+                prNode.ValueKind != JsonValueKind.Object ||
+                !prNode.TryGetProperty("files", out var filesNode) ||
+                filesNode.ValueKind != JsonValueKind.Object)
+            {
+                return paths;
+            }
+
+            foreach (var fileNode in GetRequiredArray(filesNode, "nodes").EnumerateArray())
+            {
+                var path = GetOptionalString(fileNode, "path");
+                if (!string.IsNullOrWhiteSpace(path))
+                {
+                    paths.Add(path);
+                }
+            }
+
+            var pageInfo = GetRequiredObject(filesNode, "pageInfo");
+            pages++;
+            if (!GetRequiredBoolean(pageInfo, "hasNextPage") || pages >= 20)
+            {
+                return paths;
+            }
+
+            after = GetOptionalString(pageInfo, "endCursor");
+            if (string.IsNullOrWhiteSpace(after))
+            {
+                return paths;
+            }
+        }
+    }
+
+    public async Task<string?> MergePullRequestAsync(
+        TrackerQuery query,
+        int pullRequestNumber,
+        string expectedHeadSha,
+        string method,
+        CancellationToken cancellationToken = default)
+    {
+        var endpoint = string.IsNullOrWhiteSpace(query.Endpoint) ? "https://api.github.com/graphql" : query.Endpoint;
+
+        string? pullRequestId;
+        using (var idRequest = BuildGraphQlRequest(
+                   endpoint,
+                   query.ApiKey,
+                   GraphQlPullRequestIdQuery,
+                   new { owner = query.Owner, repo = query.Repo, number = pullRequestNumber }))
+        using (var idResponse = await SendAsync(idRequest, cancellationToken))
+        using (var idDocument = await ParseGraphQlDocumentAsync(idResponse, cancellationToken))
+        {
+            var dataElement = GetRequiredObject(idDocument.RootElement, "data");
+            if (!dataElement.TryGetProperty("repository", out var repositoryNode) ||
+                repositoryNode.ValueKind != JsonValueKind.Object ||
+                !repositoryNode.TryGetProperty("pullRequest", out var prNode) ||
+                prNode.ValueKind != JsonValueKind.Object)
+            {
+                return "pull request could not be resolved";
+            }
+
+            pullRequestId = GetOptionalString(prNode, "id");
+        }
+
+        if (string.IsNullOrWhiteSpace(pullRequestId))
+        {
+            return "pull request id was missing";
+        }
+
+        var graphQlMethod = method.ToUpperInvariant() switch
+        {
+            "MERGE" => "MERGE",
+            "REBASE" => "REBASE",
+            _ => "SQUASH"
+        };
+
+        try
+        {
+            using var request = BuildGraphQlRequest(
+                endpoint,
+                query.ApiKey,
+                GraphQlMergePullRequestMutation,
+                new { pullRequestId, expectedHeadOid = expectedHeadSha, method = graphQlMethod });
+
+            using var response = await SendAsync(request, cancellationToken);
+            using var document = await ParseGraphQlDocumentAsync(response, cancellationToken);
+
+            var dataElement = GetRequiredObject(document.RootElement, "data");
+            GetRequiredObject(dataElement, "mergePullRequest");
+            return null;
+        }
+        catch (GitHubTrackerException ex)
+        {
+            // Includes the expected-head mismatch refusal, branch protection, and
+            // any other server-side veto. The caller escalates rather than retries.
+            return ex.Message;
+        }
+    }
+
     private static PullRequestStatus? ParsePullRequestNode(JsonElement prNode)
     {
         var headSha = GetOptionalString(prNode, "headRefOid");

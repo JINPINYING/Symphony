@@ -84,7 +84,8 @@ public sealed class StartupAttemptGuardTests
             new WorkflowWorkspaceSettings("./workspaces", "./workspaces/repo", "./workspaces/worktrees", "main", null),
             new WorkflowHooksSettings(null, null, null, null, 60_000),
             new WorkflowCodexSettings("codex app-server", 30_000, "never", "danger-full-access", "danger-full-access", 5_000, stallTimeoutMs),
-            new WorkflowClaudeSettings("claude", 30_000, "bypassPermissions", null, 600_000));
+            new WorkflowClaudeSettings("claude", 30_000, "bypassPermissions", null, 600_000),
+            new WorkflowMergePolicySettings(false, "squash", [], 50));
 
         return new WorkflowDefinition(
             new Dictionary<string, object?>(),

@@ -404,6 +404,24 @@ public sealed class HostLifecycleTests
         {
             return Task.FromResult<PullRequestStatus?>(null);
         }
+
+        public Task<IReadOnlyList<string>> FetchPullRequestFilesAsync(
+            TrackerQuery query,
+            int pullRequestNumber,
+            CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult<IReadOnlyList<string>>([]);
+        }
+
+        public Task<string?> MergePullRequestAsync(
+            TrackerQuery query,
+            int pullRequestNumber,
+            string expectedHeadSha,
+            string method,
+            CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult<string?>("merging is not supported by this fake");
+        }
     }
 
     private sealed class CurrentDirectoryScope : IDisposable
