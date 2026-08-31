@@ -417,12 +417,22 @@ function renderAttention() {
     </li>`;
   }).join("");
 
+  // Work an agent did outside the queue. The counts above only ever described
+  // dispatched runs, so without this the page can be busy and look asleep.
+  const activity = (state.snapshot?.agent_activity || []).slice(0, 4).map(report => `
+    <li class="agent-row">
+      <span class="agent-when">${report.live ? "Now" : "Earlier"}</span>
+      <span class="agent-actor">${escapeHtml(report.actor || "agent")}</span>
+      <span class="agent-summary">${escapeHtml(report.summary || "")}</span>
+    </li>`).join("");
+
   return `
     <div class="attention ${m.tone}">
       <div class="att-status"><span class="att-mark">${m.mark}</span><span class="att-word">${escapeHtml(m.word)}</span></div>
       <h1 class="att-headline">${escapeHtml(a.headline)}</h1>
       <p class="att-detail">${escapeHtml(a.detail)}</p>
       ${items ? `<ul class="att-list">${items}</ul>` : ""}
+      ${activity ? `<div class="agent-strip"><div class="agent-kicker">Agent activity</div><ul class="agent-list">${activity}</ul></div>` : ""}
     </div>`;
 }
 

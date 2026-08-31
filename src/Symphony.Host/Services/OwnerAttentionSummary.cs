@@ -38,6 +38,7 @@ public static class OwnerAttentionSummary
         int retryQueueCount,
         IReadOnlyList<PhaseLedgerEntity> phases,
         IReadOnlyList<OpenPullRequest> openPullRequests,
+        IReadOnlyList<AgentActivityReport> agentActivity,
         DateTimeOffset? lastEventAtUtc,
         DateTimeOffset now)
     {
@@ -115,6 +116,14 @@ public static class OwnerAttentionSummary
                 LevelAttention));
         }
 
+        // The newest report still inside the live window, if any. Stale reports
+        // are ignored rather than trusted: a session that died without saying
+        // goodbye must not leave the page claiming work is underway forever.
+        var liveAgent = agentActivity
+            .Where(report => now - report.AtUtc <= AgentActivity.LiveWindow)
+            .OrderByDescending(report => report.AtUtc)
+            .FirstOrDefault();
+
         var level = items.Any(i => i.Severity == LevelDown) ? LevelDown
                   : items.Count > 0 ? LevelAttention
                   : LevelClear;
@@ -136,6 +145,14 @@ public static class OwnerAttentionSummary
         {
             headline = runningCount == 1 ? "Working on one issue" : $"Working on {runningCount} issues";
             detail = "Nothing needs you. Progress appears below as each phase completes.";
+        }
+        else if (liveAgent is not null)
+        {
+            // An empty queue is not an idle project. Work done by an agent outside
+            // the queue used to render as "the plane is idle", which was the page
+            // being confidently wrong about the only thing it is asked.
+            headline = $"{liveAgent.Actor} is working";
+            detail = $"{liveAgent.Summary} Not a queued run, so it does not appear in the counts above. Reported {Humanise(now - liveAgent.AtUtc)} ago.";
         }
         else
         {

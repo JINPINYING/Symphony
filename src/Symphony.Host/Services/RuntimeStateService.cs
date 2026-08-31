@@ -15,6 +15,23 @@ public sealed class RuntimeStateService(
     // A malformed or older snapshot must never take the page down. An empty list
     // reads as "no pull requests are waiting", which is the safe wrong answer:
     // the page understates rather than inventing something to act on.
+    private static AgentActivityReport? ReadAgentActivity(string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            return null;
+        }
+
+        try
+        {
+            return JsonSerializer.Deserialize<AgentActivityReport>(json);
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
     private static IReadOnlyList<OpenPullRequest> ReadOpenPullRequests(string? json)
     {
         if (string.IsNullOrWhiteSpace(json))
@@ -105,6 +122,19 @@ public sealed class RuntimeStateService(
             .Select(entry => entry.DataJson)
             .FirstOrDefault());
 
+        // Agents that are not runs, reporting what they are doing. Without this the
+        // page reports the queue and calls it the project.
+        var agentActivity = (await dbContext.EventLog
+            .AsNoTracking()
+            .Where(entry => entry.EventName == AgentActivity.EventName && entry.DataJson != null)
+            .ToListAsync(cancellationToken))
+            .OrderByDescending(entry => entry.OccurredAtUtc)
+            .Take(8)
+            .Select(entry => ReadAgentActivity(entry.DataJson))
+            .Where(report => report is not null)
+            .Select(report => report!)
+            .ToList();
+
         var attention = OwnerAttentionSummary.Build(
             engineHealthy: true, // this code only runs when the engine is serving
             escalatedRuns: escalatedRuns,
@@ -112,6 +142,7 @@ public sealed class RuntimeStateService(
             retryQueueCount: retryEntries.Count,
             phases: phaseRows,
             openPullRequests: openPullRequests,
+            agentActivity: agentActivity,
             lastEventAtUtc: recentActivity.Count > 0 ? recentActivity[0].At : null,
             now: generatedAt);
 
@@ -172,6 +203,15 @@ public sealed class RuntimeStateService(
                     url = item.Url
                 })
             },
+            agent_activity = agentActivity.Select(report => new
+            {
+                actor = report.Actor,
+                summary = report.Summary,
+                detail = report.Detail,
+                url = report.Url,
+                at = report.AtUtc.ToString("o"),
+                live = generatedAt - report.AtUtc <= AgentActivity.LiveWindow
+            }),
             open_pull_requests = openPullRequests.Select(pr => new
             {
                 number = pr.Number,
