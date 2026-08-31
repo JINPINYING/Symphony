@@ -64,4 +64,20 @@ public interface ITrackerClient
         TrackerQuery query,
         string headRefName,
         CancellationToken cancellationToken = default);
+
+    // Paths changed by the pull request, for the merge policy gate.
+    Task<IReadOnlyList<string>> FetchPullRequestFilesAsync(
+        TrackerQuery query,
+        int pullRequestNumber,
+        CancellationToken cancellationToken = default);
+
+    // Merges the pull request at an EXACT head. The expected head is sent to
+    // GitHub so the merge is refused server-side if the branch moved after the
+    // policy gate evaluated it. Returns null on success, or a refusal reason.
+    Task<string?> MergePullRequestAsync(
+        TrackerQuery query,
+        int pullRequestNumber,
+        string expectedHeadSha,
+        string method,
+        CancellationToken cancellationToken = default);
 }

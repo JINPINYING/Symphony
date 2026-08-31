@@ -16,3 +16,5 @@ public sealed class RuntimeDefaultsTests
         Assert.Contains("Closed", options.Tracker.TerminalStates);
     }
 }
+
+// build-stamp: sac-1788138095

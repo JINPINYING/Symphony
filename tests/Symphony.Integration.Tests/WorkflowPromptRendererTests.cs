@@ -71,7 +71,8 @@ public sealed class WorkflowPromptRendererTests
                 TurnSandboxPolicy: "danger-full-access",
                 ReadTimeoutMs: 5000,
                 StallTimeoutMs: 300_000),
-            new WorkflowClaudeSettings("claude", 30_000, "bypassPermissions", null, 600_000));
+            new WorkflowClaudeSettings("claude", 30_000, "bypassPermissions", null, 600_000),
+            new WorkflowMergePolicySettings(false, "squash", [], 50));
 
         return new WorkflowDefinition(
             Config: new Dictionary<string, object?>(),

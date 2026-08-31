@@ -283,6 +283,25 @@ public sealed class WorkflowLoader
         // Claude thinks longer between visible stream events than the Codex
         // app-server; the default stall window is deliberately wider.
         var claudeStallTimeoutMs = GetOptionalInt(claudeMap, "stall_timeout_ms", 600_000);
+
+        var mergeMap = GetOptionalMap(config, "merge_policy");
+        var mergeEnabled = GetOptionalBool(mergeMap, "enabled", false);
+        var mergeMethod = (GetOptionalStringFromOptionalMap(mergeMap, "method") ?? "squash").Trim().ToLowerInvariant();
+        if (mergeMethod is not ("squash" or "merge" or "rebase"))
+        {
+            throw new WorkflowLoadException(
+                "invalid_merge_policy_method",
+                "merge_policy.method must be one of: squash, merge, rebase.");
+        }
+
+        var protectedPaths = GetStringList(mergeMap, "protected_paths");
+        var maxChangedFiles = GetOptionalInt(mergeMap, "max_changed_files", 50);
+        if (maxChangedFiles <= 0)
+        {
+            throw new WorkflowLoadException(
+                "invalid_merge_policy_max_changed_files",
+                "merge_policy.max_changed_files must be > 0.");
+        }
         if (claudeStallTimeoutMs <= 0)
         {
             throw new WorkflowLoadException("invalid_claude_stall_timeout", "claude.stall_timeout_ms must be > 0.");
@@ -334,7 +353,59 @@ public sealed class WorkflowLoader
                 claudeTurnTimeoutMs,
                 claudePermissionMode,
                 claudeModel,
-                claudeStallTimeoutMs));
+                claudeStallTimeoutMs),
+            new WorkflowMergePolicySettings(
+                mergeEnabled,
+                mergeMethod,
+                protectedPaths,
+                maxChangedFiles));
+    }
+
+    private static bool GetOptionalBool(Dictionary<string, object?>? source, string key, bool defaultValue)
+    {
+        if (source is null || !source.TryGetValue(key, out var raw) || raw is null)
+        {
+            return defaultValue;
+        }
+
+        if (raw is bool parsed)
+        {
+            return parsed;
+        }
+
+        var text = raw as string;
+        if (bool.TryParse(text, out var parsedText))
+        {
+            return parsedText;
+        }
+
+        throw new WorkflowLoadException("workflow_parse_error", $"'{key}' must be a boolean.");
+    }
+
+    private static List<string> GetStringList(Dictionary<string, object?>? source, string key)
+    {
+        if (source is null || !source.TryGetValue(key, out var raw) || raw is null)
+        {
+            return [];
+        }
+
+        if (raw is string single)
+        {
+            return single
+                .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .ToList();
+        }
+
+        if (raw is List<object?> list)
+        {
+            return list
+                .Select(item => item as string)
+                .Where(item => !string.IsNullOrWhiteSpace(item))
+                .Select(item => item!.Trim())
+                .ToList();
+        }
+
+        throw new WorkflowLoadException("workflow_parse_error", $"'{key}' must be a list of strings.");
     }
 
     private static Dictionary<string, string> GetRunnerByLabelMap(Dictionary<string, object?>? source, string key)

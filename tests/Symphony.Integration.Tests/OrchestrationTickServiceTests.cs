@@ -1545,7 +1545,9 @@ public sealed class OrchestrationTickServiceTests
         IReadOnlyList<string>? activeStates = null,
         IReadOnlyDictionary<string, int>? maxConcurrentByState = null,
         string apiKey = "test-token",
-        bool includePullRequests = true)
+        bool includePullRequests = true,
+        bool mergePolicyEnabled = false,
+        IReadOnlyList<string>? protectedPaths = null)
     {
         var runtime = new WorkflowRuntimeSettings(
             new WorkflowTrackerSettings(
@@ -1571,7 +1573,12 @@ public sealed class OrchestrationTickServiceTests
             new WorkflowWorkspaceSettings("./workspaces", "./workspaces/repo", "./workspaces/worktrees", "main", null),
             new WorkflowHooksSettings(null, null, null, null, 60_000),
             new WorkflowCodexSettings("codex app-server", 30_000, "never", "danger-full-access", "danger-full-access", 5_000, 300_000),
-            new WorkflowClaudeSettings("claude", 30_000, "bypassPermissions", null, 600_000));
+            new WorkflowClaudeSettings("claude", 30_000, "bypassPermissions", null, 600_000),
+            new WorkflowMergePolicySettings(
+                Enabled: mergePolicyEnabled,
+                Method: "squash",
+                ProtectedPaths: protectedPaths ?? ["**/*.csproj", ".github/**"],
+                MaxChangedFiles: 50));
 
         return new WorkflowDefinition(new Dictionary<string, object?>(), "Prompt body", runtime, "WORKFLOW.md", DateTimeOffset.UtcNow);
     }
@@ -2069,6 +2076,40 @@ public sealed class OrchestrationTickServiceTests
 
         public Dictionary<string, int> OpenPullRequestNumberByHeadBranch { get; } =
             new(StringComparer.OrdinalIgnoreCase);
+
+        public Dictionary<int, List<string>> PullRequestFilesByNumber { get; } = [];
+        public List<(int Number, string HeadSha, string Method)> MergedPullRequests { get; } = [];
+        public string? MergeRefusal { get; set; }
+
+        public Task<IReadOnlyList<string>> FetchPullRequestFilesAsync(
+            TrackerQuery query,
+            int pullRequestNumber,
+            CancellationToken cancellationToken = default)
+        {
+            return Task.FromResult<IReadOnlyList<string>>(
+                PullRequestFilesByNumber.TryGetValue(pullRequestNumber, out var files) ? [.. files] : []);
+        }
+
+        public Task<string?> MergePullRequestAsync(
+            TrackerQuery query,
+            int pullRequestNumber,
+            string expectedHeadSha,
+            string method,
+            CancellationToken cancellationToken = default)
+        {
+            if (MergeRefusal is not null)
+            {
+                return Task.FromResult<string?>(MergeRefusal);
+            }
+
+            MergedPullRequests.Add((pullRequestNumber, expectedHeadSha, method));
+            if (PullRequestStatusByNumber.TryGetValue(pullRequestNumber, out var status))
+            {
+                PullRequestStatusByNumber[pullRequestNumber] = status with { State = "MERGED" };
+            }
+
+            return Task.FromResult<string?>(null);
+        }
 
         public Task<PullRequestStatus?> FetchOpenPullRequestByHeadBranchAsync(
             TrackerQuery query,

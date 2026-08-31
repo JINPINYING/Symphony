@@ -8,7 +8,8 @@ public sealed record WorkflowRuntimeSettings(
     WorkflowWorkspaceSettings Workspace,
     WorkflowHooksSettings Hooks,
     WorkflowCodexSettings Codex,
-    WorkflowClaudeSettings Claude);
+    WorkflowClaudeSettings Claude,
+    WorkflowMergePolicySettings MergePolicy);
 
 public sealed record WorkflowTrackerSettings(
     string Kind,
@@ -69,3 +70,13 @@ public sealed record WorkflowClaudeSettings(
     string PermissionMode,
     string? Model,
     int StallTimeoutMs);
+
+// M6: the policy gate for autonomous merges (blueprint decision 8, tier 1).
+// Enabled must be opted into explicitly. A pull request touching any protected
+// path is never merged autonomously — it escalates to the command center, which
+// is the conservative stand-in until dual-vendor review (tier 2) exists.
+public sealed record WorkflowMergePolicySettings(
+    bool Enabled,
+    string Method,
+    IReadOnlyList<string> ProtectedPaths,
+    int MaxChangedFiles);
