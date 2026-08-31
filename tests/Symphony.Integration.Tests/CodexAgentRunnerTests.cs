@@ -17,6 +17,17 @@ public sealed class CodexAgentRunnerTests
     // fake server is genuinely wedged.
     private const int AppServerHarnessReadTimeoutMs = 120_000;
 
+    // The per-turn timeout these tests pass to the runner. It was 30s, which is
+    // the same cliff the read timeout above was already raised past: CI run
+    // 33358165256 failed ShouldFailWhenTurnRequestsUserInput with response_timeout
+    // because a slow Windows runner took longer than 30s to reach the user-input
+    // event, so the turn timed out before the behaviour under test could happen.
+    //
+    // No test in this file asserts timeout behaviour - each one asserts some other
+    // outcome and the timeout is incidental - so a generous value only slows a run
+    // that is already going to fail.
+    private const int TurnTimeoutMs = 120_000;
+
     [Fact]
     public async Task RunIssueAsync_ShouldUsePropertyParameterNamesForValidationErrors()
     {
@@ -303,7 +314,7 @@ public sealed class CodexAgentRunnerTests
                 "#5",
                 harness.WorkspacePath,
                 harness.Command,
-                30_000,
+                TurnTimeoutMs,
                 maxTurns: 3,
                 trackerQuery: CreateTrackerQuery()));
 
@@ -331,7 +342,7 @@ public sealed class CodexAgentRunnerTests
                 "#6",
                 harness.WorkspacePath,
                 harness.Command,
-                30_000,
+                TurnTimeoutMs,
                 maxTurns: 1,
                 trackerQuery: CreateTrackerQuery()),
             (update, _) =>
@@ -371,7 +382,7 @@ public sealed class CodexAgentRunnerTests
                 "#6b",
                 harness.WorkspacePath,
                 harness.Command,
-                30_000,
+                TurnTimeoutMs,
                 maxTurns: 1,
                 trackerQuery: CreateTrackerQuery()),
             (update, _) =>
@@ -402,7 +413,7 @@ public sealed class CodexAgentRunnerTests
                 "#7",
                 harness.WorkspacePath,
                 harness.Command,
-                30_000,
+                TurnTimeoutMs,
                 trackerQuery: CreateTrackerQuery()));
 
         Assert.False(result.Success);
@@ -426,7 +437,7 @@ public sealed class CodexAgentRunnerTests
                 "#8",
                 harness.WorkspacePath,
                 harness.Command,
-                30_000,
+                TurnTimeoutMs,
                 trackerQuery: CreateTrackerQuery()));
 
         Assert.True(result.Success, result.Stderr);
