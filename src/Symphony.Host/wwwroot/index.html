@@ -4,8 +4,39 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#041319">
-  <title>Symphony Control Room</title>
+  <title>Symphony Watchtower</title>
   <link rel="stylesheet" href="/assets/dashboard.css">
+<style>
+/* Owner attention block - the first thing on the page, and the only thing most
+   visits need to read. Semantic colour is paired with a word in every state. */
+.attention{border-radius:20px;padding:22px 24px;margin-bottom:18px;border:1px solid;display:flex;flex-direction:column;gap:8px}
+.attention.att-clear{border-color:rgba(94,234,190,.35);background:rgba(16,84,68,.28)}
+.attention.att-warn{border-color:rgba(240,180,88,.4);background:rgba(92,64,16,.3)}
+.attention.att-down{border-color:rgba(240,140,140,.45);background:rgba(96,28,28,.32)}
+.att-word{font-family:ui-monospace,Consolas,monospace;font-size:11px;font-weight:700;letter-spacing:.16em;text-transform:uppercase;opacity:.9}
+.attention.att-clear .att-word{color:#7ee0c0}
+.attention.att-warn .att-word{color:#f2c274}
+.attention.att-down .att-word{color:#f5a3a3}
+.att-headline{font-size:26px;line-height:1.2;font-weight:700;letter-spacing:-.02em;margin:0;color:#fff;text-wrap:balance}
+.att-detail{margin:0;font-size:15px;line-height:1.6;color:rgba(226,232,240,.82);max-width:70ch}
+.att-list{list-style:none;margin:10px 0 0;padding:0;display:flex;flex-direction:column;gap:8px}
+.att-item{display:flex;gap:12px;align-items:flex-start;background:rgba(255,255,255,.05);border-radius:12px;padding:11px 13px}
+.att-sev{font-family:ui-monospace,Consolas,monospace;font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;padding:3px 7px;border-radius:5px;white-space:nowrap;margin-top:2px}
+.att-sev.att-warn{color:#f2c274;background:rgba(240,180,88,.14)}
+.att-sev.att-down{color:#f5a3a3;background:rgba(240,140,140,.16)}
+.att-item-label{font-weight:600;color:#fff;font-size:15px}
+.att-item-detail{font-size:13.5px;color:rgba(226,232,240,.72);margin-top:2px}
+.rm-list{list-style:none;margin:18px 0 0;padding:0;display:flex;flex-direction:column;gap:2px}
+.rm-row{display:flex;gap:12px;align-items:baseline;padding:8px 0;border-top:1px solid rgba(255,255,255,.07);font-size:14.5px;color:rgba(226,232,240,.85)}
+.rm-row:first-child{border-top:0}
+.rm-status{font-family:ui-monospace,Consolas,monospace;font-size:10px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;padding:2px 7px;border-radius:4px;min-width:62px;text-align:center;white-space:nowrap}
+.rm-done .rm-status{color:#7ee0c0;background:rgba(94,234,190,.13)}
+.rm-active .rm-status{color:#f2c274;background:rgba(240,180,88,.15)}
+.rm-planned .rm-status{color:rgba(148,163,184,.9);background:rgba(148,163,184,.12)}
+.rm-ms{font-family:ui-monospace,Consolas,monospace;font-size:12px;font-weight:600;color:#fff;min-width:34px}
+.rm-title{flex:1;min-width:0}
+.rm-done .rm-title{color:rgba(226,232,240,.62)}
+</style>
 </head>
 <body>
   <div class="pointer-events-none fixed inset-0 overflow-hidden">
@@ -45,7 +76,7 @@
 
   <noscript>
     <div class="mx-auto max-w-3xl px-4 py-10 text-sm text-slate-200">
-      Symphony Control Room requires JavaScript to render live runtime state.
+      Symphony Watchtower requires JavaScript to render live runtime state.
     </div>
   </noscript>
 

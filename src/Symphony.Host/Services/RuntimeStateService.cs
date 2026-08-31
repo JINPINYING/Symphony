@@ -64,9 +64,43 @@ public sealed class RuntimeStateService(
             .Where(attempt => attempt.Status == RunStatusNames.Running && attempt.CompletedAtUtc is null)
             .Sum(attempt => Math.Max((generatedAt - attempt.StartedAtUtc).TotalSeconds, 0d));
 
+        // The owner-facing answer to "does this need me?", computed here so the
+        // live page and the published copy say the same thing.
+        var escalatedRuns = await dbContext.Runs
+            .AsNoTracking()
+            .Where(run => run.Status == RunStatusNames.NeedsCommandCenter)
+            .ToListAsync(cancellationToken);
+        var phaseRows = await dbContext.PhaseLedger.AsNoTracking().ToListAsync(cancellationToken);
+        var attention = OwnerAttentionSummary.Build(
+            engineHealthy: true, // this code only runs when the engine is serving
+            escalatedRuns: escalatedRuns,
+            runningCount: runningRuns.Count,
+            retryQueueCount: retryEntries.Count,
+            phases: phaseRows,
+            lastEventAtUtc: recentActivity.Count > 0 ? recentActivity[0].At : null,
+            now: generatedAt);
+
         return new
         {
             generated_at = generatedAt,
+            attention = new
+            {
+                level = attention.Level,
+                headline = attention.Headline,
+                detail = attention.Detail,
+                items = attention.Items.Select(item => new
+                {
+                    label = item.Label,
+                    detail = item.Detail,
+                    severity = item.Severity
+                })
+            },
+            roadmap = RoadmapReader.Read(Directory.GetCurrentDirectory()).Select(entry => new
+            {
+                status = entry.Status,
+                milestone = entry.Milestone,
+                title = entry.Title
+            }),
             counts = new
             {
                 running = runningRuns.Count,

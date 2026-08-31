@@ -203,7 +203,7 @@ async function selectIssue(issueIdentifier, updateHash = true) {
 
 function render() {
   updateDocumentTitle();
-  elements.heroPanel.innerHTML = renderHeroPanel();
+  elements.heroPanel.innerHTML = renderAttention() + renderHeroPanel();
   elements.alert.innerHTML = renderAlert();
   renderWorkflowEditorSection();
   elements.metricGrid.innerHTML = renderMetricCards();
@@ -211,6 +211,7 @@ function render() {
   elements.issueDistribution.innerHTML = renderIssueDistribution();
   elements.activityFeed.innerHTML = renderActivityFeed();
   elements.trackedIssues.innerHTML = renderTrackedIssues();
+  mountRoadmap();
   elements.issueDetail.innerHTML = renderIssueDetail();
   elements.instanceStatus.innerHTML = renderInstanceStatus();
   elements.rateLimits.innerHTML = renderRateLimits();
@@ -249,6 +250,79 @@ function renderWorkflowEditorSection(force = false) {
   syncWorkflowEditorChrome();
 }
 
+// The owner's half of the page: "does this need me?", answered before any detail.
+// The engine computes this (OwnerAttentionSummary) so the live page and the
+// published copy cannot disagree. Every state carries a WORD as well as a
+// colour - colour alone is not an accessible signal.
+// Project narrative, read from config/ROADMAP.md rather than hard-coded here,
+// so it cannot drift from reality without someone editing the file.
+function renderRoadmap() {
+  const items = state.snapshot?.roadmap || [];
+  if (!items.length) return "";
+  const rows = items.map(entry => {
+    const word = entry.status === "done" ? "Done" : entry.status === "active" ? "Now" : "Planned";
+    return `
+      <li class="rm-row rm-${escapeHtml(entry.status)}">
+        <span class="rm-status">${escapeHtml(word)}</span>
+        ${entry.milestone ? `<span class="rm-ms">${escapeHtml(entry.milestone)}</span>` : ""}
+        <span class="rm-title">${escapeHtml(entry.title)}</span>
+      </li>`;
+  }).join("");
+  const done = items.filter(e => e.status === "done").length;
+  return `
+    <div class="panel-body p-6">
+      <div class="flex items-center justify-between gap-4">
+        <div>
+          <div class="section-kicker">Roadmap</div>
+          <h2 class="section-title">Where this is going</h2>
+        </div>
+        <span class="glass-badge">${escapeHtml(String(done))} of ${escapeHtml(String(items.length))} done</span>
+      </div>
+      <ul class="rm-list">${rows}</ul>
+    </div>`;
+}
+
+
+// The roadmap panel has no slot in the original markup, so it is appended once
+// after the tracked-issues panel and re-rendered in place thereafter.
+function mountRoadmap() {
+  const html = renderRoadmap();
+  if (!html) return;
+  let host = document.getElementById("roadmap-panel");
+  if (!host) {
+    const anchorPanel = elements.trackedIssues?.closest(".panel") || elements.trackedIssues;
+    if (!anchorPanel || !anchorPanel.parentNode) return;
+    host = document.createElement("section");
+    host.id = "roadmap-panel";
+    host.className = anchorPanel.className;
+    anchorPanel.parentNode.insertBefore(host, anchorPanel.nextSibling);
+  }
+  host.innerHTML = html;
+}
+
+function renderAttention() {
+  const a = state.snapshot?.attention;
+  if (!a) return "";
+  const tone = a.level === "down" ? "att-down" : a.level === "attention" ? "att-warn" : "att-clear";
+  const word = a.level === "down" ? "Needs you now" : a.level === "attention" ? "Needs you" : "All clear";
+  const items = (a.items || []).map(item => `
+    <li class="att-item">
+      <span class="att-sev ${item.severity === "down" ? "att-down" : "att-warn"}">${escapeHtml(item.severity === "down" ? "Blocking" : "Decide")}</span>
+      <div>
+        <div class="att-item-label">${escapeHtml(item.label)}</div>
+        <div class="att-item-detail">${escapeHtml(item.detail)}</div>
+      </div>
+    </li>`).join("");
+
+  return `
+    <div class="attention ${tone}">
+      <div class="att-word">${escapeHtml(word)}</div>
+      <h2 class="att-headline">${escapeHtml(a.headline)}</h2>
+      <p class="att-detail">${escapeHtml(a.detail)}</p>
+      ${items ? `<ul class="att-list">${items}</ul>` : ""}
+    </div>`;
+}
+
 function renderHeroPanel() {
   const workflow = state.runtime?.workflow;
   const summary = state.snapshot
@@ -262,11 +336,11 @@ function renderHeroPanel() {
         <div>
           <div class="section-kicker">Symphony Instance</div>
           <div class="mt-3 flex flex-wrap items-center gap-3">
-            <h1 class="font-display text-4xl font-semibold tracking-tight text-white text-glow sm:text-5xl">Control Room</h1>
+            <h1 class="font-display text-4xl font-semibold tracking-tight text-white text-glow sm:text-5xl">Watchtower</h1>
             <span class="status-chip ${getHealthTone()}">${escapeHtml(state.health?.label || (state.loading ? "Syncing" : "Unknown"))}</span>
           </div>
           <p class="mt-4 max-w-2xl text-base leading-7 text-slate-300 sm:text-lg">
-            Live orchestration visibility across health, workload, activity, leases, and Codex spend for the current Symphony host.
+            The live view. Everything below the summary is detail you only need when something looks wrong.
           </p>
           <div class="mt-6 flex flex-wrap gap-3 text-sm text-slate-300">
             <span class="glass-badge">${escapeHtml(`v${state.runtime?.application?.version || "unknown"}`)}</span>
