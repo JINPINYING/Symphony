@@ -1656,7 +1656,12 @@ public sealed class OrchestrationTickServiceTests
                 Enabled: mergePolicyEnabled,
                 Method: "squash",
                 ProtectedPaths: protectedPaths ?? ["**/*.csproj", ".github/**"],
-                MaxChangedFiles: 50));
+                MaxChangedFiles: 50),
+            new WorkflowEventLogRetentionSettings(
+                Enabled: false,
+                ProtocolRetentionDays: 3,
+                OperationalRetentionDays: 180,
+                MaxRows: 250_000));
 
         return new WorkflowDefinition(new Dictionary<string, object?>(), "Prompt body", runtime, "WORKFLOW.md", DateTimeOffset.UtcNow);
     }
@@ -1752,6 +1757,10 @@ public sealed class OrchestrationTickServiceTests
                     tracker,
                     TimeProvider.System,
                     NullLogger<PhaseOrchestrator>.Instance),
+                new EventLogRetentionService(
+                    dbContext,
+                    clock,
+                    NullLogger<EventLogRetentionService>.Instance),
                 Options.Create(new OrchestrationOptions
                 {
                     InstanceId = "instance-1",

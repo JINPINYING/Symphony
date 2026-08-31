@@ -137,6 +137,7 @@ internal static class SymphonyHostApplication
         services.AddScoped<EscalationPublisher>();
         services.AddScoped<DirectiveProcessor>();
         services.AddScoped<PhaseOrchestrator>();
+        services.AddScoped<EventLogRetentionService>();
         services.AddScoped<OrchestrationTickService>();
         services.AddScoped<RuntimeStateService>();
 

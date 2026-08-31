@@ -86,7 +86,12 @@ public sealed class AgentRunnerResolverTests
             new WorkflowHooksSettings(null, null, null, null, 60_000),
             new WorkflowCodexSettings("codex app-server", 30_000, "never", "danger-full-access", "danger-full-access", 5_000, 300_000),
             new WorkflowClaudeSettings("claude", 1_800_000, "acceptEdits", "claude-sonnet-5", 480_000),
-            new WorkflowMergePolicySettings(false, "squash", [], 50));
+            new WorkflowMergePolicySettings(false, "squash", [], 50),
+            new WorkflowEventLogRetentionSettings(
+                Enabled: false,
+                ProtocolRetentionDays: 3,
+                OperationalRetentionDays: 180,
+                MaxRows: 250_000));
 
         return new WorkflowDefinition(new Dictionary<string, object?>(), "Prompt", runtime, "WORKFLOW.md", DateTimeOffset.UtcNow);
     }

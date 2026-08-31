@@ -21,9 +21,15 @@ public sealed partial class OrchestrationTickService
     private readonly EscalationPublisher escalationPublisher;
     private readonly DirectiveProcessor directiveProcessor;
     private readonly PhaseOrchestrator phaseOrchestrator;
+    private readonly EventLogRetentionService eventLogRetentionService;
     private readonly OrchestrationOptions orchestrationOptions;
     private readonly TimeProvider timeProvider;
     private readonly ILogger<OrchestrationTickService> logger;
+
+    // Pruning is hourly, not per tick: the tick runs every 15 seconds and the
+    // event log does not need attention that often. In-memory is fine - a
+    // restart simply prunes once on the first tick, which is harmless.
+    private DateTimeOffset nextEventLogPruneUtc = DateTimeOffset.MinValue;
 
     public OrchestrationTickService(
         IWorkflowDefinitionProvider workflowDefinitionProvider,
@@ -35,6 +41,7 @@ public sealed partial class OrchestrationTickService
         EscalationPublisher escalationPublisher,
         DirectiveProcessor directiveProcessor,
         PhaseOrchestrator phaseOrchestrator,
+        EventLogRetentionService eventLogRetentionService,
         IOptions<OrchestrationOptions> orchestrationOptions,
         TimeProvider timeProvider,
         ILogger<OrchestrationTickService> logger)
@@ -48,6 +55,7 @@ public sealed partial class OrchestrationTickService
         this.escalationPublisher = escalationPublisher;
         this.directiveProcessor = directiveProcessor;
         this.phaseOrchestrator = phaseOrchestrator;
+        this.eventLogRetentionService = eventLogRetentionService;
         this.orchestrationOptions = orchestrationOptions.Value;
         this.timeProvider = timeProvider;
         this.logger = logger;
@@ -136,6 +144,7 @@ public sealed partial class OrchestrationTickService
             await RecoverOrphanedStateAsync(instanceId, workflowDefinition, cancellationToken);
             await ReconcileStartupAttemptsAsync(workflowDefinition, instanceId, cancellationToken);
             await ReconcileRunningIssuesAsync(workflowDefinition, apiKey, preflightError, instanceId, cancellationToken);
+            await PruneEventLogIfDueAsync(workflowDefinition, cancellationToken);
             if (preflightError is null && !string.IsNullOrWhiteSpace(apiKey))
             {
                 await RefreshTrackedIssueCacheStatesAsync(workflowDefinition, apiKey, instanceId, cancellationToken);
@@ -205,4 +214,29 @@ public sealed partial class OrchestrationTickService
     }
 
     private TimeSpan ResolveLeaseTtl() => TimeSpan.FromSeconds(orchestrationOptions.LeaseTtlSeconds);
+
+    private async Task PruneEventLogIfDueAsync(
+        WorkflowDefinition workflowDefinition,
+        CancellationToken cancellationToken)
+    {
+        var now = timeProvider.GetUtcNow();
+        if (now < nextEventLogPruneUtc)
+        {
+            return;
+        }
+
+        nextEventLogPruneUtc = now.AddHours(1);
+
+        try
+        {
+            await eventLogRetentionService.PruneAsync(
+                workflowDefinition.Runtime.EventLogRetention,
+                cancellationToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Housekeeping must never take the tick down. It retries next hour.
+            logger.LogError(ex, "Event log pruning failed; the tick continues.");
+        }
+    }
 }

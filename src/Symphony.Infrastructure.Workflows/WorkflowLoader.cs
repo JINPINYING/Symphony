@@ -307,6 +307,37 @@ public sealed class WorkflowLoader
             throw new WorkflowLoadException("invalid_claude_stall_timeout", "claude.stall_timeout_ms must be > 0.");
         }
 
+        var retentionMap = GetOptionalMap(config, "event_log_retention");
+        var retentionEnabled = GetOptionalBool(retentionMap, "enabled", false);
+        var protocolRetentionDays = GetOptionalInt(retentionMap, "protocol_event_days", 3);
+        var operationalRetentionDays = GetOptionalInt(retentionMap, "operational_event_days", 180);
+        var retentionMaxRows = GetOptionalInt(retentionMap, "max_rows", 250_000);
+        if (retentionEnabled)
+        {
+            if (protocolRetentionDays <= 0)
+            {
+                throw new WorkflowLoadException(
+                    "invalid_event_log_retention_protocol_days",
+                    "event_log_retention.protocol_event_days must be > 0.");
+            }
+
+            // Guards against a config that would silently delete the durable audit
+            // record sooner than the streaming noise it was meant to clear.
+            if (operationalRetentionDays < protocolRetentionDays)
+            {
+                throw new WorkflowLoadException(
+                    "invalid_event_log_retention_operational_days",
+                    "event_log_retention.operational_event_days must be >= protocol_event_days.");
+            }
+
+            if (retentionMaxRows <= 0)
+            {
+                throw new WorkflowLoadException(
+                    "invalid_event_log_retention_max_rows",
+                    "event_log_retention.max_rows must be > 0.");
+            }
+        }
+
         return new WorkflowRuntimeSettings(
             new WorkflowTrackerSettings(
                 kind.ToLowerInvariant(),
@@ -358,7 +389,12 @@ public sealed class WorkflowLoader
                 mergeEnabled,
                 mergeMethod,
                 protectedPaths,
-                maxChangedFiles));
+                maxChangedFiles),
+            new WorkflowEventLogRetentionSettings(
+                retentionEnabled,
+                protocolRetentionDays,
+                operationalRetentionDays,
+                retentionMaxRows));
     }
 
     private static bool GetOptionalBool(Dictionary<string, object?>? source, string key, bool defaultValue)

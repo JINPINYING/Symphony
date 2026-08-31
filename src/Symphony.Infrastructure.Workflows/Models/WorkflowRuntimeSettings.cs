@@ -9,7 +9,8 @@ public sealed record WorkflowRuntimeSettings(
     WorkflowHooksSettings Hooks,
     WorkflowCodexSettings Codex,
     WorkflowClaudeSettings Claude,
-    WorkflowMergePolicySettings MergePolicy);
+    WorkflowMergePolicySettings MergePolicy,
+    WorkflowEventLogRetentionSettings EventLogRetention);
 
 public sealed record WorkflowTrackerSettings(
     string Kind,
@@ -75,6 +76,17 @@ public sealed record WorkflowClaudeSettings(
 // Enabled must be opted into explicitly. A pull request touching any protected
 // path is never merged autonomously — it escalates to the command center, which
 // is the conservative stand-in until dual-vendor review (tier 2) exists.
+// ADCP #4 follow-up: the event log grows without bound. ~96% of rows are agent
+// streaming deltas that stop being useful within hours, while the operational
+// events - dispatches, phase changes, verdicts, merges - are the durable record
+// and are kept far longer. Retention is therefore split by what the row IS, not
+// just by age.
+public sealed record WorkflowEventLogRetentionSettings(
+    bool Enabled,
+    int ProtocolRetentionDays,
+    int OperationalRetentionDays,
+    int MaxRows);
+
 public sealed record WorkflowMergePolicySettings(
     bool Enabled,
     string Method,
