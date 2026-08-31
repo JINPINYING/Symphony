@@ -203,7 +203,7 @@ async function selectIssue(issueIdentifier, updateHash = true) {
 
 function render() {
   updateDocumentTitle();
-  elements.heroPanel.innerHTML = renderAttention() + renderHeroPanel();
+  elements.heroPanel.innerHTML = renderAttention() + renderHeroPanel() + wrapPanel(renderStaff());
   elements.alert.innerHTML = renderAlert();
   renderWorkflowEditorSection();
   elements.metricGrid.innerHTML = renderMetricCards();
@@ -256,6 +256,57 @@ function renderWorkflowEditorSection(force = false) {
 // colour - colour alone is not an accessible signal.
 // Project narrative, read from config/ROADMAP.md rather than hard-coded here,
 // so it cannot drift from reality without someone editing the file.
+// The workforce view: who is working, on what, for how long. This is the
+// question an operator opens a dashboard to ask, so it sits directly under the
+// summary and above every diagnostic.
+function renderStaff() {
+  const staff = state.snapshot?.staff || [];
+  if (!staff.length) return "";
+
+  const rows = staff.map(m => {
+    const working = m.state === "working";
+    const facts = [];
+    if (working) {
+      if (m.elapsed_seconds != null) facts.push(`${formatDurationFromMilliseconds(m.elapsed_seconds * 1000)} elapsed`);
+      if (m.turn_count != null) facts.push(`${formatNumber(m.turn_count)} turn${m.turn_count === 1 ? "" : "s"}`);
+      if (m.total_tokens) facts.push(`${formatNumber(m.total_tokens)} tokens`);
+    } else if (m.elapsed_seconds != null) {
+      facts.push(`${formatDurationFromMilliseconds(m.elapsed_seconds * 1000)} ago`);
+    }
+
+    return `
+      <li class="staff-row ${working ? "staff-working" : "staff-idle"}">
+        <span class="staff-state">${working ? "Working" : "Idle"}</span>
+        <div class="staff-main">
+          <div class="staff-name">${escapeHtml(m.runner)}</div>
+          <div class="staff-activity">${escapeHtml(m.activity)}</div>
+          ${m.last_message ? `<div class="staff-msg">${escapeHtml(m.last_message)}</div>` : ""}
+        </div>
+        <div class="staff-facts">${facts.map(f => `<span>${escapeHtml(f)}</span>`).join("")}</div>
+      </li>`;
+  }).join("");
+
+  const busy = staff.filter(m => m.state === "working").length;
+  return `
+    <div class="panel-body p-6">
+      <div class="flex items-center justify-between gap-4">
+        <div>
+          <div class="section-kicker">Right now</div>
+          <h2 class="section-title">What the team is doing</h2>
+        </div>
+        <span class="glass-badge">${escapeHtml(busy ? `${busy} of ${staff.length} working` : "all idle")}</span>
+      </div>
+      <ul class="staff-list">${rows}</ul>
+    </div>`;
+}
+
+
+// The staff panel has no slot in the original markup, so it is wrapped in the
+// same shell the other panels use rather than styled separately.
+function wrapPanel(inner) {
+  return inner ? `<section class="panel mt-4">${inner}</section>` : "";
+}
+
 function renderRoadmap() {
   const items = state.snapshot?.roadmap || [];
   if (!items.length) return "";
