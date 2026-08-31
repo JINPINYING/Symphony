@@ -315,16 +315,34 @@ public sealed class PhaseOrchestrator(
         // the workflow contract requires that order. Until this ran, a merged
         // issue still matched the candidate query and was re-dispatched on the
         // next tick, burning a full agent run before reconciliation cancelled it.
-        await trackerClient.RemoveIssueLabelsAsync(
-            query,
-            ledger.IssueId,
-            workflowDefinition.Runtime.Tracker.Labels,
-            cancellationToken);
+        //
+        // Failure here must not propagate. The merge has already happened and the
+        // stage is already Merged, so an exception would abort the tick without
+        // ever getting another chance at the label - trading a spent agent run for
+        // a failed tick and the same stale label. Log it loudly instead: the worst
+        // case is the original bug, on this one issue, visibly recorded.
+        try
+        {
+            await trackerClient.RemoveIssueLabelsAsync(
+                query,
+                ledger.IssueId,
+                workflowDefinition.Runtime.Tracker.Labels,
+                cancellationToken);
 
-        logger.LogInformation(
-            "Merged PR #{PrNumber} for {IssueIdentifier} under the routine merge policy and cleared its execution labels.",
-            ledger.PrNumber,
-            ledger.IssueIdentifier);
+            logger.LogInformation(
+                "Merged PR #{PrNumber} for {IssueIdentifier} under the routine merge policy and cleared its execution labels.",
+                ledger.PrNumber,
+                ledger.IssueIdentifier);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            logger.LogError(
+                ex,
+                "Merged PR #{PrNumber} for {IssueIdentifier}, but failed to clear its execution labels. "
+                + "The issue will be re-dispatched until the label is removed by hand.",
+                ledger.PrNumber,
+                ledger.IssueIdentifier);
+        }
     }
 
     private async Task HandleVerifyAsync(
