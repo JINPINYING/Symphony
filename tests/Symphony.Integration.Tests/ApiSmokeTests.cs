@@ -324,7 +324,7 @@ public sealed class ApiSmokeTests
             Assert.Equal(HttpStatusCode.OK, statusCode);
             Assert.NotNull(content);
             var htmlContent = content!;
-            Assert.Contains("Symphony Control Room", htmlContent, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("Symphony Watchtower", htmlContent, StringComparison.OrdinalIgnoreCase);
             Assert.Contains("dashboard-shell", htmlContent, StringComparison.OrdinalIgnoreCase);
             Assert.Contains("dashboard-rail", htmlContent, StringComparison.OrdinalIgnoreCase);
             Assert.Contains("workflow-editor", htmlContent, StringComparison.OrdinalIgnoreCase);
