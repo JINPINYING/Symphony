@@ -71,7 +71,10 @@ document.addEventListener("click", async event => {
 
   if (event.target.closest("[data-action='toggle-raw-events']")) {
     state.showRawEvents = !state.showRawEvents;
-    await refresh();
+    // loadDashboard re-fetches /api/v1/state, which now carries ?raw=true when
+    // the flag is set. Deliberately NOT queueRefresh: this is a view change, not
+    // a control action, and it must not poke the engine.
+    await loadDashboard();
     return;
   }
 
