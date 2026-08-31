@@ -307,19 +307,50 @@ function wrapPanel(inner) {
   return inner ? `<section class="panel mt-4">${inner}</section>` : "";
 }
 
+function roadmapRow(entry) {
+  const word = entry.status === "done" ? "Done" : entry.status === "active" ? "Now" : "Planned";
+  return `
+    <li class="rm-row rm-${escapeHtml(entry.status)}">
+      <span class="rm-status">${escapeHtml(word)}</span>
+      ${entry.milestone ? `<span class="rm-ms">${escapeHtml(entry.milestone)}</span>` : ""}
+      <span class="rm-title">${escapeHtml(entry.title)}</span>
+    </li>`;
+}
+
+// "N of M done" as words, not a bar. The count is the honest summary of a task
+// list and stays readable at a glance on a phone.
+function roadmapTally(items) {
+  const done = items.filter(e => e.status === "done").length;
+  return `${done} of ${items.length} done`;
+}
+
+// The file can carry more than one project - the plane's own milestones and the
+// product it is building - so entries are grouped in the order the file lists
+// them. Ungrouped entries render as one flat list, exactly as before.
+function roadmapGroups(items) {
+  const groups = [];
+  for (const entry of items) {
+    const name = entry.group || "";
+    const last = groups[groups.length - 1];
+    if (last && last.name === name) last.items.push(entry);
+    else groups.push({ name, items: [entry] });
+  }
+  return groups;
+}
+
 function renderRoadmap() {
   const items = state.snapshot?.roadmap || [];
   if (!items.length) return "";
-  const rows = items.map(entry => {
-    const word = entry.status === "done" ? "Done" : entry.status === "active" ? "Now" : "Planned";
-    return `
-      <li class="rm-row rm-${escapeHtml(entry.status)}">
-        <span class="rm-status">${escapeHtml(word)}</span>
-        ${entry.milestone ? `<span class="rm-ms">${escapeHtml(entry.milestone)}</span>` : ""}
-        <span class="rm-title">${escapeHtml(entry.title)}</span>
-      </li>`;
-  }).join("");
-  const done = items.filter(e => e.status === "done").length;
+
+  const groups = roadmapGroups(items);
+  const grouped = groups.some(g => g.name);
+
+  const body = grouped
+    ? groups.map(g => `
+        ${g.name ? `<div class="rm-group"><span class="rm-group-name">${escapeHtml(g.name)}</span><span class="rm-group-tally">${escapeHtml(roadmapTally(g.items))}</span></div>` : ""}
+        <ul class="rm-list">${g.items.map(roadmapRow).join("")}</ul>`).join("")
+    : `<ul class="rm-list">${items.map(roadmapRow).join("")}</ul>`;
+
   return `
     <div class="panel-body p-6">
       <div class="flex items-center justify-between gap-4">
@@ -327,9 +358,9 @@ function renderRoadmap() {
           <div class="section-kicker">Roadmap</div>
           <h2 class="section-title">Where this is going</h2>
         </div>
-        <span class="glass-badge">${escapeHtml(String(done))} of ${escapeHtml(String(items.length))} done</span>
+        ${grouped ? "" : `<span class="glass-badge">${escapeHtml(roadmapTally(items))}</span>`}
       </div>
-      <ul class="rm-list">${rows}</ul>
+      ${body}
     </div>`;
 }
 

@@ -142,7 +142,8 @@ public sealed class RuntimeStateService(
             {
                 status = entry.Status,
                 milestone = entry.Milestone,
-                title = entry.Title
+                title = entry.Title,
+                group = entry.Group
             }),
             counts = new
             {
