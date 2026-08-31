@@ -2,12 +2,14 @@ using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Symphony.Core.Models;
 using Symphony.Infrastructure.Persistence.Sqlite;
+using Symphony.Infrastructure.Workflows;
 using Symphony.Infrastructure.Persistence.Sqlite.Entities;
 
 namespace Symphony.Host.Services;
 
 public sealed class RuntimeStateService(
     SymphonyDbContext dbContext,
+    IWorkflowDefinitionProvider workflowDefinitionProvider,
     TimeProvider timeProvider)
 {
     public Task<object> GetStateAsync(CancellationToken cancellationToken) =>
@@ -80,9 +82,50 @@ public sealed class RuntimeStateService(
             lastEventAtUtc: recentActivity.Count > 0 ? recentActivity[0].At : null,
             now: generatedAt);
 
+        // The workforce view. Runners come from the workflow so an unconfigured
+        // vendor is not silently reported as an idle worker.
+        var configuredRunners = new List<string>();
+        try
+        {
+            var workflow = await workflowDefinitionProvider.GetCurrentAsync(cancellationToken);
+            configuredRunners.Add(workflow.Runtime.Agent.DefaultRunner);
+            configuredRunners.AddRange(workflow.Runtime.Agent.RunnerByLabel.Values);
+        }
+        catch (Exception)
+        {
+            // A workflow that will not load is already reported elsewhere on the
+            // page; it must not also blank the staff view.
+        }
+        if (configuredRunners.Count == 0)
+        {
+            configuredRunners.AddRange(["codex", "claude"]);
+        }
+
+        var recentRuns = (await dbContext.Runs
+            .AsNoTracking()
+            .Where(run => run.Status != RunStatusNames.Running)
+            .ToListAsync(cancellationToken))
+            .OrderByDescending(run => run.LastEventAtUtc ?? run.StartedAtUtc)
+            .Take(40)
+            .ToList();
+
+        var staff = StaffSummary.Build(configuredRunners, runningRuns, recentRuns, generatedAt);
+
         return new
         {
             generated_at = generatedAt,
+            staff = staff.Select(member => new
+            {
+                runner = member.Runner,
+                state = member.State,
+                issue_identifier = member.IssueIdentifier,
+                phase = member.Phase,
+                activity = member.Activity,
+                elapsed_seconds = member.ElapsedSeconds,
+                turn_count = member.TurnCount,
+                total_tokens = member.TotalTokens,
+                last_message = member.LastMessage
+            }),
             attention = new
             {
                 level = attention.Level,

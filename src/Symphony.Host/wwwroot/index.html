@@ -7,25 +7,67 @@
   <title>Symphony Watchtower</title>
   <link rel="stylesheet" href="/assets/dashboard.css">
 <style>
-/* Owner attention block - the first thing on the page, and the only thing most
-   visits need to read. Semantic colour is paired with a word in every state. */
-.attention{border-radius:20px;padding:22px 24px;margin-bottom:18px;border:1px solid;display:flex;flex-direction:column;gap:8px}
-.attention.att-clear{border-color:rgba(94,234,190,.35);background:rgba(16,84,68,.28)}
-.attention.att-warn{border-color:rgba(240,180,88,.4);background:rgba(92,64,16,.3)}
-.attention.att-down{border-color:rgba(240,140,140,.45);background:rgba(96,28,28,.32)}
-.att-word{font-family:ui-monospace,Consolas,monospace;font-size:11px;font-weight:700;letter-spacing:.16em;text-transform:uppercase;opacity:.9}
-.attention.att-clear .att-word{color:#7ee0c0}
-.attention.att-warn .att-word{color:#f2c274}
-.attention.att-down .att-word{color:#f5a3a3}
-.att-headline{font-size:26px;line-height:1.2;font-weight:700;letter-spacing:-.02em;margin:0;color:#fff;text-wrap:balance}
-.att-detail{margin:0;font-size:15px;line-height:1.6;color:rgba(226,232,240,.82);max-width:70ch}
-.att-list{list-style:none;margin:10px 0 0;padding:0;display:flex;flex-direction:column;gap:8px}
-.att-item{display:flex;gap:12px;align-items:flex-start;background:rgba(255,255,255,.05);border-radius:12px;padding:11px 13px}
-.att-sev{font-family:ui-monospace,Consolas,monospace;font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;padding:3px 7px;border-radius:5px;white-space:nowrap;margin-top:2px}
-.att-sev.att-warn{color:#f2c274;background:rgba(240,180,88,.14)}
-.att-sev.att-down{color:#f5a3a3;background:rgba(240,140,140,.16)}
-.att-item-label{font-weight:600;color:#fff;font-size:15px}
-.att-item-detail{font-size:13.5px;color:rgba(226,232,240,.72);margin-top:2px}
+/* ---------------------------------------------------------------------------
+   The answer, first and largest.
+   Rule this follows: the status must be readable as a WORD before any colour
+   registers, because colour alone is not a signal every reader can use. Hence a
+   large label and a glyph, with colour as reinforcement rather than the message.
+   --------------------------------------------------------------------------- */
+.attention{border-radius:22px;padding:30px 32px 28px;margin-bottom:14px;border:1px solid;display:flex;flex-direction:column;gap:12px}
+.attention.att-clear{border-color:rgba(94,234,190,.34);background:linear-gradient(180deg,rgba(16,86,70,.34),rgba(10,40,34,.22))}
+.attention.att-warn{border-color:rgba(242,186,96,.42);background:linear-gradient(180deg,rgba(96,68,16,.36),rgba(52,36,10,.22))}
+.attention.att-down{border-color:rgba(242,146,146,.46);background:linear-gradient(180deg,rgba(102,30,30,.38),rgba(56,16,16,.24))}
+
+.att-status{display:flex;align-items:center;gap:11px}
+.att-mark{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:50%;
+  font-size:15px;font-weight:700;line-height:1;border:2px solid currentColor}
+.att-word{font-size:19px;font-weight:700;letter-spacing:.04em;text-transform:uppercase}
+.attention.att-clear .att-status{color:#8FEDD0}
+.attention.att-warn .att-status{color:#FFCE86}
+.attention.att-down .att-status{color:#FFAFAF}
+
+.att-headline{font-size:clamp(28px,4.4vw,42px);line-height:1.1;font-weight:700;letter-spacing:-.025em;margin:0;color:#fff;text-wrap:balance}
+.att-detail{margin:0;font-size:16px;line-height:1.65;color:rgba(233,240,248,.86);max-width:68ch}
+
+.att-list{list-style:none;margin:8px 0 0;padding:0;display:flex;flex-direction:column;gap:8px}
+.att-item{display:flex;gap:13px;align-items:flex-start;background:rgba(255,255,255,.06);border-radius:12px;padding:13px 15px}
+.att-sev{font-family:ui-monospace,Consolas,monospace;font-size:10.5px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;padding:4px 8px;border-radius:5px;white-space:nowrap;margin-top:1px}
+.att-sev.att-warn{color:#FFCE86;background:rgba(242,186,96,.16)}
+.att-sev.att-down{color:#FFAFAF;background:rgba(242,146,146,.18)}
+.att-item-label{font-weight:600;color:#fff;font-size:15.5px}
+.att-item-detail{font-size:13.5px;color:rgba(233,240,248,.74);margin-top:3px;line-height:1.55}
+
+/* Metadata and controls: present, but never competing with the answer above. */
+.metastrip{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px;
+  padding:13px 18px;border-radius:14px;border:1px solid rgba(255,255,255,.09);background:rgba(255,255,255,.028)}
+.ms-line{display:flex;flex-wrap:wrap;align-items:center;gap:10px;min-width:0;font-size:13px;color:rgba(203,213,225,.78)}
+.ms-name{font-weight:700;color:#fff;font-size:14px;letter-spacing:-.01em}
+.ms-sep{width:1px;height:14px;background:rgba(255,255,255,.14)}
+.ms-fact{white-space:nowrap}
+.ms-fact b{color:rgba(233,240,248,.95);font-weight:600}
+.ms-controls{display:flex;align-items:center;gap:12px}
+.ms-auto{display:inline-flex;align-items:center;gap:7px;font-size:12.5px;color:rgba(203,213,225,.8);cursor:pointer}
+.ms-auto input{width:15px;height:15px;accent-color:#5EEABE;cursor:pointer}
+.ms-refresh{font-size:12.5px;font-weight:500;color:#BEF0E4;padding:6px 13px;border-radius:999px;
+  border:1px solid rgba(94,234,190,.28);background:rgba(94,234,190,.1);cursor:pointer;white-space:nowrap}
+.ms-refresh:hover:not(:disabled){border-color:rgba(94,234,190,.5);background:rgba(94,234,190,.16)}
+.ms-refresh:disabled{opacity:.55;cursor:not-allowed}
+.ms-refresh:focus-visible,.ms-auto input:focus-visible{outline:2px solid rgba(94,234,190,.6);outline-offset:2px}
+
+.staff-list{list-style:none;margin:18px 0 0;padding:0;display:flex;flex-direction:column;gap:8px}
+.staff-row{display:flex;gap:14px;align-items:flex-start;padding:14px 16px;border-radius:14px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.032)}
+.staff-working{border-color:rgba(94,234,190,.3);background:rgba(16,86,70,.2)}
+.staff-state{font-family:ui-monospace,Consolas,monospace;font-size:10.5px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;
+  padding:4px 9px;border-radius:5px;white-space:nowrap;margin-top:2px;min-width:74px;text-align:center}
+.staff-working .staff-state{color:#8FEDD0;background:rgba(94,234,190,.16)}
+.staff-idle .staff-state{color:rgba(148,163,184,.9);background:rgba(148,163,184,.12)}
+.staff-main{flex:1;min-width:0}
+.staff-name{font-size:16px;font-weight:700;color:#fff;text-transform:capitalize;letter-spacing:-.01em}
+.staff-activity{font-size:14px;color:rgba(226,232,240,.82);margin-top:2px}
+.staff-msg{font-size:13px;color:rgba(203,213,225,.62);margin-top:5px;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+.staff-facts{display:flex;flex-direction:column;align-items:flex-end;gap:3px;font-family:ui-monospace,Consolas,monospace;
+  font-size:12px;color:rgba(203,213,225,.7);white-space:nowrap;font-variant-numeric:tabular-nums}
+@media (max-width:640px){.staff-row{flex-wrap:wrap}.staff-facts{flex-direction:row;gap:10px;width:100%;justify-content:flex-start}}
 .rm-list{list-style:none;margin:18px 0 0;padding:0;display:flex;flex-direction:column;gap:2px}
 .rm-row{display:flex;gap:12px;align-items:baseline;padding:8px 0;border-top:1px solid rgba(255,255,255,.07);font-size:14.5px;color:rgba(226,232,240,.85)}
 .rm-row:first-child{border-top:0}
