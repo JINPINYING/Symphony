@@ -68,6 +68,50 @@ public sealed class RoadmapReaderTests
     }
 
     [Fact]
+    public void GroupsEntriesUnderTheHeadingAboveThem()
+    {
+        // One file, two projects: the plane's own milestones and the product it
+        // is building. The page needs to be able to tell them apart.
+        var entries = RoadmapReader.Parse([
+            "# Roadmap",
+            "",
+            "## Control plane",
+            "- [x] **M7** Symphony is the only engine",
+            "",
+            "## CyberMed AI Receptionist",
+            "- [>] **Stage 1** Foundation integrity"
+        ]);
+
+        Assert.Equal(2, entries.Count);
+        Assert.Equal("Control plane", entries[0].Group);
+        Assert.Equal("CyberMed AI Receptionist", entries[1].Group);
+    }
+
+    [Fact]
+    public void TheDocumentHeadingIsNotAGroup()
+    {
+        // "# Roadmap" titles the file. Only "##" opens a group, so a file with no
+        // headings below the title stays one flat ungrouped list.
+        var entries = RoadmapReader.Parse([
+            "# Roadmap",
+            "- [x] **M1** Escalations reach GitHub"
+        ]);
+
+        Assert.Equal(string.Empty, Assert.Single(entries).Group);
+    }
+
+    [Fact]
+    public void StripsBoldFromAGroupHeading()
+    {
+        var entries = RoadmapReader.Parse([
+            "## **CyberMed AI Receptionist**",
+            "- [ ] **Stage 2** Synthetic Voice MVP"
+        ]);
+
+        Assert.Equal("CyberMed AI Receptionist", Assert.Single(entries).Group);
+    }
+
+    [Fact]
     public void ReturnsEmptyRatherThanThrowingWhenTheFileIsAbsent()
     {
         // A missing roadmap must not take the status page down with it.

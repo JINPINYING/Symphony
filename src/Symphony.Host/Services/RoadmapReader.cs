@@ -1,6 +1,6 @@
 namespace Symphony.Host.Services;
 
-public sealed record RoadmapEntry(string Status, string Milestone, string Title);
+public sealed record RoadmapEntry(string Status, string Milestone, string Title, string Group = "");
 
 /// <summary>
 /// Reads the roadmap the page shows.
@@ -16,6 +16,10 @@ public sealed record RoadmapEntry(string Status, string Milestone, string Title)
 ///   - [x] **M4** Claude runner and real phases
 ///   - [>] **M8** Whatever is in flight
 ///   - [ ] **M9** Not started
+///
+/// A <c>##</c> heading starts a group, so one file can carry more than one
+/// project: the plane's own milestones and the product it is building. Entries
+/// before any heading have no group and render exactly as they did before.
 /// </summary>
 public static class RoadmapReader
 {
@@ -45,10 +49,21 @@ public static class RoadmapReader
     public static IReadOnlyList<RoadmapEntry> Parse(IEnumerable<string> lines)
     {
         var entries = new List<RoadmapEntry>();
+        var group = string.Empty;
 
         foreach (var raw in lines)
         {
             var line = raw.Trim();
+
+            // "## Name" opens a group and everything after it belongs to that
+            // group, until the next one. The "# Title" at the top of the file is
+            // the document heading, not a group.
+            if (line.StartsWith("## ", StringComparison.Ordinal))
+            {
+                group = line[3..].Trim().Trim('*').Trim();
+                continue;
+            }
+
             if (!line.StartsWith("- [", StringComparison.Ordinal) || line.Length < 6)
             {
                 continue;
@@ -79,7 +94,7 @@ public static class RoadmapReader
             rest = rest.TrimStart('-', '—', ' ').Trim();
             if (rest.Length > 0 || milestone.Length > 0)
             {
-                entries.Add(new RoadmapEntry(status, milestone, rest));
+                entries.Add(new RoadmapEntry(status, milestone, rest, group));
             }
         }
 
