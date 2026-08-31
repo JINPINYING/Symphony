@@ -10,7 +10,10 @@ public sealed class RuntimeStateService(
     SymphonyDbContext dbContext,
     TimeProvider timeProvider)
 {
-    public async Task<object> GetStateAsync(CancellationToken cancellationToken)
+    public Task<object> GetStateAsync(CancellationToken cancellationToken) =>
+        GetStateAsync(includeRawEvents: false, cancellationToken);
+
+    public async Task<object> GetStateAsync(bool includeRawEvents, CancellationToken cancellationToken)
     {
         var generatedAt = timeProvider.GetUtcNow();
         var runningRuns = (await dbContext.Runs
@@ -39,9 +42,10 @@ public sealed class RuntimeStateService(
             .ToListAsync(cancellationToken))
             .OrderByDescending(entry => entry.UpdatedAtUtc ?? entry.CachedAtUtc)
             .ToList();
-        var recentActivity = await GetRecentVisibleEventLogEntriesAsync(
+        var recentActivity = await GetRecentActivityAsync(
             dbContext.EventLog.AsNoTracking(),
             limit: 24,
+            includeRawEvents,
             cancellationToken);
         var leases = (await dbContext.InstanceLeases
             .AsNoTracking()
@@ -142,15 +146,19 @@ public sealed class RuntimeStateService(
                         labels = ParseJsonValue(entry.LabelsJson)
                     })
             },
+            activity_mode = includeRawEvents ? "raw" : "operational",
             activity = recentActivity.Select(entry => new
             {
-                at = entry.OccurredAtUtc,
+                at = entry.At,
                 issue_id = entry.IssueId,
                 issue_identifier = entry.IssueIdentifier,
                 session_id = entry.SessionId,
                 level = entry.Level,
                 @event = entry.EventName,
-                message = DashboardEventPresentation.GetVisibleMessage(entry.EventName, entry.Message)
+                label = entry.Label,
+                repeat_count = entry.RepeatCount,
+                is_protocol = entry.IsProtocol,
+                message = entry.Message
             }),
             coordination = new
             {
@@ -203,11 +211,12 @@ public sealed class RuntimeStateService(
         var issueCache = await dbContext.IssueCache
             .AsNoTracking()
             .SingleOrDefaultAsync(entry => entry.Identifier == issueIdentifier, cancellationToken);
-        var recentEvents = await GetRecentVisibleEventLogEntriesAsync(
+        var recentEvents = await GetRecentActivityAsync(
             dbContext.EventLog
                 .AsNoTracking()
                 .Where(entry => entry.IssueIdentifier == issueIdentifier),
             limit: 20,
+            includeRawEvents: false,
             cancellationToken);
 
         if (latestRun is null && workspaceRecord is null && retryEntry is null && issueCache is null && recentEvents.Count == 0)
@@ -274,12 +283,14 @@ public sealed class RuntimeStateService(
                 codex_session_logs = Array.Empty<object>()
             },
             recent_events = recentEvents
-                .OrderBy(entry => entry.OccurredAtUtc)
+                .OrderBy(entry => entry.At)
                 .Select(entry => new
                 {
-                    at = entry.OccurredAtUtc,
+                    at = entry.At,
                     @event = entry.EventName,
-                    message = DashboardEventPresentation.GetVisibleMessage(entry.EventName, entry.Message)
+                    label = entry.Label,
+                    repeat_count = entry.RepeatCount,
+                    message = entry.Message
                 }),
             last_error = lastError,
             tracked = new
@@ -310,17 +321,33 @@ public sealed class RuntimeStateService(
         return document.RootElement.Clone();
     }
 
-    private static async Task<List<EventLogEntity>> GetRecentVisibleEventLogEntriesAsync(
+    private static async Task<IReadOnlyList<DashboardActivityEntry>> GetRecentActivityAsync(
         IQueryable<EventLogEntity> query,
         int limit,
+        bool includeRawEvents,
         CancellationToken cancellationToken)
     {
+        // Protocol chatter is ~96% of the log, so excluding it in SQL rather than
+        // paging through it in memory is the difference between one query and
+        // dozens. The in-memory classifier stays the authority - this only avoids
+        // dragging rows across that it would certainly discard.
+        if (!includeRawEvents)
+        {
+            var protocolNames = DashboardEventPresentation.ProtocolEventNames.ToArray();
+            query = query.Where(entry =>
+                !protocolNames.Contains(entry.EventName) &&
+                entry.Message != entry.EventName &&
+                entry.Message != "");
+        }
+
         const int minimumBatchSize = 32;
+        const int maxPages = 8;
         var batchSize = Math.Max(limit * 2, minimumBatchSize);
         var offset = 0;
-        var visibleEntries = new List<EventLogEntity>(limit);
+        var candidates = new List<EventLogEntity>(batchSize);
+        var activity = (IReadOnlyList<DashboardActivityEntry>)Array.Empty<DashboardActivityEntry>();
 
-        while (visibleEntries.Count < limit)
+        for (var page = 0; page < maxPages; page++)
         {
             var batch = await query
                 // SQLite cannot order DateTimeOffset columns directly, so page by the
@@ -335,30 +362,25 @@ public sealed class RuntimeStateService(
                 break;
             }
 
-            foreach (var entry in batch
-                .OrderByDescending(entry => entry.OccurredAtUtc)
-                .ThenByDescending(entry => entry.Id))
-            {
-                if (!DashboardEventPresentation.ShouldInclude(entry.EventName, entry.Message))
-                {
-                    continue;
-                }
+            candidates.AddRange(batch);
+            offset += batch.Count;
 
-                visibleEntries.Add(entry);
-                if (visibleEntries.Count == limit)
-                {
-                    break;
-                }
-            }
+            // Collapsing can only reduce the count, so re-aggregate the whole
+            // accumulated set each page rather than guessing how many raw rows a
+            // full page of activity needs.
+            activity = DashboardActivityAggregator.Build(
+                candidates
+                    .OrderByDescending(entry => entry.OccurredAtUtc)
+                    .ThenByDescending(entry => entry.Id),
+                includeRawEvents,
+                limit);
 
-            if (batch.Count < batchSize)
+            if (activity.Count >= limit || batch.Count < batchSize)
             {
                 break;
             }
-
-            offset += batch.Count;
         }
 
-        return visibleEntries;
+        return activity;
     }
 }
