@@ -295,6 +295,9 @@ function mountRoadmap() {
     host = document.createElement("section");
     host.id = "roadmap-panel";
     host.className = anchorPanel.className;
+    // The anchor sits in a grid column, so an inherited class would squeeze the
+    // roadmap into half the width and wrap every row. Span the full track.
+    host.style.gridColumn = "1 / -1";
     anchorPanel.parentNode.insertBefore(host, anchorPanel.nextSibling);
   }
   host.innerHTML = html;
