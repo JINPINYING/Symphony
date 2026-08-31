@@ -203,7 +203,21 @@ internal static class SymphonyHostApplication
         });
         app.UseStaticFiles(new StaticFileOptions
         {
-            FileProvider = fileProvider
+            FileProvider = fileProvider,
+            OnPrepareResponse = context =>
+            {
+                // The Control Room is served from a fixed path with no build
+                // fingerprint, so browsers happily hold an old dashboard.js
+                // indefinitely: after a deploy the page keeps rendering with stale
+                // code while the server has the new file, and only a hard refresh
+                // fixes it. Observed exactly that shipping the #4 event-stream fix.
+                //
+                // "no-cache" does not mean "do not cache" - it means revalidate
+                // before use. The browser still gets a 304 when nothing changed, so
+                // this costs one conditional request per asset, and a deploy is
+                // picked up on the next ordinary reload.
+                context.Context.Response.Headers.CacheControl = "no-cache, must-revalidate";
+            }
         });
     }
 
