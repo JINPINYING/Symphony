@@ -36,6 +36,7 @@ const state = {
   loading: false,
   refreshQueued: false,
   autoRefresh: true,
+  showRawEvents: false,
   error: null,
   issueError: null,
   lastLoadedAt: null
@@ -65,6 +66,12 @@ document.addEventListener("click", async event => {
 
   if (event.target.closest("[data-action='save-workflow']")) {
     await saveWorkflowEditor();
+    return;
+  }
+
+  if (event.target.closest("[data-action='toggle-raw-events']")) {
+    state.showRawEvents = !state.showRawEvents;
+    await refresh();
     return;
   }
 
@@ -114,7 +121,7 @@ async function loadDashboard({ queueRefresh = false } = {}) {
     const [healthResult, runtimeResult, stateResult, workflowResult] = await Promise.allSettled([
       fetchHealth(),
       fetchJson("/api/v1/runtime"),
-      fetchJson("/api/v1/state"),
+      fetchJson(state.showRawEvents ? "/api/v1/state?raw=true" : "/api/v1/state"),
       fetchJson("/api/v1/workflow")
     ]);
 
@@ -607,10 +614,15 @@ function renderActivityFeed() {
           <div class="section-kicker">Recent activity</div>
           <h2 class="section-title">Event stream</h2>
         </div>
-        <span class="glass-badge">${escapeHtml(formatNumber(activity.length))} events</span>
+        <div class="flex items-center gap-3">
+          <span class="glass-badge">${escapeHtml(formatNumber(activity.length))} ${state.showRawEvents ? "raw events" : "activities"}</span>
+          <button type="button" data-action="toggle-raw-events" class="glass-badge hover:text-cyan-100" title="Raw events are always recorded; this only changes what is shown.">
+            ${state.showRawEvents ? "Show activity" : "Show raw events"}
+          </button>
+        </div>
       </div>
       <div class="mt-6 space-y-3">
-        ${activity.length ? activity.map(renderActivityEntry).join("") : renderEmptyState("No activity logged yet.", "When dispatch, retries, turns, or terminal events are recorded, they will stream into this feed.")}
+        ${activity.length ? activity.map(renderActivityEntry).join("") : renderEmptyState("No activity logged yet.", "Dispatches, phase changes, verdicts and merges appear here. Streaming protocol events are hidden by default — use Show raw events to see everything.")}
       </div>
     </div>`;
 }
@@ -620,12 +632,14 @@ function renderActivityEntry(entry) {
   return `
     <div class="rounded-3xl border ${tone} bg-white/[0.035] p-4">
       <div class="flex flex-wrap items-center gap-2">
-        <span class="status-chip ${tone}">${escapeHtml(entry.event)}</span>
+        <span class="status-chip ${tone}">${escapeHtml(entry.label || entry.event)}</span>
+        ${entry.repeat_count > 1 ? `<span class="glass-badge" title="${escapeHtml(String(entry.repeat_count))} consecutive identical events collapsed into one row">&times;${escapeHtml(String(entry.repeat_count))}</span>` : ""}
         ${entry.issue_identifier ? `<button type="button" data-issue-identifier="${escapeHtml(entry.issue_identifier)}" class="text-sm font-semibold text-white hover:text-cyan-100">${escapeHtml(entry.issue_identifier)}</button>` : ""}
         <span class="text-xs uppercase tracking-[0.22em] text-slate-400">${escapeHtml(formatRelativeTime(entry.at))}</span>
       </div>
-      <p class="mt-3 text-sm leading-6 text-slate-300">${escapeHtml(entry.message || "No message")}</p>
+      ${entry.message ? `<p class="mt-3 text-sm leading-6 text-slate-300">${escapeHtml(entry.message)}</p>` : ""}
       <div class="mt-3 flex flex-wrap gap-3 text-xs text-slate-400">
+        ${entry.is_protocol ? `<span class="font-mono">${escapeHtml(entry.event)}</span>` : ""}
         ${entry.session_id ? `<span>Session ${escapeHtml(entry.session_id)}</span>` : ""}
         ${entry.level ? `<span>${escapeHtml(entry.level)}</span>` : ""}
       </div>

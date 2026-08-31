@@ -389,9 +389,13 @@ internal static class SymphonyHostApplication
 
         app.MapGet("/api/v1/state", async (
             RuntimeStateService runtimeStateService,
+            bool? raw,
             CancellationToken cancellationToken) =>
         {
-            var payload = await runtimeStateService.GetStateAsync(cancellationToken);
+            // ?raw=true returns the unfiltered diagnostic feed (ADCP #4). The default
+            // stays the operational view; raw events are never deleted, only hidden
+            // until they are asked for.
+            var payload = await runtimeStateService.GetStateAsync(raw ?? false, cancellationToken);
             return Results.Ok(payload);
         });
 
