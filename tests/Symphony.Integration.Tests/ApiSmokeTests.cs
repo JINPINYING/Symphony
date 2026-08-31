@@ -1,4 +1,4 @@
-using System.Net;
+﻿using System.Net;
 using System.Net.Http.Json;
 using System.Text.Json;
 using Microsoft.AspNetCore.Builder;
@@ -1280,6 +1280,12 @@ public sealed class ApiSmokeTests
         {
             return Task.FromResult<IReadOnlyList<string>>([]);
         }
+
+        public Task<IReadOnlyList<OpenPullRequest>> FetchOpenPullRequestsAsync(TrackerQuery query, int limit, CancellationToken cancellationToken = default)
+            => Task.FromResult<IReadOnlyList<OpenPullRequest>>(OpenPullRequests);
+
+        public IReadOnlyList<OpenPullRequest> OpenPullRequests { get; set; } = [];
+
 
         public Task<string?> MergePullRequestAsync(
             TrackerQuery query,

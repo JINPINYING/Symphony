@@ -398,13 +398,32 @@ function renderAttention() {
   };
   const m = map[a.level] || map.clear;
 
-  const items = (a.items || []).map(item => `
+  // An item that names a decision but makes the reader go and find it is only
+  // half an answer, so the label links straight to the thing when there is one.
+  // http(s) only: the URL arrives as data, and a javascript: label would be a
+  // scripting hole dressed up as a convenience.
+  const items = (a.items || []).map(item => {
+    const safeUrl = /^https?:\/\//i.test(item.url || "") ? item.url : null;
+    const label = escapeHtml(item.label);
+    return `
     <li class="att-item">
       <span class="att-sev ${item.severity === "down" ? "att-down" : "att-warn"}">${escapeHtml(item.severity === "down" ? "Blocking" : "Decide")}</span>
       <div>
-        <div class="att-item-label">${escapeHtml(item.label)}</div>
+        <div class="att-item-label">${safeUrl
+          ? `<a class="att-item-link" href="${escapeHtml(safeUrl)}" target="_blank" rel="noopener noreferrer">${label}</a>`
+          : label}</div>
         <div class="att-item-detail">${escapeHtml(item.detail)}</div>
       </div>
+    </li>`;
+  }).join("");
+
+  // Work an agent did outside the queue. The counts above only ever described
+  // dispatched runs, so without this the page can be busy and look asleep.
+  const activity = (state.snapshot?.agent_activity || []).slice(0, 4).map(report => `
+    <li class="agent-row">
+      <span class="agent-when">${report.live ? "Now" : "Earlier"}</span>
+      <span class="agent-actor">${escapeHtml(report.actor || "agent")}</span>
+      <span class="agent-summary">${escapeHtml(report.summary || "")}</span>
     </li>`).join("");
 
   return `
@@ -413,6 +432,7 @@ function renderAttention() {
       <h1 class="att-headline">${escapeHtml(a.headline)}</h1>
       <p class="att-detail">${escapeHtml(a.detail)}</p>
       ${items ? `<ul class="att-list">${items}</ul>` : ""}
+      ${activity ? `<div class="agent-strip"><div class="agent-kicker">Agent activity</div><ul class="agent-list">${activity}</ul></div>` : ""}
     </div>`;
 }
 

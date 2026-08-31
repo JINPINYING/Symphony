@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Configuration;
@@ -13,6 +14,7 @@ using Symphony.Host.Workers;
 using Symphony.Infrastructure.Agent.Claude;
 using Symphony.Infrastructure.Agent.Codex;
 using Symphony.Infrastructure.Persistence.Sqlite;
+using Symphony.Infrastructure.Persistence.Sqlite.Entities;
 using Symphony.Infrastructure.Persistence.Sqlite.Storage;
 using Symphony.Infrastructure.Tracker.GitHub;
 using Symphony.Infrastructure.Workspaces;
@@ -430,6 +432,50 @@ internal static class SymphonyHostApplication
                         message = $"Issue '{issueIdentifier}' was not found in runtime state."
                     }
                 });
+        });
+
+        // An agent working outside the queue says what it is doing, so the page
+        // stops reporting an empty queue as an idle plane while work is underway.
+        // A report, not a command: it dispatches nothing and blocks nothing.
+        app.MapPost("/api/v1/activity", async (
+            AgentActivityRequest request,
+            SymphonyDbContext dbContext,
+            TimeProvider timeProvider,
+            CancellationToken cancellationToken) =>
+        {
+            var actor = AgentActivity.Clamp(request.Actor);
+            var summary = AgentActivity.Clamp(request.Summary);
+            if (actor is null || summary is null)
+            {
+                return Results.BadRequest(new
+                {
+                    error = new
+                    {
+                        code = "actor_and_summary_required",
+                        message = "An activity report needs an actor and a summary."
+                    }
+                });
+            }
+
+            var at = timeProvider.GetUtcNow();
+            var report = new AgentActivityReport(
+                actor,
+                summary,
+                AgentActivity.Clamp(request.Detail),
+                AgentActivity.Clamp(request.Url),
+                at);
+
+            dbContext.EventLog.Add(new EventLogEntity
+            {
+                EventName = AgentActivity.EventName,
+                Level = LogLevel.Information.ToString(),
+                Message = $"{actor}: {summary}",
+                DataJson = JsonSerializer.Serialize(report),
+                OccurredAtUtc = at
+            });
+            await dbContext.SaveChangesAsync(cancellationToken);
+
+            return Results.Accepted(value: new { recorded_at = at });
         });
 
         app.MapPost("/api/v1/refresh", (

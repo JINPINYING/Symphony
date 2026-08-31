@@ -65,6 +65,15 @@ public interface ITrackerClient
         string headRefName,
         CancellationToken cancellationToken = default);
 
+    // Every open pull request on the repository, whoever opened it. The other
+    // PR methods answer questions about a PR this engine created; this one
+    // answers what is sitting on the repository waiting for a person, which the
+    // engine previously had no way to see.
+    Task<IReadOnlyList<OpenPullRequest>> FetchOpenPullRequestsAsync(
+        TrackerQuery query,
+        int limit,
+        CancellationToken cancellationToken = default);
+
     // Paths changed by the pull request, for the merge policy gate.
     Task<IReadOnlyList<string>> FetchPullRequestFilesAsync(
         TrackerQuery query,

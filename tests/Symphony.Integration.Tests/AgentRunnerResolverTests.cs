@@ -1,4 +1,4 @@
-using Microsoft.Extensions.Logging.Abstractions;
+﻿using Microsoft.Extensions.Logging.Abstractions;
 using Symphony.Core.Abstractions;
 using Symphony.Core.Models;
 using Symphony.Host.Services;
@@ -140,6 +140,12 @@ public sealed class AgentRunnerResolverTests
 
         public Task<IReadOnlyList<string>> FetchPullRequestFilesAsync(TrackerQuery query, int pullRequestNumber, CancellationToken cancellationToken = default)
             => Task.FromResult<IReadOnlyList<string>>([]);
+
+        public Task<IReadOnlyList<OpenPullRequest>> FetchOpenPullRequestsAsync(TrackerQuery query, int limit, CancellationToken cancellationToken = default)
+            => Task.FromResult<IReadOnlyList<OpenPullRequest>>(OpenPullRequests);
+
+        public IReadOnlyList<OpenPullRequest> OpenPullRequests { get; set; } = [];
+
 
         public Task<string?> MergePullRequestAsync(TrackerQuery query, int pullRequestNumber, string expectedHeadSha, string method, CancellationToken cancellationToken = default)
             => Task.FromResult<string?>("merging is not supported by this fake");

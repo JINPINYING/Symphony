@@ -1,9 +1,11 @@
+using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
 using Symphony.Core.Abstractions;
 using Symphony.Core.Configuration;
 using Symphony.Core.Models;
 using Symphony.Infrastructure.Persistence.Sqlite;
+using Symphony.Infrastructure.Persistence.Sqlite.Entities;
 using Symphony.Infrastructure.Tracker.GitHub;
 using Symphony.Infrastructure.Workflows;
 using Symphony.Infrastructure.Workflows.Models;
@@ -30,6 +32,14 @@ public sealed partial class OrchestrationTickService
     // event log does not need attention that often. In-memory is fine - a
     // restart simply prunes once on the first tick, which is harmless.
     private DateTimeOffset nextEventLogPruneUtc = DateTimeOffset.MinValue;
+
+    // Open pull requests are polled on their own slower clock. The tick runs every
+    // 15 seconds; a merge decision does not move that fast, and one GraphQL call
+    // per tick would spend rate limit on a question whose answer rarely changes.
+    internal const string OpenPullRequestsEventName = "open_pull_requests_updated";
+    private const int OpenPullRequestLimit = 25;
+    private static readonly TimeSpan OpenPullRequestPollInterval = TimeSpan.FromMinutes(2);
+    private DateTimeOffset nextOpenPullRequestPollUtc = DateTimeOffset.MinValue;
 
     public OrchestrationTickService(
         IWorkflowDefinitionProvider workflowDefinitionProvider,
@@ -188,11 +198,62 @@ public sealed partial class OrchestrationTickService
                 BuildTrackerQuery(workflowDefinition, apiKey),
                 (issue, directive, token) => DispatchDirectiveIssueAsync(issue, workflowDefinition, instanceId, directive, token),
                 cancellationToken);
+
+            await RecordOpenPullRequestsAsync(workflowDefinition, apiKey, cancellationToken);
             return workflowDefinition.Runtime.Polling.IntervalMs;
         }
         finally
         {
             await coordinationStore.ReleaseLeaseAsync(ResolveLeaseName(), instanceId, CancellationToken.None);
+        }
+    }
+
+    // The status page must not call GitHub. It is rendered on every poll and by
+    // the published copy, so a slow or unreachable API there would make the page
+    // slow or blank exactly when the owner is checking whether anything is wrong.
+    // So the tick fetches, and the page reads the newest snapshot from the event
+    // log - the same shape rate limits already use, which needs no schema change.
+    //
+    // Never fatal. Pull requests are a reporting concern; failing to read them
+    // must not stop a tick that is otherwise dispatching work.
+    private async Task RecordOpenPullRequestsAsync(
+        WorkflowDefinition workflowDefinition,
+        string apiKey,
+        CancellationToken cancellationToken)
+    {
+        if (timeProvider.GetUtcNow() < nextOpenPullRequestPollUtc)
+        {
+            return;
+        }
+
+        try
+        {
+            var openPullRequests = await trackerClient.FetchOpenPullRequestsAsync(
+                BuildTrackerQuery(workflowDefinition, apiKey),
+                OpenPullRequestLimit,
+                cancellationToken);
+
+            var now = timeProvider.GetUtcNow();
+            nextOpenPullRequestPollUtc = now + OpenPullRequestPollInterval;
+
+            dbContext.EventLog.Add(new EventLogEntity
+            {
+                EventName = OpenPullRequestsEventName,
+                Level = LogLevel.Information.ToString(),
+                Message = openPullRequests.Count == 1
+                    ? "1 open pull request."
+                    : $"{openPullRequests.Count} open pull requests.",
+                DataJson = JsonSerializer.Serialize(openPullRequests),
+                OccurredAtUtc = now
+            });
+
+            await dbContext.SaveChangesAsync(cancellationToken);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            // Back off on failure too, so a broken token does not retry every tick.
+            nextOpenPullRequestPollUtc = timeProvider.GetUtcNow() + OpenPullRequestPollInterval;
+            logger.LogWarning(exception, "Could not read open pull requests; the status page will show the previous snapshot.");
         }
     }
 

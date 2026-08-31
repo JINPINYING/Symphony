@@ -1,4 +1,4 @@
-using System.Reflection;
+﻿using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -746,6 +746,12 @@ public sealed class CodexAgentRunnerTests
 
         public Task<IReadOnlyList<string>> FetchPullRequestFilesAsync(TrackerQuery query, int pullRequestNumber, CancellationToken cancellationToken = default)
             => Task.FromResult<IReadOnlyList<string>>([]);
+
+        public Task<IReadOnlyList<OpenPullRequest>> FetchOpenPullRequestsAsync(TrackerQuery query, int limit, CancellationToken cancellationToken = default)
+            => Task.FromResult<IReadOnlyList<OpenPullRequest>>(OpenPullRequests);
+
+        public IReadOnlyList<OpenPullRequest> OpenPullRequests { get; set; } = [];
+
 
         public Task<string?> MergePullRequestAsync(TrackerQuery query, int pullRequestNumber, string expectedHeadSha, string method, CancellationToken cancellationToken = default)
             => Task.FromResult<string?>("merging is not supported by this fake");

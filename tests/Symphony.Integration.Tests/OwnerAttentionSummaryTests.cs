@@ -17,8 +17,16 @@ public sealed class OwnerAttentionSummaryTests
         int running = 0,
         int retrying = 0,
         IReadOnlyList<PhaseLedgerEntity>? phases = null,
+        IReadOnlyList<OpenPullRequest>? openPullRequests = null,
+        IReadOnlyList<AgentActivityReport>? agentActivity = null,
         DateTimeOffset? lastEvent = null) =>
-        OwnerAttentionSummary.Build(healthy, escalated ?? [], running, retrying, phases ?? [], lastEvent, Now);
+        OwnerAttentionSummary.Build(healthy, escalated ?? [], running, retrying, phases ?? [], openPullRequests ?? [], agentActivity ?? [], lastEvent, Now);
+
+    private static AgentActivityReport Activity(string summary, TimeSpan ago) =>
+        new("Claude", summary, null, null, Now - ago);
+
+    private static OpenPullRequest Pr(int number, string? checks, bool draft = false) =>
+        new(number, $"Change {number}", $"https://example.invalid/pull/{number}", "someone", draft, checks, "MERGEABLE", Now.AddHours(-6));
 
     private static RunEntity Escalated(string issue, bool posted) => new()
     {
@@ -28,6 +36,104 @@ public sealed class OwnerAttentionSummaryTests
         Status = RunStatusNames.NeedsCommandCenter,
         EscalationPostedAtUtc = posted ? Now.AddMinutes(-5) : null,
     };
+
+    // The bug this whole input exists to fix: every other signal here is the
+    // engine's own run state, so an empty queue read as "nothing needs you" while
+    // several green pull requests sat open waiting for a merge decision.
+    [Fact]
+    public void AGreenPullRequestIsNotAnIdlePlane()
+    {
+        var result = Build(openPullRequests: [Pr(105, "SUCCESS")], lastEvent: Now.AddHours(-3));
+
+        Assert.Equal(OwnerAttentionSummary.LevelAttention, result.Level);
+        Assert.Equal("One thing is waiting on you", result.Headline);
+        Assert.Contains(result.Items, i => i.Label == "PR #105 is waiting on you");
+    }
+
+    [Fact]
+    public void FailingChecksSaySo()
+    {
+        var result = Build(openPullRequests: [Pr(106, "FAILURE")]);
+
+        var item = Assert.Single(result.Items);
+        Assert.Equal("PR #106 has failing checks", item.Label);
+        Assert.Contains("CI is red", item.Detail);
+    }
+
+    [Fact]
+    public void DraftsAndPendingChecksAreNotWaitingOnAnyone()
+    {
+        // A draft is the author's to finish and a pending check resolves itself.
+        // Listing either is how a status page starts crying wolf.
+        var result = Build(openPullRequests:
+        [
+            Pr(1, "SUCCESS", draft: true),
+            Pr(2, "PENDING"),
+            Pr(3, "EXPECTED")
+        ]);
+
+        Assert.Equal(OwnerAttentionSummary.LevelClear, result.Level);
+        Assert.Empty(result.Items);
+    }
+
+    [Fact]
+    public void APullRequestWithNoChecksStillCounts()
+    {
+        // A repository without CI is not a repository without merge decisions.
+        var result = Build(openPullRequests: [Pr(21, null)]);
+
+        Assert.Contains(result.Items, i => i.Label == "PR #21 is waiting on you");
+    }
+
+    [Fact]
+    public void SeveralPullRequestsAreCountedIndividually()
+    {
+        var result = Build(openPullRequests: [Pr(106, "SUCCESS"), Pr(105, "SUCCESS")]);
+
+        Assert.Equal("2 things are waiting on you", result.Headline);
+        // Listed by number so the page does not reshuffle between polls.
+        Assert.Equal(["PR #105 is waiting on you", "PR #106 is waiting on you"], result.Items.Select(i => i.Label));
+    }
+
+    // An empty queue is not an idle project. An agent working outside the queue
+    // used to render as "the plane is idle" - the page being confidently wrong
+    // about the only question it is asked.
+    [Fact]
+    public void AnAgentWorkingOutsideTheQueueIsNotIdle()
+    {
+        var result = Build(
+            agentActivity: [Activity("Rebasing the voice provider evidence lane.", TimeSpan.FromMinutes(2))],
+            lastEvent: Now.AddHours(-3));
+
+        Assert.Equal(OwnerAttentionSummary.LevelClear, result.Level);
+        Assert.Equal("Claude is working", result.Headline);
+        Assert.Contains("Rebasing the voice provider evidence lane.", result.Detail);
+        Assert.DoesNotContain("idle", result.Detail);
+    }
+
+    [Fact]
+    public void AStaleReportDoesNotKeepClaimingWorkIsUnderway()
+    {
+        // A session that dies without saying goodbye must not leave the page
+        // asserting forever that something is happening.
+        var result = Build(
+            agentActivity: [Activity("Started something and then vanished.", TimeSpan.FromHours(4))],
+            lastEvent: Now.AddHours(-4));
+
+        Assert.Equal("Nothing needs you", result.Headline);
+    }
+
+    [Fact]
+    public void AWaitingPullRequestOutranksAWorkingAgent()
+    {
+        // Work in progress is information; a decision only the owner can make is
+        // the reason they opened the page.
+        var result = Build(
+            openPullRequests: [Pr(105, "SUCCESS")],
+            agentActivity: [Activity("Still going.", TimeSpan.FromMinutes(1))]);
+
+        Assert.Equal("One thing is waiting on you", result.Headline);
+    }
 
     [Fact]
     public void IdleIsClear_NotAProblem()

@@ -3,8 +3,12 @@ using Symphony.Infrastructure.Persistence.Sqlite.Entities;
 
 namespace Symphony.Host.Services;
 
-/// <summary>One thing the owner may need to act on.</summary>
-public sealed record AttentionItem(string Label, string Detail, string Severity);
+/// <summary>
+/// One thing the owner may need to act on. <paramref name="Url"/> is where to go
+/// and do it, when there is such a place - an item that names a decision but
+/// makes the reader hunt for it is only half an answer.
+/// </summary>
+public sealed record AttentionItem(string Label, string Detail, string Severity, string? Url = null);
 
 /// <summary>
 /// The answer to "does this need me?", computed by the engine rather than
@@ -33,6 +37,8 @@ public static class OwnerAttentionSummary
         int runningCount,
         int retryQueueCount,
         IReadOnlyList<PhaseLedgerEntity> phases,
+        IReadOnlyList<OpenPullRequest> openPullRequests,
+        IReadOnlyList<AgentActivityReport> agentActivity,
         DateTimeOffset? lastEventAtUtc,
         DateTimeOffset now)
     {
@@ -67,6 +73,41 @@ public static class OwnerAttentionSummary
                 LevelAttention));
         }
 
+        // An open pull request is the most common way work waits on a person, and
+        // for a long time this summary could not see one: every other input here
+        // is the engine's own run state, so a green PR nobody had merged read as
+        // an empty queue and the page said "nothing needs you".
+        //
+        // Draft and pending-CI PRs are deliberately excluded. A draft is the
+        // author's to finish and a pending check will resolve itself; listing
+        // either would make the page cry wolf, which is how a status page teaches
+        // its reader to stop looking.
+        foreach (var pr in openPullRequests.Where(pr => !pr.IsDraft).OrderBy(pr => pr.Number))
+        {
+            var checks = pr.ChecksState;
+            if (string.Equals(checks, "PENDING", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(checks, "EXPECTED", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var failing = string.Equals(checks, "FAILURE", StringComparison.OrdinalIgnoreCase) ||
+                          string.Equals(checks, "ERROR", StringComparison.OrdinalIgnoreCase);
+            var waited = pr.UpdatedAtUtc > DateTimeOffset.MinValue
+                ? $" Waiting {Humanise(now - pr.UpdatedAtUtc)}."
+                : string.Empty;
+
+            items.Add(new AttentionItem(
+                failing
+                    ? $"PR #{pr.Number} has failing checks"
+                    : $"PR #{pr.Number} is waiting on you",
+                failing
+                    ? $"{pr.Title} - CI is red, so the merge gate will not take it.{waited}"
+                    : $"{pr.Title} - open and not blocked by CI. Nothing will merge it without you.{waited}",
+                LevelAttention,
+                string.IsNullOrWhiteSpace(pr.Url) ? null : pr.Url));
+        }
+
         if (retryQueueCount > 0)
         {
             items.Add(new AttentionItem(
@@ -74,6 +115,14 @@ public static class OwnerAttentionSummary
                 "Transient failures retry on their own. Persistent ones escalate.",
                 LevelAttention));
         }
+
+        // The newest report still inside the live window, if any. Stale reports
+        // are ignored rather than trusted: a session that died without saying
+        // goodbye must not leave the page claiming work is underway forever.
+        var liveAgent = agentActivity
+            .Where(report => now - report.AtUtc <= AgentActivity.LiveWindow)
+            .OrderByDescending(report => report.AtUtc)
+            .FirstOrDefault();
 
         var level = items.Any(i => i.Severity == LevelDown) ? LevelDown
                   : items.Count > 0 ? LevelAttention
@@ -96,6 +145,14 @@ public static class OwnerAttentionSummary
         {
             headline = runningCount == 1 ? "Working on one issue" : $"Working on {runningCount} issues";
             detail = "Nothing needs you. Progress appears below as each phase completes.";
+        }
+        else if (liveAgent is not null)
+        {
+            // An empty queue is not an idle project. Work done by an agent outside
+            // the queue used to render as "the plane is idle", which was the page
+            // being confidently wrong about the only thing it is asked.
+            headline = $"{liveAgent.Actor} is working";
+            detail = $"{liveAgent.Summary} Not a queued run, so it does not appear in the counts above. Reported {Humanise(now - liveAgent.AtUtc)} ago.";
         }
         else
         {
