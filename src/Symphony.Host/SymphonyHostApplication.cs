@@ -143,6 +143,19 @@ internal static class SymphonyHostApplication
         services.AddScoped<OrchestrationTickService>();
         services.AddScoped<RuntimeStateService>();
 
+        // Singleton so its short cache survives between scoped state requests;
+        // without that, every dashboard poll would relaunch schtasks. The reader
+        // is chosen by platform rather than probed, so a non-Windows host reports
+        // "nothing to watch" instead of failing to watch.
+        if (OperatingSystem.IsWindows())
+        {
+            services.AddSingleton<IWatchedTaskReader, WindowsWatchedTaskReader>();
+        }
+        else
+        {
+            services.AddSingleton<IWatchedTaskReader, UnsupportedWatchedTaskReader>();
+        }
+
         services
             .AddHealthChecks()
             .AddDbContextCheck<SymphonyDbContext>("sqlite");

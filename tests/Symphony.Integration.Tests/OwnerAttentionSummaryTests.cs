@@ -19,8 +19,12 @@ public sealed class OwnerAttentionSummaryTests
         IReadOnlyList<PhaseLedgerEntity>? phases = null,
         IReadOnlyList<OpenPullRequest>? openPullRequests = null,
         IReadOnlyList<AgentActivityReport>? agentActivity = null,
+        IReadOnlyList<WatchedTaskReport>? watchedTasks = null,
         DateTimeOffset? lastEvent = null) =>
-        OwnerAttentionSummary.Build(healthy, escalated ?? [], running, retrying, phases ?? [], openPullRequests ?? [], agentActivity ?? [], lastEvent, Now);
+        OwnerAttentionSummary.Build(healthy, escalated ?? [], running, retrying, phases ?? [], openPullRequests ?? [], agentActivity ?? [], watchedTasks ?? [], lastEvent, Now);
+
+    private static WatchedTaskReport Task(string name, string health) =>
+        new(name, "\\" + name, "Enabled", "Ready", Now.AddMinutes(-5), 0, Now.AddMinutes(10), 15, health, $"{name} is {health}.");
 
     private static AgentActivityReport Activity(string summary, TimeSpan ago) =>
         new("Claude", summary, null, null, Now - ago);
@@ -232,5 +236,61 @@ public sealed class OwnerAttentionSummaryTests
         Assert.Equal(3, result.Items.Count);
         Assert.Equal("3 things are waiting on you", result.Headline);
         Assert.Contains(result.Items, i => i.Label.StartsWith("3 runs waiting", StringComparison.Ordinal));
+    }
+
+    // The 27-hour blind spot. Every other input to this summary is the engine's
+    // own state, and the engine's state is identical whether the queue is empty
+    // because there is no work or because the scheduler that finds work stopped
+    // firing. Before this, the page said "nothing needs you" throughout.
+    [Fact]
+    public void AScheduleThatStoppedFiringIsNotAQuietPlane()
+    {
+        var result = Build(watchedTasks: [Task("ADCP Commander", WatchedTaskReport.HealthLate)]);
+
+        Assert.Equal(OwnerAttentionSummary.LevelAttention, result.Level);
+        var item = Assert.Single(result.Items);
+        Assert.Equal("ADCP Commander is not running as scheduled", item.Label);
+    }
+
+    // Disabled and failing will not recover on their own, so they outrank a run
+    // that is merely late - which a busy host can cause without anything at all
+    // being wrong.
+    [Theory]
+    [InlineData(WatchedTaskReport.HealthDisabled)]
+    [InlineData(WatchedTaskReport.HealthFailing)]
+    public void ATaskThatCannotRecoverOnItsOwnReadsAsDown(string health)
+    {
+        var result = Build(watchedTasks: [Task("ADCP Event Watcher", health)]);
+
+        Assert.Equal(OwnerAttentionSummary.LevelDown, result.Level);
+    }
+
+    [Fact]
+    public void TheWorstSchedulerLeads()
+    {
+        var result = Build(watchedTasks:
+        [
+            Task("Late one", WatchedTaskReport.HealthLate),
+            Task("Stopped one", WatchedTaskReport.HealthDisabled)
+        ]);
+
+        Assert.Equal(OwnerAttentionSummary.LevelDown, result.Level);
+        Assert.StartsWith("Stopped one", result.Items[0].Label);
+    }
+
+    // The point of the whole feature is that silence is legible - which means a
+    // healthy scheduler must stay silent, or the page fills with cron noise and
+    // stops being read.
+    [Fact]
+    public void HealthySchedulersSayNothing()
+    {
+        var result = Build(watchedTasks:
+        [
+            Task("ADCP Commander", WatchedTaskReport.HealthOk),
+            Task("ADCP Event Watcher", WatchedTaskReport.HealthOk)
+        ]);
+
+        Assert.Equal(OwnerAttentionSummary.LevelClear, result.Level);
+        Assert.Empty(result.Items);
     }
 }

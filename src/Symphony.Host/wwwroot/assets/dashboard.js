@@ -900,6 +900,60 @@ function renderIssueDetail() {
     </div>`;
 }
 
+/* The schedulers that wake this plane.
+ *
+ * Nothing rendered these until one of them died and stayed dead for 27 hours
+ * while the page reported everything as fine. The engine cannot tell the
+ * difference from the inside - a scheduler that stopped firing and a quiet week
+ * look identical - so the state now carries what the host says about them.
+ *
+ * Health is spelled out as a word, never colour alone. A healthy scheduler is
+ * shown but not emphasised: the point is to make silence legible, not to fill
+ * the page with cron chatter nobody reads. */
+function renderWatchedTasks() {
+  const tasks = state.snapshot?.watched_tasks || [];
+  if (!tasks.length) {
+    return "";
+  }
+
+  const tone = health => {
+    switch (health) {
+      case "ok": return toneClasses.healthy;
+      case "late": return toneClasses.warning;
+      case "disabled":
+      case "failing": return toneClasses.danger;
+      default: return toneClasses.neutral;
+    }
+  };
+
+  const label = health => ({
+    ok: "On schedule",
+    late: "Late",
+    failing: "Failing",
+    disabled: "Disabled",
+    unknown: "Unmonitored"
+  }[health] || "Unknown");
+
+  const rows = tasks.map(task => `
+    <div class="border-t border-white/10 pt-3 first:border-t-0 first:pt-0">
+      <div class="flex items-center justify-between gap-3">
+        <div class="text-sm font-medium text-white">${escapeHtml(task.name)}</div>
+        <span class="status-chip ${tone(task.health)}">${escapeHtml(label(task.health))}</span>
+      </div>
+      <div class="mt-1 text-sm text-slate-300">${escapeHtml(task.explanation || "")}</div>
+      <div class="mt-1 text-xs text-slate-400">
+        Last run ${escapeHtml(task.last_run ? formatRelativeTime(task.last_run) : "never")}
+        &middot; next ${escapeHtml(task.next_run ? formatRelativeTime(task.next_run) : "not scheduled")}
+      </div>
+    </div>`).join("");
+
+  return `
+    <div class="rounded-3xl border border-white/10 bg-white/[0.035] p-5">
+      <div class="text-xs uppercase tracking-[0.22em] text-slate-400">What wakes the plane</div>
+      <div class="mt-3 space-y-3">${rows}</div>
+    </div>`;
+}
+
 function renderInstanceStatus() {
   const runtime = state.runtime;
   const workflow = runtime?.workflow;
@@ -919,6 +973,8 @@ function renderInstanceStatus() {
           </div>
           <div class="mt-3 text-sm text-slate-300">${escapeHtml(state.health?.detail || "No health detail available.")}</div>
         </div>
+
+        ${renderWatchedTasks()}
 
         <div class="rounded-3xl border border-white/10 bg-white/[0.035] p-5">
           <div class="text-xs uppercase tracking-[0.22em] text-slate-400">Orchestrator</div>
