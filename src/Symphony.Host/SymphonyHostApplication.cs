@@ -472,6 +472,22 @@ internal static class SymphonyHostApplication
                 });
             }
 
+            // Rejected with a reason rather than dropped. A silently discarded
+            // report is indistinguishable from an idle plane, which is exactly the
+            // confusion this feed exists to remove.
+            var rejection = AgentActivity.DescribeRejection(summary);
+            if (rejection is not null)
+            {
+                return Results.BadRequest(new
+                {
+                    error = new
+                    {
+                        code = "summary_not_a_report",
+                        message = $"Report refused: {rejection}"
+                    }
+                });
+            }
+
             var at = timeProvider.GetUtcNow();
             var report = new AgentActivityReport(
                 actor,
