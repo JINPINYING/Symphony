@@ -1351,8 +1351,25 @@ public sealed class OrchestrationTickServiceTests
 
         await harness.Service.RunTickAsync(CancellationToken.None);
 
+        // The incumbent stalls and schedules a retry. Its slot is NOT handed to the
+        // waiting issue mid-flight: that hand-off is what made two ready issues take
+        // turns destroying each other's runs every three minutes (ADCP#25). The waiting
+        // issue is still visibly waiting, and the SLO diagnostic still says so.
         var retryingRun = await harness.DbContext.Runs.SingleAsync(run => run.IssueId == "issue-1");
         Assert.Equal(RunStatusNames.Retrying, retryingRun.Status);
+        Assert.Empty(harness.Coordinator.StartRequests);
+        Assert.Contains(
+            await harness.DbContext.EventLog.ToListAsync(),
+            entry => entry.EventName == "candidate_acquisition_delayed" && entry.IssueId == "issue-86");
+
+        // Once the incumbent's run is genuinely over, the long-waiting issue is acquired.
+        retryingRun.Status = RunStatusNames.CanceledByReconciliation;
+        retryingRun.CompletedAtUtc = now;
+        harness.DbContext.RetryQueue.RemoveRange(await harness.DbContext.RetryQueue.ToListAsync());
+        await harness.DbContext.SaveChangesAsync();
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
         Assert.Single(harness.Coordinator.StartRequests);
         Assert.Equal("issue-86", harness.Coordinator.StartRequests.Single().Issue.Id);
         var run = await harness.DbContext.Runs.SingleAsync(run => run.IssueId == "issue-86");
@@ -1615,6 +1632,135 @@ public sealed class OrchestrationTickServiceTests
         Assert.Equal(RunStatusNames.Running, run.Status);
         Assert.Equal("instance-2", claim.ClaimedByInstanceId);
         Assert.Empty(await harness.DbContext.RetryQueue.ToListAsync());
+    }
+
+    // ADCP#25. Replays the observed alternation: two issues carrying symphony-ready,
+    // max_concurrent_agents 1, one agent that keeps stalling. Before the fix the two
+    // issues took it in turns to destroy each other's runs every ~3 minutes and nothing
+    // ever finished - released_ineligible became the most common status in the database.
+    [Fact]
+    public async Task RunTickAsync_ShouldNotDestroyADueRetryThatMerelyLostTheSlotToAnotherIssue()
+    {
+        var clock = new MutableTimeProvider(DateTimeOffset.Parse("2026-09-01T10:00:00Z"));
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: new FakeTrackerClient(
+                [BuildIssue("issue-1", "#1", "Open", null), BuildIssue("issue-2", "#2", "Open", null)],
+                issueStatesById: new Dictionary<string, string>
+                {
+                    ["issue-1"] = "Open",
+                    ["issue-2"] = "Open"
+                }),
+            coordinator: new FakeIssueExecutionCoordinator(
+                FakeDispatchOutcome.LeaveRunning,
+                stopReturnsFalse: true),
+            timeProvider: clock);
+
+        // #1 is dispatched; #2 waits for the slot.
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        Assert.Equal(
+            RunStatusNames.Running,
+            (await harness.DbContext.Runs.SingleAsync(run => run.IssueId == "issue-1")).Status);
+        Assert.False(await harness.DbContext.Runs.AnyAsync(run => run.IssueId == "issue-2"));
+
+        // #1 stalls and schedules a retry. Its reservation survives: work in flight is
+        // not surrendered to a competitor just because no process is live this instant.
+        clock.Advance(TimeSpan.FromMinutes(6));
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        clock.Advance(TimeSpan.FromMinutes(1));
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var issueOneRun = await harness.DbContext.Runs.SingleAsync(run => run.IssueId == "issue-1");
+        Assert.NotEqual(RunStatusNames.ReleasedIneligible, issueOneRun.Status);
+        Assert.Null(issueOneRun.CompletedAtUtc);
+
+        // #2 was never started into the gap, so nothing was spent on work that would
+        // have been thrown away three minutes later.
+        Assert.DoesNotContain(harness.Coordinator.StartRequests, request => request.Issue.Id == "issue-2");
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldRescheduleRatherThanReleaseARetryRefusedForCapacity()
+    {
+        var now = DateTimeOffset.Parse("2026-09-01T10:00:00Z");
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: new FakeTrackerClient(
+                [BuildIssue("issue-1", "#1", "Open", null)],
+                issueStatesById: new Dictionary<string, string> { ["issue-1"] = "Open" }),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning),
+            timeProvider: new FixedTimeProvider(now));
+
+        // #1 has a due retry; a different issue is occupying the only slot.
+        await harness.InsertRetryingRunAsync("issue-1", "#1", "Open", "instance-1", nowUtcOverride: now);
+        await harness.InsertRunningRunAsync("issue-2", "#2", "Open", "instance-1", startedAtUtc: now);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var run = await harness.DbContext.Runs.SingleAsync(entity => entity.IssueId == "issue-1");
+        Assert.Equal(RunStatusNames.Retrying, run.Status);
+        Assert.Null(run.CompletedAtUtc);
+
+        // The reservation is kept and pushed forward, and waiting does not spend the
+        // retry budget of work that has not been tried yet.
+        var reservation = await harness.DbContext.RetryQueue.SingleAsync(entry => entry.IssueId == "issue-1");
+        Assert.Equal(1, reservation.Attempt);
+        Assert.True(reservation.DueAtUtc > now);
+        Assert.Equal("no available orchestrator slots", reservation.Error);
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldStillReleaseARetryWhoseIssueIsGenuinelyIneligible()
+    {
+        var now = DateTimeOffset.Parse("2026-09-01T10:00:00Z");
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: new FakeTrackerClient(
+                [BuildIssue("issue-1", "#1", "Closed", null)],
+                issueStatesById: new Dictionary<string, string> { ["issue-1"] = "Closed" }),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning),
+            timeProvider: new FixedTimeProvider(now));
+
+        await harness.InsertRetryingRunAsync("issue-1", "#1", "Open", "instance-1", nowUtcOverride: now);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var run = await harness.DbContext.Runs.SingleAsync();
+        Assert.Equal(RunStatusNames.ReleasedIneligible, run.Status);
+
+        // And it now says WHICH kind of ineligible. "Issue no longer eligible for
+        // dispatch" read the same whether the label was removed, the issue was closed,
+        // or the scheduler simply changed its mind - and only one of those was a bug.
+        Assert.Contains("terminal_state", run.LastMessage);
+        Assert.Empty(await harness.DbContext.RetryQueue.ToListAsync());
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldEndARetryThatHasSpentItsAttemptBudget()
+    {
+        var now = DateTimeOffset.Parse("2026-09-01T10:00:00Z");
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: new FakeTrackerClient(
+                [BuildIssue("issue-1", "#1", "Open", null)],
+                issueStatesById: new Dictionary<string, string> { ["issue-1"] = "Open" }),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning),
+            timeProvider: new FixedTimeProvider(now));
+
+        await harness.InsertRetryingRunAsync("issue-1", "#1", "Open", "instance-1", nowUtcOverride: now);
+        var reservation = await harness.DbContext.RetryQueue.SingleAsync();
+        reservation.Attempt = 99;
+        await harness.DbContext.SaveChangesAsync();
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        // Without a ceiling, honouring a reservation for the life of the run would let
+        // one issue that never recovers hold the queue against everything behind it.
+        var run = await harness.DbContext.Runs.SingleAsync();
+        Assert.Equal(RunStatusNames.NeedsCommandCenter, run.Status);
+        Assert.Empty(await harness.DbContext.RetryQueue.ToListAsync());
+        Assert.Empty(harness.Coordinator.StartRequests);
     }
 
     // ADCP#23. The reproduction is the whole point: before the fix these three tests
