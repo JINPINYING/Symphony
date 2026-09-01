@@ -467,6 +467,91 @@ public sealed class OrchestrationTickServiceTests
         Assert.Empty(tracker.RemovedLabelsByIssue);
     }
 
+    // ADCP#22. An escalated ledger is deliberately parked so the phase machine does
+    // not resume it - but "parked" was implemented as "never looked at again", so
+    // #111 was still listed on the owner's panel as stopped at the merge gate long
+    // after PR #112 had been merged and the issue closed. A resolved alarm that
+    // never clears teaches the reader the panel is not worth reading.
+    [Fact]
+    public async Task RunTickAsync_ShouldClearAMergeGateEscalationOnceItsPullRequestIsResolved()
+    {
+        var tracker = new FakeTrackerClient([]);
+        tracker.PullRequestStatusByNumber[112] = new PullRequestStatus(112, "MERGED", false, "dbbbae5c", "SUCCESS", null);
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await SeedEscalatedLedgerAsync(harness, prNumber: 112);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var ledger = Assert.Single(await harness.DbContext.PhaseLedger.ToListAsync());
+        Assert.Equal(PhaseStages.Closed, ledger.Stage);
+        Assert.Contains(
+            await harness.DbContext.EventLog.ToListAsync(),
+            entry => entry.EventName == "phase_escalation_cleared");
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldLeaveAMergeGateEscalationUpWhileItsPullRequestIsStillOpen()
+    {
+        var tracker = new FakeTrackerClient([]);
+        tracker.PullRequestStatusByNumber[112] = new PullRequestStatus(112, "OPEN", false, "dbbbae5c", "SUCCESS", "MERGEABLE");
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await SeedEscalatedLedgerAsync(harness, prNumber: 112);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        // Still waiting on a person, and the phase machine must not have resumed it.
+        var ledger = Assert.Single(await harness.DbContext.PhaseLedger.ToListAsync());
+        Assert.Equal(PhaseStages.Escalated, ledger.Stage);
+        Assert.Empty(harness.Coordinator.StartRequests);
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldLeaveAMergeGateEscalationUpWhenItCannotBeVerified()
+    {
+        // No status for PR 112 at all: clearing an alarm we could not verify is
+        // worse than leaving one up a little longer.
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: new FakeTrackerClient([]),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await SeedEscalatedLedgerAsync(harness, prNumber: 112);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Equal(
+            PhaseStages.Escalated,
+            (await harness.DbContext.PhaseLedger.SingleAsync()).Stage);
+    }
+
+    private static async Task SeedEscalatedLedgerAsync(TestHarness harness, int prNumber)
+    {
+        harness.DbContext.PhaseLedger.Add(new PhaseLedgerEntity
+        {
+            IssueId = "issue-1",
+            IssueIdentifier = "#111",
+            Stage = PhaseStages.Escalated,
+            PrNumber = prNumber,
+            HeadSha = "dbbbae5c",
+            ImplementerRunner = "codex",
+            RepairCount = 0,
+            LastVerdict = ReviewVerdicts.Approved,
+            LastVerdictHeadSha = "dbbbae5c",
+            CreatedAtUtc = DateTimeOffset.UtcNow,
+            UpdatedAtUtc = DateTimeOffset.UtcNow,
+        });
+
+        await harness.DbContext.SaveChangesAsync();
+    }
+
     private static async Task SeedReadyLedgerAsync(TestHarness harness, int prNumber, string headSha)
     {
         harness.DbContext.PhaseLedger.Add(new PhaseLedgerEntity
