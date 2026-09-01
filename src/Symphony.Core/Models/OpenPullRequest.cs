@@ -29,4 +29,10 @@ public sealed record OpenPullRequest(
     // from snapshots written before multi-repository tracking; empty means the
     // repository that was the only one at the time. Needed because "PR #122" is
     // unique only within a repository.
-    string Repository = "");
+    string Repository = "",
+    // The head branch. Trailing and defaulted for the same snapshot-compatibility
+    // reason as Repository. It is what tells a pull request the plane opened
+    // ("symphony/115") from one a person opened, which decides whether an
+    // untracked green PR is a decision waiting on the owner or a fault where the
+    // pipeline dropped its own work.
+    string? HeadRefName = null);

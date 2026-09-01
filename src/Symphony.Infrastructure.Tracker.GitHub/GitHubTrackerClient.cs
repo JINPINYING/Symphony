@@ -569,6 +569,7 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
               state
               isDraft
               mergeable
+              headRefName
               headRefOid
               commits(last: 1) {
                 nodes {
@@ -777,7 +778,8 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
                 status.ChecksState,
                 status.Mergeable,
                 updatedAt,
-                $"{query.Owner}/{query.Repo}"));
+                $"{query.Owner}/{query.Repo}",
+                GetOptionalString(prNode, "headRefName")));
         }
 
         return results;

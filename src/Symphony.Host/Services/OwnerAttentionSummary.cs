@@ -169,6 +169,13 @@ public static class OwnerAttentionSummary
                 LevelAttention));
         }
 
+        // Pull requests the phase pipeline holds a ledger row for. Anything else
+        // the plane opened is outside its own machinery and will not advance.
+        var trackedPullRequestNumbers = phases
+            .Where(p => p.PrNumber > 0 && !string.Equals(p.Stage, PhaseStages.Closed, StringComparison.Ordinal))
+            .Select(p => p.PrNumber)
+            .ToHashSet();
+
         // An open pull request is the most common way work waits on a person, and
         // for a long time this summary could not see one: every other input here
         // is the engine's own run state, so a green PR nobody had merged read as
@@ -194,13 +201,34 @@ public static class OwnerAttentionSummary
                 : string.Empty;
 
             var prLabel = Qualify(primaryRepository, pr.Repository, $"PR #{pr.Number}");
+
+            // "Waiting on you" and "the plane lost this" both leave a green pull
+            // request sitting open, and they ask completely different things of the
+            // reader - one is a judgement to make, the other is a fault to repair.
+            // The page called both the first, and the owner caught it: PR #127 was
+            // reported as their decision when in fact the phase pipeline had
+            // dropped it and would never have picked it up.
+            //
+            // Both halves are required. Most open pull requests have no ledger
+            // because a person opened them, and those genuinely are the owner's to
+            // merge - calling every untracked PR a fault would relabel all normal
+            // work as breakage. The fault is specifically a branch the PLANE
+            // created that the plane is no longer tracking.
+            var planeOpened = pr.HeadRefName?.StartsWith("symphony/", StringComparison.OrdinalIgnoreCase) == true;
+            var droppedByPipeline = planeOpened && !trackedPullRequestNumbers.Contains(pr.Number);
+            var tracked = !droppedByPipeline;
+
             items.Add(new AttentionItem(
                 failing
                     ? $"{prLabel} has failing checks"
-                    : $"{prLabel} is waiting on you",
+                    : tracked
+                        ? $"{prLabel} is waiting on you"
+                        : $"{prLabel} fell out of the pipeline",
                 failing
                     ? $"{pr.Title} - CI is red, so the merge gate will not take it.{waited}"
-                    : $"{pr.Title} - open and not blocked by CI. Nothing will merge it without you.{waited}",
+                    : tracked
+                        ? $"{pr.Title} - open and not blocked by CI. Nothing will merge it without you.{waited}"
+                        : $"{pr.Title} - open and green, but the plane is not tracking it, so no review or merge will ever run. This is a fault to repair, not a decision to make.{waited}",
                 LevelAttention,
                 string.IsNullOrWhiteSpace(pr.Url) ? null : pr.Url));
         }
