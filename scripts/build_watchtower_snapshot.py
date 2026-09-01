@@ -165,6 +165,24 @@ def capture_issue_details(base_url: str, identifiers: list[str]) -> dict[str, di
     return captured
 
 
+def attention_summary(captured: dict[str, dict]) -> dict:
+    """The engine's own 'does this need me?' verdict, for the publisher to act on.
+
+    Deliberately a passthrough. The publisher decides whether to notify, but it
+    must not decide whether something is WRONG -- that judgement lives in
+    OwnerAttentionSummary so both surfaces answer identically.
+    """
+    state = json.loads(captured["/api/v1/state"]["body"])
+    attention = state.get("attention") or {}
+    return {
+        "level": attention.get("level"),
+        "headline": attention.get("headline"),
+        "detail": attention.get("detail"),
+        "items": attention.get("items") or [],
+        "generated_at": state.get("generated_at"),
+    }
+
+
 # ---------------------------------------------------------------------------
 # coupling assertions -- see "HOW IT FAILS"
 # ---------------------------------------------------------------------------
@@ -450,6 +468,13 @@ def main(argv: list[str]) -> int:
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(html, encoding="utf-8")
         print(f"Wrote {out} ({len(html.encode('utf-8')) / 1024:.0f} KB).")
+
+        # The publisher needs to decide whether to notify, and the engine has
+        # already made that judgement in OwnerAttentionSummary. Printing it here
+        # keeps publishing to a single command -- the publisher never has to form
+        # its own opinion about whether something is wrong, which is the whole
+        # reason the answer was moved into the engine.
+        print(json.dumps({"attention": attention_summary(captured)}, indent=1))
         return 0
 
     except BuildError as error:

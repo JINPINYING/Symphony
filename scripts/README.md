@@ -13,6 +13,11 @@ python scripts/build_watchtower_snapshot.py --out watchtower-snapshot.html
 python scripts/build_watchtower_snapshot.py --check   # assertions only
 ```
 
+It also prints the engine's own `attention` verdict on stdout, so the publisher
+can decide whether to notify without forming its own opinion about whether
+anything is wrong. That judgement lives in `OwnerAttentionSummary`; keeping it
+there is why both surfaces answer identically.
+
 **Why it lives here and not in the control-plane repo.** It inlines
 `wwwroot/index.html`, `dashboard.css` and `dashboard.js`, and it answers the
 renderer's own `fetch` calls from a frozen capture. That is a tight coupling to
