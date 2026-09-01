@@ -50,6 +50,19 @@ public sealed class PhaseOrchestrator(
     TimeProvider timeProvider,
     ILogger<PhaseOrchestrator> logger)
 {
+    /// <summary>
+    /// How long a phase may sit without progress before it is reported as stuck.
+    ///
+    /// Two hours: comfortably past a slow CI run or a long agent turn, and far
+    /// short of the days a silently parked issue used to sit for.
+    /// </summary>
+    public static readonly TimeSpan StuckStageTimeout = TimeSpan.FromHours(2);
+
+    private static string Humanise(TimeSpan span) =>
+        span.TotalMinutes < 60 ? $"{(int)span.TotalMinutes} minutes"
+        : span.TotalHours < 24 ? $"{(int)span.TotalHours} hours"
+        : $"{(int)span.TotalDays} days";
+
     public static string ReviewVerdictMarker(int prNumber, string headSha) =>
         $"<!-- symphony:review-verdict:{prNumber}:{headSha} -->";
 
@@ -484,6 +497,34 @@ public sealed class PhaseOrchestrator(
             return;
         }
 
+        // Backstop: a stage that has not moved in a long time is stuck, whatever it
+        // believes it is waiting for.
+        //
+        // Every fault found in this file so far has been the same shape - a state
+        // the code did not recognise as terminal, so it waited on it forever, in
+        // silence. Enumerating statuses fixes the ones we have already met and does
+        // nothing about the next one. The stages legitimately wait on several
+        // things that can hang and none of which is bounded: a pull request left as
+        // a draft, a CI check that never reports, a claim that keeps being refused,
+        // a slot that never frees. This catches all of them, and the ones nobody
+        // has thought of, by noticing the absence of progress rather than the
+        // presence of a known failure.
+        //
+        // Deliberately generous, because the cost of being wrong is asymmetric: too
+        // short escalates work that was progressing normally and teaches the owner
+        // to ignore escalations, while too long only delays a report about work
+        // that has already stopped.
+        var stuckFor = timeProvider.GetUtcNow() - ledger.UpdatedAtUtc;
+        if (stuckFor > StuckStageTimeout)
+        {
+            await EscalateAsync(ledger,
+                $"PR #{ledger.PrNumber} has been at phase '{ledger.Stage}' for {Humanise(stuckFor)} with no progress. " +
+                $"Its pull request is {(pullRequest.IsDraft ? "a draft" : "open")} with CI {pullRequest.ChecksState ?? "not configured"}. " +
+                "Nothing in the phase machine is going to move it on its own.",
+                cancellationToken);
+            return;
+        }
+
         switch (ledger.Stage)
         {
             case PhaseStages.AwaitingVerify:
@@ -728,6 +769,10 @@ public sealed class PhaseOrchestrator(
                     $"No {reviewPhase} run found for PR #{ledger.PrNumber}; re-dispatching the review.");
                 await dbContext.SaveChangesAsync(cancellationToken);
             }
+            else if (latestReview.Status is RunStatusNames.Running or RunStatusNames.Retrying)
+            {
+                // Genuinely still working. This is the only reason to keep waiting.
+            }
             else if (latestReview.Status is RunStatusNames.Failed or RunStatusNames.TimedOut or RunStatusNames.Stalled)
             {
                 await EscalateAsync(ledger,
@@ -739,6 +784,26 @@ public sealed class PhaseOrchestrator(
                 await EscalateAsync(ledger,
                     $"The {reviewPhase} run for PR #{ledger.PrNumber} succeeded but posted no verdict comment with the exact-head marker — contract violation.",
                     cancellationToken);
+            }
+            else
+            {
+                // The run is over and never produced a verdict, but the review
+                // itself did not fail - it was cancelled out from under the phase,
+                // most often by restart reconciliation. That is the engine's doing,
+                // not the reviewer's, so the recovery is to ask again rather than
+                // to escalate a reviewer that was never given its turn.
+                //
+                // Waiting was the previous behaviour, and it was silent and
+                // permanent: every terminal status outside the three named above
+                // fell through to "keep waiting", so #128 sat at `reviewing` with a
+                // canceled_by_reconciliation review run while the page correctly
+                // showed Codex idle. The owner spotted the contradiction - the
+                // pipeline said reviewing, the reviewer was doing nothing.
+                ledger.Stage = PhaseStages.AwaitingReview;
+                ledger.UpdatedAtUtc = timeProvider.GetUtcNow();
+                AddPhaseEvent(ledger.IssueId, ledger.IssueIdentifier, "phase_review_redispatch",
+                    $"The {reviewPhase} run for PR #{ledger.PrNumber} ended '{latestReview.Status}' before producing a verdict; re-dispatching the review.");
+                await dbContext.SaveChangesAsync(cancellationToken);
             }
 
             return;
@@ -851,6 +916,29 @@ public sealed class PhaseOrchestrator(
             await EscalateAsync(ledger,
                 $"The bounded repair for PR #{ledger.PrNumber} ended '{latestRepair.Status}'.",
                 cancellationToken);
+            return;
+        }
+
+        // The same hole the reviewing stage had, in its sibling. A repair that
+        // ended without failing - cancelled by restart reconciliation, most often -
+        // is over and is never coming back, but it matched none of the statuses
+        // above and fell through to "keep waiting". So did the case of no repair
+        // run existing at all, which the reviewing stage recovers from by
+        // re-dispatching and this one did not.
+        //
+        // Re-dispatching means returning the ledger to the review that ordered the
+        // repair: it is what asks for the work again.
+        var repairIsOver = latestRepair is not null &&
+            latestRepair.Status is not (RunStatusNames.Running or RunStatusNames.Retrying or RunStatusNames.Succeeded);
+        if (latestRepair is null || repairIsOver)
+        {
+            ledger.Stage = PhaseStages.AwaitingReview;
+            ledger.UpdatedAtUtc = timeProvider.GetUtcNow();
+            AddPhaseEvent(ledger.IssueId, ledger.IssueIdentifier, "phase_repair_redispatch",
+                latestRepair is null
+                    ? $"No repair run exists for PR #{ledger.PrNumber}; returning to review rather than waiting on one that was never dispatched."
+                    : $"The repair for PR #{ledger.PrNumber} ended '{latestRepair.Status}' without moving the head; returning to review rather than waiting on a run that is over.");
+            await dbContext.SaveChangesAsync(cancellationToken);
             return;
         }
 
