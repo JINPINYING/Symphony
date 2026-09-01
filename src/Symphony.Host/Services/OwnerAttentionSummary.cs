@@ -36,15 +36,16 @@ public static class OwnerAttentionSummary
     /// The owner is left off because every repository here shares one, and a label
     /// too long for the panel is a label nobody reads.
     /// </summary>
-    private static string Qualify(bool qualifyRepositories, string? repository, string identifier)
+    private static string Qualify(string? primaryRepository, string? repository, string identifier)
     {
-        if (!qualifyRepositories || string.IsNullOrWhiteSpace(repository) || string.IsNullOrWhiteSpace(identifier))
+        if (string.IsNullOrWhiteSpace(primaryRepository) || string.IsNullOrWhiteSpace(identifier))
         {
             return identifier;
         }
 
-        var slash = repository.LastIndexOf('/');
-        var name = slash >= 0 && slash + 1 < repository.Length ? repository[(slash + 1)..] : repository;
+        var source = string.IsNullOrWhiteSpace(repository) ? primaryRepository : repository;
+        var slash = source.LastIndexOf('/');
+        var name = slash >= 0 && slash + 1 < source.Length ? source[(slash + 1)..] : source;
         return identifier.StartsWith('#') ? $"{name}{identifier}" : $"{name} {identifier}";
     }
 
@@ -64,11 +65,16 @@ public static class OwnerAttentionSummary
         TrackerReachabilitySnapshot? tracker,
         DateTimeOffset? lastEventAtUtc,
         DateTimeOffset now,
-        // When the plane watches more than one repository, "#115" stops being an
-        // answer: two repositories can each have one, and a panel that says
-        // "#115 needs a decision" is then telling the reader to go and find out
-        // which. Off for a single repository, so nothing changes there.
-        bool qualifyRepositories = false)
+        // The primary repository key when the plane watches more than one, and null
+        // when it watches one. Non-null turns qualification on: "#115" stops being
+        // an answer once two repositories can each have one, and a panel that says
+        // "#115 needs a decision" is telling the reader to go and find out which.
+        //
+        // It is the primary KEY rather than a flag because rows written before
+        // multi-repository tracking carry no repository, and they all belong to the
+        // repository that was the only one at the time - so they can be labelled
+        // correctly instead of being the one line on the panel that stays ambiguous.
+        string? primaryRepository = null)
     {
         var items = new List<AttentionItem>();
 
@@ -99,7 +105,7 @@ public static class OwnerAttentionSummary
         {
             var posted = run.EscalationPostedAtUtc is not null;
             items.Add(new AttentionItem(
-                $"{Qualify(qualifyRepositories, run.Repository, run.IssueIdentifier)} needs a decision",
+                $"{Qualify(primaryRepository, run.Repository, run.IssueIdentifier)} needs a decision",
                 posted
                     ? "Escalated and posted to GitHub. Reply with a symphony:directive comment to un-park it."
                     : "Escalated but the GitHub comment has not posted yet - the publisher may be failing.",
@@ -111,8 +117,8 @@ public static class OwnerAttentionSummary
         foreach (var phase in phases.Where(p => string.Equals(p.Stage, PhaseStages.Escalated, StringComparison.Ordinal)))
         {
             items.Add(new AttentionItem(
-                $"{Qualify(qualifyRepositories, phase.Repository, phase.IssueIdentifier)} stopped at the merge gate",
-                $"{Qualify(qualifyRepositories, phase.Repository, $"PR #{phase.PrNumber}")} was approved but not merged. The gate escalates rather than merging when a change touches a protected path.",
+                $"{Qualify(primaryRepository, phase.Repository, phase.IssueIdentifier)} stopped at the merge gate",
+                $"{Qualify(primaryRepository, phase.Repository, $"PR #{phase.PrNumber}")} was approved but not merged. The gate escalates rather than merging when a change touches a protected path.",
                 LevelAttention));
         }
 
@@ -140,7 +146,7 @@ public static class OwnerAttentionSummary
                 ? $" Waiting {Humanise(now - pr.UpdatedAtUtc)}."
                 : string.Empty;
 
-            var prLabel = Qualify(qualifyRepositories, pr.Repository, $"PR #{pr.Number}");
+            var prLabel = Qualify(primaryRepository, pr.Repository, $"PR #{pr.Number}");
             items.Add(new AttentionItem(
                 failing
                     ? $"{prLabel} has failing checks"

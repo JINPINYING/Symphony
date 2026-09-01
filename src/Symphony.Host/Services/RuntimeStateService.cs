@@ -183,7 +183,7 @@ public sealed class RuntimeStateService(
         // reported as unmonitored by the reader itself, and an outright throw
         // leaves the rest of the page intact.
         var watchedTasks = new List<WatchedTaskReport>();
-        var qualifyRepositories = false;
+        string? primaryRepository = null;
         var trackedRepositories = Array.Empty<string>();
         try
         {
@@ -193,7 +193,9 @@ public sealed class RuntimeStateService(
 
             // Only qualify identifiers when there is genuinely something to
             // disambiguate; a single-repository plane keeps reading "#115".
-            qualifyRepositories = workflowForTasks.Runtime.Tracker.IsMultiRepository;
+            primaryRepository = workflowForTasks.Runtime.Tracker.IsMultiRepository
+                ? workflowForTasks.Runtime.Tracker.PrimaryRepository.Key
+                : null;
             trackedRepositories = workflowForTasks.Runtime.Tracker.TrackedRepositories
                 .Select(repository => repository.Key)
                 .ToArray();
@@ -216,7 +218,7 @@ public sealed class RuntimeStateService(
             tracker: trackerReachability.Current,
             lastEventAtUtc: recentActivity.Count > 0 ? recentActivity[0].At : null,
             now: generatedAt,
-            qualifyRepositories: qualifyRepositories);
+            primaryRepository: primaryRepository);
 
         // The workforce view. Runners come from the workflow so an unconfigured
         // vendor is not silently reported as an idle worker.
