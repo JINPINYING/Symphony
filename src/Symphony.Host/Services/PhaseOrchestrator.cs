@@ -236,10 +236,35 @@ public sealed class PhaseOrchestrator(
                 continue;
             }
 
+            var clearedAt = timeProvider.GetUtcNow();
             ledger.Stage = PhaseStages.Closed;
-            ledger.UpdatedAtUtc = timeProvider.GetUtcNow();
+            ledger.UpdatedAtUtc = clearedAt;
+
+            // Clear the RUN too, not just the ledger.
+            //
+            // This reconciler was written to stop resolved alarms sitting on the
+            // owner's panel forever, and it closed the ledger - but the panel is
+            // built from `runs`, so the alarm stayed up anyway. On 2026-09-01 the
+            // page led with "2 things are waiting on you" for #115 and #118 while
+            // its own event stream, further down the same page, said both were
+            // "resolved and no longer needs attention". A page that contradicts
+            // itself on its most important line is worse than one that is merely
+            // late, so the two records are updated together or not at all.
+            var strandedRuns = await dbContext.Runs
+                .Where(run => run.IssueId == ledger.IssueId
+                              && run.Status == RunStatusNames.NeedsCommandCenter)
+                .ToListAsync(cancellationToken);
+            foreach (var run in strandedRuns)
+            {
+                run.Status = RunStatusNames.ResolvedByPhaseClear;
+                run.CompletedAtUtc = clearedAt;
+            }
+
             AddPhaseEvent(ledger.IssueId, ledger.IssueIdentifier, "phase_escalation_cleared",
-                $"PR #{ledger.PrNumber} is {pullRequest.State}, so the merge-gate escalation for {ledger.IssueIdentifier} is resolved and no longer needs attention.");
+                $"PR #{ledger.PrNumber} is {pullRequest.State}, so the merge-gate escalation for {ledger.IssueIdentifier} is resolved and no longer needs attention."
+                + (strandedRuns.Count > 0
+                    ? $" Also resolved {strandedRuns.Count} stranded run{(strandedRuns.Count == 1 ? string.Empty : "s")}."
+                    : string.Empty));
             cleared = true;
         }
 

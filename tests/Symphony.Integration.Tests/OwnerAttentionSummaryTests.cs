@@ -80,13 +80,27 @@ public sealed class OwnerAttentionSummaryTests
     private static OpenPullRequest Pr(int number, string? checks, bool draft = false) =>
         new(number, $"Change {number}", $"https://example.invalid/pull/{number}", "someone", draft, checks, "MERGEABLE", Now.AddHours(-6));
 
-    private static RunEntity Escalated(string issue, bool posted) => new()
+    private static RunEntity Escalated(
+        string issue,
+        bool posted,
+        string? repository = null,
+        string? lastMessage = null) => new()
     {
         Id = Guid.NewGuid().ToString("N"),
         IssueId = "issue-" + issue,
         IssueIdentifier = issue,
+        Repository = repository ?? string.Empty,
+        LastMessage = lastMessage,
         Status = RunStatusNames.NeedsCommandCenter,
         EscalationPostedAtUtc = posted ? Now.AddMinutes(-5) : null,
+    };
+
+    private static PhaseLedgerEntity Ledger(string issue, string stage, int pr = 1) => new()
+    {
+        IssueId = "issue-" + issue,
+        IssueIdentifier = issue,
+        Stage = stage,
+        PrNumber = pr
     };
 
     // The bug this whole input exists to fix: every other signal here is the
@@ -324,6 +338,81 @@ public sealed class OwnerAttentionSummaryTests
 
         Assert.Equal(OwnerAttentionSummary.LevelDown, result.Level);
         Assert.StartsWith("Stopped one", result.Items[0].Label);
+    }
+
+    // 2026-09-01: the page led with "2 things are waiting on you" for #115 and
+    // #118 while its own event stream, further down the same page, reported both
+    // as "resolved and no longer needs attention". The ledger had been closed and
+    // the runs had not. Reporting a decision that is not needed costs more trust
+    // than missing one, because the reader stops believing the number.
+    [Theory]
+    [InlineData(PhaseStages.Closed)]
+    [InlineData(PhaseStages.Merged)]
+    public void AnEscalationWhosePhaseHasSettledIsNotStillWaitingOnYou(string stage)
+    {
+        var result = Build(
+            escalated: [Escalated("#115", posted: true)],
+            phases: [Ledger("#115", stage)]);
+
+        Assert.Equal(OwnerAttentionSummary.LevelClear, result.Level);
+        Assert.Empty(result.Items);
+    }
+
+    [Fact]
+    public void AnEscalationWhosePhaseIsStillEscalatedDoesStillWait()
+    {
+        var result = Build(
+            escalated: [Escalated("#115", posted: true)],
+            phases: [Ledger("#115", PhaseStages.Escalated)]);
+
+        Assert.Contains(result.Items, i => i.Label.Contains("#115") && i.Label.Contains("needs a decision"));
+    }
+
+    // The engine already knows why it stopped. "Escalated and posted to GitHub"
+    // sent the reader off to find what was in hand the whole time.
+    [Fact]
+    public void TheReasonTheRunStoppedIsTheDetail()
+    {
+        var result = Build(escalated:
+        [
+            Escalated("#115", posted: true,
+                lastMessage: "Phase orchestration: VERIFY failed for PR #122: CI rollup is FAILURE at head 214a4406.")
+        ]);
+
+        var item = Assert.Single(result.Items);
+        Assert.Contains("CI rollup is FAILURE at head 214a4406", item.Detail);
+        Assert.Contains("symphony:directive", item.Detail);
+    }
+
+    [Fact]
+    public void AnEscalationWithNoRecordedReasonSaysSoRatherThanInventingOne()
+    {
+        var result = Build(escalated: [Escalated("#115", posted: true, lastMessage: null)]);
+
+        Assert.Contains("did not record a reason", Assert.Single(result.Items).Detail);
+    }
+
+    // An item that names a decision and makes the reader hunt for the issue is
+    // half an answer. The pull-request items had links; these did not.
+    [Fact]
+    public void AnEscalationLinksToItsIssue()
+    {
+        var result = Build(escalated:
+            [Escalated("#115", posted: true, repository: "JINPINYING/CyberMed-AI-Receptionist")]);
+
+        Assert.Equal(
+            "https://github.com/JINPINYING/CyberMed-AI-Receptionist/issues/115",
+            Assert.Single(result.Items).Url);
+    }
+
+    // A wrong link is worse than none: none is obviously absent, a wrong one is
+    // discovered only after following it.
+    [Fact]
+    public void AnEscalationWithNoRepositoryHasNoLinkRatherThanAGuessedOne()
+    {
+        var result = Build(escalated: [Escalated("#115", posted: true, repository: null)]);
+
+        Assert.Null(Assert.Single(result.Items).Url);
     }
 
     // The observed failures were DNS blips that cleared within a tick or two and
