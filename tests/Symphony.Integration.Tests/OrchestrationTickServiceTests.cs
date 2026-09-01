@@ -620,6 +620,81 @@ public sealed class OrchestrationTickServiceTests
         Assert.NotNull(run.CompletedAtUtc);
     }
 
+    // Resolving the run at the moment the ledger closes fixes every future case
+    // and no past one - that loop only visits ledgers still at stage escalated.
+    // #115 and #118 had already been cleared to closed before that code existed,
+    // so their runs would have stayed needs_command_center forever, invisible on
+    // the panel (which suppresses settled issues) but still counted by the
+    // commander's sweep, which reads the runs.
+    [Fact]
+    public async Task RunTickAsync_ShouldRepairARunLeftStrandedAgainstAnAlreadySettledLedger()
+    {
+        var tracker = new FakeTrackerClient([]);
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        // Already settled - nothing here is at stage Escalated, so the clearing
+        // loop never looks at it.
+        harness.DbContext.PhaseLedger.Add(new PhaseLedgerEntity
+        {
+            IssueId = "issue-1",
+            IssueIdentifier = "#115",
+            Stage = PhaseStages.Closed,
+            PrNumber = 122,
+            HeadSha = "214a4406",
+            ImplementerRunner = "claude",
+            CreatedAtUtc = DateTimeOffset.UtcNow,
+            UpdatedAtUtc = DateTimeOffset.UtcNow,
+        });
+        harness.DbContext.Runs.Add(new RunEntity
+        {
+            Id = Guid.NewGuid().ToString("N"),
+            IssueId = "issue-1",
+            IssueIdentifier = "#115",
+            Status = RunStatusNames.NeedsCommandCenter,
+            EscalationPostedAtUtc = DateTimeOffset.UtcNow.AddHours(-5),
+            StartedAtUtc = DateTimeOffset.UtcNow.AddHours(-6),
+        });
+        await harness.DbContext.SaveChangesAsync();
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var run = Assert.Single(await harness.DbContext.Runs.ToListAsync());
+        Assert.Equal(RunStatusNames.ResolvedByPhaseClear, run.Status);
+    }
+
+    // The sweep must not touch an escalation that is genuinely still open, or it
+    // becomes a machine for silently clearing real alarms.
+    [Fact]
+    public async Task RunTickAsync_ShouldLeaveAStrandedRunAloneWhileItsPhaseIsStillEscalated()
+    {
+        var tracker = new FakeTrackerClient([]);
+        tracker.PullRequestStatusByNumber[112] = new PullRequestStatus(112, "OPEN", false, "dbbbae5c", "SUCCESS", "MERGEABLE");
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await SeedEscalatedLedgerAsync(harness, prNumber: 112);
+        harness.DbContext.Runs.Add(new RunEntity
+        {
+            Id = Guid.NewGuid().ToString("N"),
+            IssueId = "issue-1",
+            IssueIdentifier = "#111",
+            Status = RunStatusNames.NeedsCommandCenter,
+            EscalationPostedAtUtc = DateTimeOffset.UtcNow.AddMinutes(-30),
+            StartedAtUtc = DateTimeOffset.UtcNow.AddHours(-1),
+        });
+        await harness.DbContext.SaveChangesAsync();
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var run = Assert.Single(await harness.DbContext.Runs.ToListAsync());
+        Assert.Equal(RunStatusNames.NeedsCommandCenter, run.Status);
+    }
+
     [Fact]
     public async Task RunTickAsync_ShouldLeaveAMergeGateEscalationUpWhileItsPullRequestIsStillOpen()
     {
