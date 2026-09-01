@@ -228,6 +228,20 @@ public sealed class RuntimeStateService(
             var workflow = await workflowDefinitionProvider.GetCurrentAsync(cancellationToken);
             configuredRunners.Add(workflow.Runtime.Agent.DefaultRunner);
             configuredRunners.AddRange(workflow.Runtime.Agent.RunnerByLabel.Values);
+
+            // The fallback vendor is a member of the team, not a spare part. It
+            // reviews everything the implementer produces - review is always a
+            // cross-vendor dispatch - and it takes the work outright when the
+            // implementer runs out of quota.
+            //
+            // It was invisible here because the list was built from the implementer
+            // settings only. Once runner_by_label emptied and both lanes went to
+            // one vendor, "what the team is doing" showed a team of one, which is
+            // not what is configured and not what happens.
+            if (!string.IsNullOrWhiteSpace(workflow.Runtime.Agent.FallbackRunner))
+            {
+                configuredRunners.Add(workflow.Runtime.Agent.FallbackRunner!);
+            }
         }
         catch (Exception)
         {

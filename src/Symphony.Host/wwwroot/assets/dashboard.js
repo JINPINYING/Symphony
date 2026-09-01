@@ -514,9 +514,18 @@ function renderAttention() {
     : null;
   const STALE_AFTER_MS = 2 * 60 * 60 * 1000;
 
+  /* "Now" replaced the age instead of decorating it, and it covered a fifteen
+   * minute window - so a report from 14 minutes ago read "Now" while the one
+   * below it read "16 minutes ago". A two-minute difference rendered as a jump
+   * from nothing to sixteen, which made a correctly ordered list look shuffled.
+   * The owner spotted it and asked whether the feed was even in time order.
+   *
+   * Every row carries its real age now; liveness is a dot beside it rather than
+   * a substitute for the number. Same rule as the rest of this page: a label must
+   * not stand in front of the fact it is describing. */
   const activity = reports.map(report => `
     <li class="agent-row">
-      <span class="agent-when">${report.live ? "Now" : escapeHtml(formatRelativeTime(report.at))}</span>
+      <span class="agent-when">${report.live ? '<span class="agent-live" title="Reported within the last 15 minutes"></span>' : ""}${escapeHtml(formatRelativeTime(report.at))}</span>
       <span class="agent-actor">${escapeHtml(report.actor || "agent")}</span>
       <span class="agent-summary">${escapeHtml(report.summary || "")}</span>
     </li>`).join("");
