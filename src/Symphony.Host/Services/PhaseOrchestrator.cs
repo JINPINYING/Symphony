@@ -87,13 +87,24 @@ public sealed class PhaseOrchestrator(
             return;
         }
 
-        var ledgeredIssueIds = new HashSet<string>(
-            await dbContext.PhaseLedger.Select(entry => entry.IssueId).ToListAsync(cancellationToken),
-            StringComparer.OrdinalIgnoreCase);
+        var ledgersByIssue = (await dbContext.PhaseLedger.ToListAsync(cancellationToken))
+            .ToDictionary(entry => entry.IssueId, StringComparer.OrdinalIgnoreCase);
 
         foreach (var issueRuns in succeededImplementations.GroupBy(run => run.IssueId, StringComparer.OrdinalIgnoreCase))
         {
-            if (ledgeredIssueIds.Contains(issueRuns.Key))
+            ledgersByIssue.TryGetValue(issueRuns.Key, out var existingLedger);
+
+            // A ledger that is still working owns the issue; leave it alone.
+            //
+            // This used to skip any issue that had EVER had a ledger, which
+            // silently dropped every second implementation cycle out of the
+            // pipeline forever. #115 hit it: PR #122 failed CI and was closed, the
+            // issue was reimplemented as PR #127, and because a (terminal) ledger
+            // row already existed no new one was seeded - so #127 never reached
+            // verify, review or the merge gate, and would have sat open until a
+            // person noticed. The owner noticed, by asking whether "waiting on
+            // you" really meant them.
+            if (existingLedger is not null && !IsTerminalStage(existingLedger.Stage))
             {
                 continue;
             }
@@ -120,20 +131,53 @@ public sealed class PhaseOrchestrator(
                 continue;
             }
 
-            var nowUtc = timeProvider.GetUtcNow();
-            dbContext.PhaseLedger.Add(new PhaseLedgerEntity
+            // Nothing new to enter: the settled ledger already describes this PR.
+            if (existingLedger is not null && existingLedger.PrNumber == prNumber.Value)
             {
-                IssueId = issue.Id,
-                IssueIdentifier = issue.Identifier,
-                Repository = latestRun.Repository,
-                Stage = PhaseStages.AwaitingVerify,
-                PrNumber = prNumber.Value,
-                ImplementerRunner = AgentRunnerNames.IsKnown(latestRun.Runner) ? latestRun.Runner : AgentRunnerNames.Codex,
-                CreatedAtUtc = nowUtc,
-                UpdatedAtUtc = nowUtc
-            });
-            AddPhaseEvent(issue.Id, issue.Identifier, "phase_ledger_created",
-                $"Implementation durable; PR #{prNumber} enters verify/review phases (implementer: {latestRun.Runner}).");
+                continue;
+            }
+
+            var nowUtc = timeProvider.GetUtcNow();
+            var runner = AgentRunnerNames.IsKnown(latestRun.Runner) ? latestRun.Runner : AgentRunnerNames.Codex;
+
+            if (existingLedger is null)
+            {
+                dbContext.PhaseLedger.Add(new PhaseLedgerEntity
+                {
+                    IssueId = issue.Id,
+                    IssueIdentifier = issue.Identifier,
+                    Repository = latestRun.Repository,
+                    Stage = PhaseStages.AwaitingVerify,
+                    PrNumber = prNumber.Value,
+                    ImplementerRunner = runner,
+                    CreatedAtUtc = nowUtc,
+                    UpdatedAtUtc = nowUtc
+                });
+                AddPhaseEvent(issue.Id, issue.Identifier, "phase_ledger_created",
+                    $"Implementation durable; PR #{prNumber} enters verify/review phases (implementer: {runner}).");
+            }
+            else
+            {
+                // The ledger is keyed by issue, so a second cycle resets the row
+                // rather than adding one. Every judgement carried by the old row
+                // belonged to the OLD pull request and must go with it - a verdict
+                // or a rejected head left behind would fence the new PR against a
+                // commit from a different branch.
+                var settledPrNumber = existingLedger.PrNumber;
+                existingLedger.Repository = latestRun.Repository;
+                existingLedger.Stage = PhaseStages.AwaitingVerify;
+                existingLedger.PrNumber = prNumber.Value;
+                existingLedger.ImplementerRunner = runner;
+                existingLedger.HeadSha = null;
+                existingLedger.LastVerdict = null;
+                existingLedger.LastVerdictHeadSha = null;
+                existingLedger.RejectedHeadSha = null;
+                existingLedger.RepairCount = 0;
+                existingLedger.UpdatedAtUtc = nowUtc;
+                AddPhaseEvent(issue.Id, issue.Identifier, "phase_ledger_reopened",
+                    $"Reimplemented after PR #{settledPrNumber} settled; PR #{prNumber} enters verify/review phases (implementer: {runner}).");
+            }
+
             await dbContext.SaveChangesAsync(cancellationToken);
         }
     }
@@ -365,6 +409,12 @@ public sealed class PhaseOrchestrator(
             return [];
         }
     }
+
+    // A ledger at one of these stages has finished with its pull request. It is
+    // history, not work in progress, so it must not block a later cycle.
+    private static bool IsTerminalStage(string? stage) =>
+        string.Equals(stage, PhaseStages.Closed, StringComparison.Ordinal) ||
+        string.Equals(stage, PhaseStages.Merged, StringComparison.Ordinal);
 
     private static bool IsTerminalPullRequestState(string? state) =>
         string.Equals(state, "MERGED", StringComparison.OrdinalIgnoreCase) ||

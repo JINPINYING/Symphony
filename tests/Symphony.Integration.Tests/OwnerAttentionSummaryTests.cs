@@ -77,8 +77,8 @@ public sealed class OwnerAttentionSummaryTests
     private static AgentActivityReport Activity(string summary, TimeSpan ago) =>
         new("Claude", summary, null, null, Now - ago);
 
-    private static OpenPullRequest Pr(int number, string? checks, bool draft = false) =>
-        new(number, $"Change {number}", $"https://example.invalid/pull/{number}", "someone", draft, checks, "MERGEABLE", Now.AddHours(-6));
+    private static OpenPullRequest Pr(int number, string? checks, bool draft = false, string? branch = null) =>
+        new(number, $"Change {number}", $"https://example.invalid/pull/{number}", "someone", draft, checks, "MERGEABLE", Now.AddHours(-6), "", branch);
 
     private static RunEntity Escalated(
         string issue,
@@ -413,6 +413,46 @@ public sealed class OwnerAttentionSummaryTests
         var result = Build(escalated: [Escalated("#115", posted: true, repository: null)]);
 
         Assert.Null(Assert.Single(result.Items).Url);
+    }
+
+    // The owner asked whether "waiting on you" really meant them. For PR #127 it
+    // did not: the plane had opened it, then dropped it - the ledger still pointed
+    // at the previous, closed pull request, so no review or merge would ever run.
+    // "Decide this" and "the plane lost this" ask completely different things of
+    // the reader, and the page called both the first.
+    [Fact]
+    public void AGreenPullRequestThePipelineIsNotTrackingIsAFaultNotADecision()
+    {
+        var result = Build(
+            openPullRequests: [Pr(127, "SUCCESS", branch: "symphony/115")],
+            phases: [Ledger("#115", PhaseStages.Closed, pr: 122)]);
+
+        var item = Assert.Single(result.Items);
+        Assert.Contains("fell out of the pipeline", item.Label);
+        Assert.Contains("fault to repair, not a decision", item.Detail);
+    }
+
+    [Fact]
+    public void AGreenPullRequestThePipelineHoldsIsStillYourDecision()
+    {
+        var result = Build(
+            openPullRequests: [Pr(127, "SUCCESS", branch: "symphony/115")],
+            phases: [Ledger("#115", PhaseStages.Ready, pr: 127)]);
+
+        var item = Assert.Single(result.Items);
+        Assert.Contains("is waiting on you", item.Label);
+        Assert.Contains("Nothing will merge it without you", item.Detail);
+    }
+
+    // Red CI outranks both: the gate will not take it whoever it belongs to.
+    [Fact]
+    public void FailingChecksOutrankTheTrackingQuestion()
+    {
+        var result = Build(
+            openPullRequests: [Pr(127, "FAILURE", branch: "symphony/115")],
+            phases: [Ledger("#115", PhaseStages.Closed, pr: 122)]);
+
+        Assert.Contains("has failing checks", Assert.Single(result.Items).Label);
     }
 
     // The observed failures were DNS blips that cleared within a tick or two and
