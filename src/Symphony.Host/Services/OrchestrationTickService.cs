@@ -24,6 +24,7 @@ public sealed partial class OrchestrationTickService
     private readonly DirectiveProcessor directiveProcessor;
     private readonly PhaseOrchestrator phaseOrchestrator;
     private readonly EventLogRetentionService eventLogRetentionService;
+    private readonly TrackerReachability trackerReachability;
     private readonly OrchestrationOptions orchestrationOptions;
     private readonly TimeProvider timeProvider;
     private readonly ILogger<OrchestrationTickService> logger;
@@ -52,6 +53,7 @@ public sealed partial class OrchestrationTickService
         DirectiveProcessor directiveProcessor,
         PhaseOrchestrator phaseOrchestrator,
         EventLogRetentionService eventLogRetentionService,
+        TrackerReachability trackerReachability,
         IOptions<OrchestrationOptions> orchestrationOptions,
         TimeProvider timeProvider,
         ILogger<OrchestrationTickService> logger)
@@ -66,6 +68,7 @@ public sealed partial class OrchestrationTickService
         this.directiveProcessor = directiveProcessor;
         this.phaseOrchestrator = phaseOrchestrator;
         this.eventLogRetentionService = eventLogRetentionService;
+        this.trackerReachability = trackerReachability;
         this.orchestrationOptions = orchestrationOptions.Value;
         this.timeProvider = timeProvider;
         this.logger = logger;

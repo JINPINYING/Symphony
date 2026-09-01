@@ -136,6 +136,8 @@ internal static class SymphonyHostApplication
         services.AddSymphonyWorkspaceServices();
         services.AddSingleton<IIssueExecutionCoordinator, IssueExecutionCoordinator>();
         services.AddSingleton<RefreshSignalService>();
+        // Singleton: a failure streak only means anything across ticks.
+        services.AddSingleton<TrackerReachability>();
         services.AddScoped<EscalationPublisher>();
         services.AddScoped<DirectiveProcessor>();
         services.AddScoped<PhaseOrchestrator>();

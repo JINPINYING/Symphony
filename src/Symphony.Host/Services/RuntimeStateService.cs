@@ -11,6 +11,7 @@ public sealed class RuntimeStateService(
     SymphonyDbContext dbContext,
     IWorkflowDefinitionProvider workflowDefinitionProvider,
     IWatchedTaskReader watchedTaskReader,
+    TrackerReachability trackerReachability,
     TimeProvider timeProvider)
 {
     // A malformed or older snapshot must never take the page down. An empty list
@@ -164,6 +165,7 @@ public sealed class RuntimeStateService(
             openPullRequests: openPullRequests,
             agentActivity: agentActivity,
             watchedTasks: watchedTasks,
+            tracker: trackerReachability.Current,
             lastEventAtUtc: recentActivity.Count > 0 ? recentActivity[0].At : null,
             now: generatedAt);
 
@@ -223,6 +225,14 @@ public sealed class RuntimeStateService(
                     severity = item.Severity,
                     url = item.Url
                 })
+            },
+            tracker_reachability = new
+            {
+                consecutive_failures = trackerReachability.Current.ConsecutiveFailures,
+                last_success = trackerReachability.Current.LastSuccessUtc?.ToString("o"),
+                unreachable_since = trackerReachability.Current.UnreachableSinceUtc?.ToString("o"),
+                last_failure_reason = trackerReachability.Current.LastFailureReason,
+                last_failure_transient = trackerReachability.Current.LastFailureTransient
             },
             watched_tasks = watchedTasks.Select(task => new
             {

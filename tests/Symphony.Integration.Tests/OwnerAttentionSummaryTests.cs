@@ -20,8 +20,9 @@ public sealed class OwnerAttentionSummaryTests
         IReadOnlyList<OpenPullRequest>? openPullRequests = null,
         IReadOnlyList<AgentActivityReport>? agentActivity = null,
         IReadOnlyList<WatchedTaskReport>? watchedTasks = null,
+        TrackerReachabilitySnapshot? tracker = null,
         DateTimeOffset? lastEvent = null) =>
-        OwnerAttentionSummary.Build(healthy, escalated ?? [], running, retrying, phases ?? [], openPullRequests ?? [], agentActivity ?? [], watchedTasks ?? [], lastEvent, Now);
+        OwnerAttentionSummary.Build(healthy, escalated ?? [], running, retrying, phases ?? [], openPullRequests ?? [], agentActivity ?? [], watchedTasks ?? [], tracker, lastEvent, Now);
 
     private static WatchedTaskReport Task(string name, string health) =>
         new(name, "\\" + name, "Enabled", "Ready", Now.AddMinutes(-5), 0, Now.AddMinutes(10), 15, health, $"{name} is {health}.");
@@ -276,6 +277,48 @@ public sealed class OwnerAttentionSummaryTests
 
         Assert.Equal(OwnerAttentionSummary.LevelDown, result.Level);
         Assert.StartsWith("Stopped one", result.Items[0].Label);
+    }
+
+    // The observed failures were DNS blips that cleared within a tick or two and
+    // cost nothing. Reporting each of them would train the reader to ignore red,
+    // which is the same failure this page keeps trying not to commit.
+    [Fact]
+    public void ABriefLossOfTheTrackerIsNotWorthWakingAnyone()
+    {
+        var tracker = new TrackerReachabilitySnapshot(
+            ConsecutiveFailures: 3,
+            LastSuccessUtc: Now.AddMinutes(-2),
+            UnreachableSinceUtc: Now.AddMinutes(-2),
+            LastFailureReason: "No such host is known. (api.github.com:443)",
+            LastFailureTransient: true);
+
+        var result = Build(tracker: tracker);
+
+        Assert.Equal(OwnerAttentionSummary.LevelClear, result.Level);
+        Assert.Empty(result.Items);
+    }
+
+    // Sustained, though, means the plane is blind: nothing is found, nothing is
+    // dispatched, and from the inside that is indistinguishable from a quiet
+    // queue - so it has to be said out loud.
+    [Fact]
+    public void ATrackerThatStaysUnreachableIsABlindPlane()
+    {
+        var tracker = new TrackerReachabilitySnapshot(
+            ConsecutiveFailures: 90,
+            LastSuccessUtc: Now.AddMinutes(-25),
+            UnreachableSinceUtc: Now.AddMinutes(-25),
+            LastFailureReason: "No such host is known. (api.github.com:443)",
+            LastFailureTransient: true);
+
+        var result = Build(tracker: tracker);
+
+        Assert.Equal(OwnerAttentionSummary.LevelDown, result.Level);
+        var item = Assert.Single(result.Items);
+        Assert.Equal("The issue tracker cannot be reached", item.Label);
+        // The cause must travel with the alarm. Reporting only that a scan failed
+        // is what sent the real answer to a 64 MB log file in the first place.
+        Assert.Contains("api.github.com", item.Detail);
     }
 
     // The point of the whole feature is that silence is legible - which means a

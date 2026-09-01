@@ -27,14 +27,26 @@ public sealed partial class OrchestrationTickService
         }
         catch (Exception ex)
         {
+            // The old message was the exception's TYPE and nothing else, which
+            // produced a dozen identical "GitHubTrackerException." rows and sent
+            // the real cause - intermittent DNS - to a 64 MB rotated log where
+            // nobody glancing at the page would ever find it. Record the cause.
+            var transient = TrackerReachability.IsTransientConnectivity(ex);
+            var cause = TrackerReachability.DescribeCause(ex);
+            trackerReachability.RecordFailure(cause, transient);
+
+            // Connectivity blips recover within a tick or two and cost nothing;
+            // logging each at Error teaches the reader that red means nothing.
+            // A refusal - bad credentials, a malformed query - will fail the same
+            // way forever, and does deserve the louder level.
             AddIssueEvent(
                 null,
                 null,
                 null,
                 null,
                 "candidate_scan_failed",
-                LogLevel.Error,
-                $"Candidate fetch failed for {query.Owner}/{query.Repo}: {ex.GetType().Name}.");
+                transient ? LogLevel.Warning : LogLevel.Error,
+                $"Candidate fetch failed for {query.Owner}/{query.Repo}: {cause}");
             await dbContext.SaveChangesAsync(cancellationToken);
             logger.LogWarning(
                 ex,
@@ -43,6 +55,8 @@ public sealed partial class OrchestrationTickService
                 query.Repo);
             return;
         }
+
+        trackerReachability.RecordSuccess();
 
         await UpsertIssueCacheAsync(issues, workflowDefinition, cancellationToken);
 
