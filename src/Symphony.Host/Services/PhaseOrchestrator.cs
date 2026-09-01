@@ -55,15 +55,15 @@ public sealed class PhaseOrchestrator(
 
     public async Task ProcessPhasesAsync(
         WorkflowDefinition workflowDefinition,
-        TrackerQuery query,
+        TrackerQuerySet queries,
         Func<NormalizedIssue, PhaseDispatchRequest, CancellationToken, Task<bool>> dispatchAsync,
         CancellationToken cancellationToken)
     {
         try
         {
-            await SeedLedgersForCompletedImplementationsAsync(query, cancellationToken);
-            await AdvanceLedgersAsync(workflowDefinition, query, dispatchAsync, cancellationToken);
-            await ReconcileEscalatedLedgersAsync(query, cancellationToken);
+            await SeedLedgersForCompletedImplementationsAsync(queries, cancellationToken);
+            await AdvanceLedgersAsync(workflowDefinition, queries, dispatchAsync, cancellationToken);
+            await ReconcileEscalatedLedgersAsync(queries, cancellationToken);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -76,7 +76,7 @@ public sealed class PhaseOrchestrator(
     }
 
     private async Task SeedLedgersForCompletedImplementationsAsync(
-        TrackerQuery query,
+        TrackerQuerySet queries,
         CancellationToken cancellationToken)
     {
         var succeededImplementations = await dbContext.Runs
@@ -99,6 +99,11 @@ public sealed class PhaseOrchestrator(
             }
 
             var latestRun = issueRuns.OrderByDescending(run => run.CompletedAtUtc ?? run.StartedAtUtc).First();
+
+            // The repository the implementation actually ran in. A pull request
+            // number means nothing without it: two repositories can each have a
+            // PR #122, and everything after this point asks about one by number.
+            var query = queries.For(latestRun.Repository);
             var issues = await trackerClient.FetchIssuesByIdsAsync(query, [issueRuns.Key], cancellationToken);
             var issue = issues.FirstOrDefault();
             if (issue is null || IssueStateMatcher.IsClosedState(issue.State))
@@ -120,6 +125,7 @@ public sealed class PhaseOrchestrator(
             {
                 IssueId = issue.Id,
                 IssueIdentifier = issue.Identifier,
+                Repository = latestRun.Repository,
                 Stage = PhaseStages.AwaitingVerify,
                 PrNumber = prNumber.Value,
                 ImplementerRunner = AgentRunnerNames.IsKnown(latestRun.Runner) ? latestRun.Runner : AgentRunnerNames.Codex,
@@ -180,7 +186,7 @@ public sealed class PhaseOrchestrator(
     // and if the snapshot was merely truncated that fetch answers OPEN and nothing
     // happens.
     private async Task ReconcileEscalatedLedgersAsync(
-        TrackerQuery query,
+        TrackerQuerySet queries,
         CancellationToken cancellationToken)
     {
         var escalated = await dbContext.PhaseLedger
@@ -204,7 +210,10 @@ public sealed class PhaseOrchestrator(
             PullRequestStatus? pullRequest;
             try
             {
-                pullRequest = await trackerClient.FetchPullRequestStatusAsync(query, ledger.PrNumber, cancellationToken);
+                pullRequest = await trackerClient.FetchPullRequestStatusAsync(
+                    queries.For(ledger.Repository),
+                    ledger.PrNumber,
+                    cancellationToken);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -274,7 +283,7 @@ public sealed class PhaseOrchestrator(
 
     private async Task AdvanceLedgersAsync(
         WorkflowDefinition workflowDefinition,
-        TrackerQuery query,
+        TrackerQuerySet queries,
         Func<NormalizedIssue, PhaseDispatchRequest, CancellationToken, Task<bool>> dispatchAsync,
         CancellationToken cancellationToken)
     {
@@ -288,7 +297,12 @@ public sealed class PhaseOrchestrator(
         {
             try
             {
-                await AdvanceOneAsync(workflowDefinition, query, ledger, dispatchAsync, cancellationToken);
+                await AdvanceOneAsync(
+                    workflowDefinition,
+                    queries.For(ledger.Repository),
+                    ledger,
+                    dispatchAsync,
+                    cancellationToken);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {

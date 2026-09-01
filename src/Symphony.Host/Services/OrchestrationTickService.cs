@@ -182,7 +182,7 @@ public sealed partial class OrchestrationTickService
             // overwrote the review run's phase and runner.
             await phaseOrchestrator.ProcessPhasesAsync(
                 workflowDefinition,
-                BuildTrackerQuery(workflowDefinition, apiKey),
+                BuildTrackerQueries(workflowDefinition, apiKey),
                 (issue, phaseRequest, token) => DispatchPhaseIssueAsync(issue, workflowDefinition, instanceId, phaseRequest, token),
                 cancellationToken);
 
@@ -232,10 +232,17 @@ public sealed partial class OrchestrationTickService
 
         try
         {
-            var openPullRequests = await trackerClient.FetchOpenPullRequestsAsync(
-                BuildTrackerQuery(workflowDefinition, apiKey),
-                OpenPullRequestLimit,
-                cancellationToken);
+            // Every tracked repository, merged into one snapshot: "what is sitting
+            // open waiting for a person" is a question about the plane's whole
+            // surface, not about whichever repository happens to be first.
+            var openPullRequests = new List<OpenPullRequest>();
+            foreach (var repositoryQuery in BuildTrackerQueries(workflowDefinition, apiKey).All)
+            {
+                openPullRequests.AddRange(await trackerClient.FetchOpenPullRequestsAsync(
+                    repositoryQuery,
+                    OpenPullRequestLimit,
+                    cancellationToken));
+            }
 
             var now = timeProvider.GetUtcNow();
             nextOpenPullRequestPollUtc = now + OpenPullRequestPollInterval;

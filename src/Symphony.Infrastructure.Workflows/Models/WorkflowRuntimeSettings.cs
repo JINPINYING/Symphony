@@ -30,17 +30,71 @@ public sealed record WorkflowWatchedTaskSettings(
     int ExpectEveryMinutes,
     int? LateAfterMinutes);
 
+// One repository the plane watches, and the workspace it works it in.
+//
+// The workspace fields are per repository rather than global because they have
+// to be: two repositories can each have an issue #115, and a single clone path
+// or worktrees root would put both issues in the same directory. Separate roots
+// also mean branch names cannot collide, since symphony/115 in one repository
+// and symphony/115 in another are simply different branches in different repos.
+public sealed record WorkflowRepositorySettings(
+    string Owner,
+    string Repo,
+    string SharedClonePath,
+    string WorktreesRoot,
+    string RemoteUrl)
+{
+    // "owner/repo" - the durable key recorded on runs, ledgers and cache rows so
+    // a later phase can rebuild the query for the repository the work came from.
+    public string Key => $"{Owner}/{Repo}";
+}
+
 public sealed record WorkflowTrackerSettings(
     string Kind,
     string Endpoint,
     string ApiKey,
+    // Owner/Repo remain the PRIMARY repository rather than the only one. Keeping
+    // them means a single-repository config, the preflight validator and every
+    // existing consumer behave exactly as before; Repositories is what makes more
+    // than one possible.
     string Owner,
     string Repo,
     string? Milestone,
     bool IncludePullRequests,
     IReadOnlyList<string> Labels,
     IReadOnlyList<string> ActiveStates,
-    IReadOnlyList<string> TerminalStates);
+    IReadOnlyList<string> TerminalStates,
+    // Trailing with a default so existing construction sites keep compiling. An
+    // empty list means "just the primary repository", which the loader fills in.
+    IReadOnlyList<WorkflowRepositorySettings>? Repositories = null)
+{
+    public IReadOnlyList<WorkflowRepositorySettings> TrackedRepositories =>
+        Repositories is { Count: > 0 } configured
+            ? configured
+            : [new WorkflowRepositorySettings(Owner, Repo, string.Empty, string.Empty, string.Empty)];
+
+    public WorkflowRepositorySettings PrimaryRepository => TrackedRepositories[0];
+
+    public bool IsMultiRepository => TrackedRepositories.Count > 1;
+
+    public WorkflowRepositorySettings? FindRepository(string? key)
+    {
+        if (string.IsNullOrWhiteSpace(key))
+        {
+            return null;
+        }
+
+        foreach (var repository in TrackedRepositories)
+        {
+            if (repository.Key.Equals(key, StringComparison.OrdinalIgnoreCase))
+            {
+                return repository;
+            }
+        }
+
+        return null;
+    }
+}
 
 public sealed record WorkflowPollingSettings(int IntervalMs);
 

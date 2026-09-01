@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Symphony.Core.Configuration;
+using Symphony.Core.Models;
 using Symphony.Infrastructure.Workflows;
 using Symphony.Infrastructure.Workflows.Models;
 
@@ -186,6 +187,177 @@ public sealed class WorkflowLoaderTests
         ---
         Prompt.
         """;
+
+    // A control plane that cannot be pointed at its own backlog will always depend
+    // on someone doing its repairs by hand. tracker.repositories is what makes more
+    // than one possible; everything below is about not breaking the one that exists.
+    [Fact]
+    public async Task LoadAsync_ShouldGiveEveryTrackedRepositoryItsOwnWorkspace()
+    {
+        var workflowPath = CreateWorkflowPath();
+        await File.WriteAllTextAsync(workflowPath, """
+            ---
+            tracker:
+              kind: github
+              endpoint: https://api.github.com/graphql
+              api_key: test-token
+              repositories:
+                - owner: JINPINYING
+                  repo: CyberMed-AI-Receptionist
+                - owner: JINPINYING
+                  repo: Symphony
+            workspace:
+              root: ./workspaces
+              shared_clone_path: ./workspaces/repo
+              worktrees_root: ./workspaces/worktrees
+              remote_url: https://github.com/JINPINYING/CyberMed-AI-Receptionist.git
+            ---
+            Prompt.
+            """);
+
+        try
+        {
+            var definition = await new WorkflowLoader().LoadAsync(workflowPath);
+            var tracker = definition.Runtime.Tracker;
+
+            Assert.True(tracker.IsMultiRepository);
+
+            // owner/repo default to the first entry, so a multi-repository config
+            // does not have to repeat itself and the preflight validator - which
+            // still reads them - keeps working.
+            Assert.Equal("JINPINYING", tracker.Owner);
+            Assert.Equal("CyberMed-AI-Receptionist", tracker.Repo);
+
+            // The first repository keeps the configured paths verbatim. Re-deriving
+            // them would strand the clone and worktrees already on disk.
+            var primary = tracker.TrackedRepositories[0];
+            Assert.Equal(definition.Runtime.Workspace.SharedClonePath, primary.SharedClonePath);
+            Assert.Equal(definition.Runtime.Workspace.WorktreesRoot, primary.WorktreesRoot);
+            Assert.Equal("https://github.com/JINPINYING/CyberMed-AI-Receptionist.git", primary.RemoteUrl);
+
+            // The second gets its own, or both repositories' issue #115 would land
+            // in the same directory.
+            var secondary = tracker.TrackedRepositories[1];
+            Assert.NotEqual(primary.SharedClonePath, secondary.SharedClonePath);
+            Assert.NotEqual(primary.WorktreesRoot, secondary.WorktreesRoot);
+            Assert.Equal("https://github.com/JINPINYING/Symphony.git", secondary.RemoteUrl);
+
+            // Siblings, not children: one repository's cleanup sweep must never walk
+            // into another's worktrees. Checked on the boundary rather than as a
+            // substring, because "worktrees-symphony" starts with "worktrees" while
+            // being nowhere inside it - which is exactly the distinction that makes
+            // this safe, and exactly what a substring test would get wrong.
+            var primaryRoot = WorkspacePathSafety.GetAbsolutePath(primary.WorktreesRoot)
+                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            var secondaryRoot = WorkspacePathSafety.GetAbsolutePath(secondary.WorktreesRoot);
+            Assert.False(
+                secondaryRoot.StartsWith(primaryRoot + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase),
+                $"'{secondaryRoot}' must not sit inside '{primaryRoot}'.");
+            Assert.NotEqual(primaryRoot, secondaryRoot);
+            Assert.Equal("JINPINYING/Symphony", secondary.Key);
+        }
+        finally
+        {
+            File.Delete(workflowPath);
+        }
+    }
+
+    [Fact]
+    public async Task LoadAsync_ShouldTreatASingleRepositoryConfigExactlyAsBefore()
+    {
+        var workflowPath = CreateWorkflowPath();
+        await File.WriteAllTextAsync(workflowPath, """
+            ---
+            tracker:
+              kind: github
+              endpoint: https://api.github.com/graphql
+              api_key: test-token
+              owner: released
+              repo: symphony
+            workspace:
+              shared_clone_path: ./workspaces/repo
+              worktrees_root: ./workspaces/worktrees
+            ---
+            Prompt.
+            """);
+
+        try
+        {
+            var definition = await new WorkflowLoader().LoadAsync(workflowPath);
+            var tracker = definition.Runtime.Tracker;
+
+            Assert.False(tracker.IsMultiRepository);
+            var only = Assert.Single(tracker.TrackedRepositories);
+            Assert.Equal("released/symphony", only.Key);
+            Assert.Equal(definition.Runtime.Workspace.SharedClonePath, only.SharedClonePath);
+            Assert.Equal(definition.Runtime.Workspace.WorktreesRoot, only.WorktreesRoot);
+        }
+        finally
+        {
+            File.Delete(workflowPath);
+        }
+    }
+
+    // Listed twice: it would be fetched twice, dispatch the same issue twice, and
+    // race itself for its own workspace.
+    [Fact]
+    public async Task LoadAsync_ShouldRejectARepositoryListedTwice()
+    {
+        var workflowPath = CreateWorkflowPath();
+        await File.WriteAllTextAsync(workflowPath, """
+            ---
+            tracker:
+              kind: github
+              endpoint: https://api.github.com/graphql
+              api_key: test-token
+              repositories:
+                - owner: JINPINYING
+                  repo: Symphony
+                - owner: jinpinying
+                  repo: symphony
+            ---
+            Prompt.
+            """);
+
+        try
+        {
+            var exception = await Assert.ThrowsAsync<WorkflowLoadException>(
+                () => new WorkflowLoader().LoadAsync(workflowPath));
+            Assert.Equal("duplicate_tracker_repository", exception.Code);
+        }
+        finally
+        {
+            File.Delete(workflowPath);
+        }
+    }
+
+    // Given but empty says "watch nothing", which is never what anyone means.
+    [Fact]
+    public async Task LoadAsync_ShouldRejectAnEmptyRepositoryList()
+    {
+        var workflowPath = CreateWorkflowPath();
+        await File.WriteAllTextAsync(workflowPath, """
+            ---
+            tracker:
+              kind: github
+              endpoint: https://api.github.com/graphql
+              api_key: test-token
+              repositories: []
+            ---
+            Prompt.
+            """);
+
+        try
+        {
+            var exception = await Assert.ThrowsAsync<WorkflowLoadException>(
+                () => new WorkflowLoader().LoadAsync(workflowPath));
+            Assert.Equal("invalid_tracker_repositories", exception.Code);
+        }
+        finally
+        {
+            File.Delete(workflowPath);
+        }
+    }
 
     [Fact]
     public async Task LoadAsync_ShouldRejectUnknownRunnerNames()

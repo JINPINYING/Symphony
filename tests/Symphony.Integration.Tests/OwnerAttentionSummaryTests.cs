@@ -21,8 +21,55 @@ public sealed class OwnerAttentionSummaryTests
         IReadOnlyList<AgentActivityReport>? agentActivity = null,
         IReadOnlyList<WatchedTaskReport>? watchedTasks = null,
         TrackerReachabilitySnapshot? tracker = null,
-        DateTimeOffset? lastEvent = null) =>
-        OwnerAttentionSummary.Build(healthy, escalated ?? [], running, retrying, phases ?? [], openPullRequests ?? [], agentActivity ?? [], watchedTasks ?? [], tracker, lastEvent, Now);
+        DateTimeOffset? lastEvent = null,
+        string? primaryRepository = null) =>
+        OwnerAttentionSummary.Build(healthy, escalated ?? [], running, retrying, phases ?? [], openPullRequests ?? [], agentActivity ?? [], watchedTasks ?? [], tracker, lastEvent, Now, primaryRepository);
+
+    // Once the plane watches more than one repository, "#115" stops being an answer:
+    // both can have one, and a panel that names it without saying which is telling
+    // the reader to go and find out.
+    [Fact]
+    public void IdentifiersAreQualifiedOnceMoreThanOneRepositoryIsWatched()
+    {
+        var escalated = Escalated("#115", posted: true);
+        escalated.Repository = "JINPINYING/Symphony";
+
+        var qualified = Build(escalated: [escalated], primaryRepository: "JINPINYING/CyberMed-AI-Receptionist");
+        Assert.Contains(qualified.Items, item => item.Label.StartsWith("Symphony#115", StringComparison.Ordinal));
+
+        // And a single-repository plane keeps reading exactly as it did.
+        var plain = Build(escalated: [escalated], primaryRepository: null);
+        Assert.Contains(plain.Items, item => item.Label.StartsWith("#115", StringComparison.Ordinal));
+    }
+
+    // Rows written before multi-repository tracking carry no repository, and they
+    // all belong to the repository that was the only one at the time. Labelling
+    // them from the primary keeps them from being the one ambiguous line left on
+    // an otherwise unambiguous panel.
+    [Fact]
+    public void ARowFromBeforeMultiRepositoryTrackingIsLabelledFromThePrimary()
+    {
+        var escalated = Escalated("#115", posted: true);
+        escalated.Repository = string.Empty;
+
+        var result = Build(escalated: [escalated], primaryRepository: "JINPINYING/CyberMed-AI-Receptionist");
+
+        Assert.Contains(
+            result.Items,
+            item => item.Label.StartsWith("CyberMed-AI-Receptionist#115", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void APullRequestNumberIsQualifiedToo()
+    {
+        var pr = new OpenPullRequest(
+            122, "Change 122", "https://example.invalid/pull/122", "someone", false, "SUCCESS", "MERGEABLE",
+            Now.AddHours(-6), "JINPINYING/Symphony");
+
+        var result = Build(openPullRequests: [pr], primaryRepository: "JINPINYING/CyberMed-AI-Receptionist");
+
+        Assert.Contains(result.Items, item => item.Label.Contains("Symphony PR #122", StringComparison.Ordinal));
+    }
 
     private static WatchedTaskReport Task(string name, string health) =>
         new(name, "\\" + name, "Enabled", "Ready", Now.AddMinutes(-5), 0, Now.AddMinutes(10), 15, health, $"{name} is {health}.");

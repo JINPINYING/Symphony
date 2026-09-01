@@ -545,7 +545,7 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
                     continue;
                 }
 
-                var issue = ParseIssue(issueNode, query.IncludePullRequests);
+                var issue = ParseIssue(issueNode, query.IncludePullRequests, $"{query.Owner}/{query.Repo}");
                 issuesById[issue.Id] = issue;
             }
         }
@@ -776,7 +776,8 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
                 status.IsDraft,
                 status.ChecksState,
                 status.Mergeable,
-                updatedAt));
+                updatedAt,
+                $"{query.Owner}/{query.Repo}"));
         }
 
         return results;
@@ -1237,7 +1238,7 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
 
             foreach (var issueNode in nodesElement.EnumerateArray())
             {
-                var issue = ParseIssue(issueNode, query.IncludePullRequests);
+                var issue = ParseIssue(issueNode, query.IncludePullRequests, $"{query.Owner}/{query.Repo}");
 
                 if (applyCandidateFilters && !MatchesMilestone(issue.Milestone, issueNode, query.Milestone))
                 {
@@ -1284,7 +1285,7 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
         return candidateIssues;
     }
 
-    private static NormalizedIssue ParseIssue(JsonElement issueNode, bool includePullRequests)
+    private static NormalizedIssue ParseIssue(JsonElement issueNode, bool includePullRequests, string repository)
     {
         var labels = issueNode.TryGetProperty("labels", out var labelsNode) &&
                      labelsNode.ValueKind == JsonValueKind.Object &&
@@ -1360,7 +1361,8 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
             PullRequests: pullRequests,
             BlockedBy: blockedBy,
             CreatedAt: ParseDateTimeOffset(issueNode, "createdAt"),
-            UpdatedAt: ParseDateTimeOffset(issueNode, "updatedAt"));
+            UpdatedAt: ParseDateTimeOffset(issueNode, "updatedAt"),
+            Repository: repository);
     }
 
     private static IReadOnlyList<string> BuildIssueStates(IReadOnlyList<string> activeStates)

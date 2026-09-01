@@ -4,6 +4,10 @@ public sealed class IssueCacheEntity
 {
     public string IssueId { get; set; } = string.Empty;
     public string Identifier { get; set; } = string.Empty;
+
+    // "owner/repo". Empty means the primary repository. Identifier ("#115") is
+    // unique only within one, so the status page needs this to say which #115.
+    public string Repository { get; set; } = string.Empty;
     public string Title { get; set; } = string.Empty;
     public string? Description { get; set; }
     public int? Priority { get; set; }

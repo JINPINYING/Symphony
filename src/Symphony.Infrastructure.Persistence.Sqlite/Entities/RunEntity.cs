@@ -5,6 +5,12 @@ public sealed class RunEntity
     public string Id { get; set; } = string.Empty;
     public string IssueId { get; set; } = string.Empty;
     public string IssueIdentifier { get; set; } = string.Empty;
+
+    // "owner/repo" this run's issue belongs to. Empty means the primary
+    // repository, which is what every row written before multi-repo meant.
+    // IssueIdentifier ("#115") is unique only within a repository, so anything
+    // that has to talk to GitHub about this run rebuilds its query from here.
+    public string Repository { get; set; } = string.Empty;
     public string OwnerInstanceId { get; set; } = string.Empty;
     public string Status { get; set; } = string.Empty;
     public string State { get; set; } = string.Empty;

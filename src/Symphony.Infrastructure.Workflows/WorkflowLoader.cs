@@ -140,8 +140,17 @@ public sealed class WorkflowLoader
 
         var endpoint = GetOptionalString(trackerMap, "endpoint") ?? "https://api.github.com/graphql";
         var apiKey = GetRequiredString(trackerMap, "api_key", "missing_tracker_api_key");
-        var owner = GetRequiredString(trackerMap, "owner", "missing_tracker_owner");
-        var repo = GetRequiredString(trackerMap, "repo", "missing_tracker_repo");
+        // tracker.repositories is what makes more than one repository possible. When
+        // it is present owner/repo become optional and default to its first entry,
+        // so an existing single-repository config is untouched and a multi-repository
+        // one does not have to repeat itself.
+        var repositoryEntries = ParseTrackerRepositories(trackerMap);
+        var owner = repositoryEntries.Count > 0
+            ? GetOptionalString(trackerMap, "owner") ?? repositoryEntries[0].Owner
+            : GetRequiredString(trackerMap, "owner", "missing_tracker_owner");
+        var repo = repositoryEntries.Count > 0
+            ? GetOptionalString(trackerMap, "repo") ?? repositoryEntries[0].Repo
+            : GetRequiredString(trackerMap, "repo", "missing_tracker_repo");
         var milestone = GetOptionalStringOrNumber(trackerMap, "milestone");
         var includePullRequests = GetOptionalBoolean(trackerMap, "include_pull_requests", defaultValue: true);
         var labels = GetStringList(trackerMap, "labels", []);
@@ -222,6 +231,15 @@ public sealed class WorkflowLoader
         {
             throw new WorkflowLoadException("invalid_workspace_base_branch", "workspace.base_branch must be non-empty.");
         }
+
+        var repositories = BuildRepositorySettings(
+            repositoryEntries,
+            owner,
+            repo,
+            workspaceRoot,
+            sharedClonePath,
+            worktreesRoot,
+            remoteUrl);
 
         var hooksMap = GetOptionalMap(config, "hooks");
         var hooksAfterCreate = GetOptionalScriptFromOptionalMap(hooksMap, "after_create");
@@ -366,7 +384,8 @@ public sealed class WorkflowLoader
                 includePullRequests,
                 labels,
                 activeStates,
-                terminalStates),
+                terminalStates,
+                repositories),
             new WorkflowPollingSettings(intervalMs),
             new WorkflowAgentSettings(
                 maxConcurrentAgents,
@@ -414,6 +433,110 @@ public sealed class WorkflowLoader
                 operationalRetentionDays,
                 retentionMaxRows),
             ParseWatchedTasks(config));
+    }
+
+    private sealed record TrackerRepositoryEntry(string Owner, string Repo, string? RemoteUrl);
+
+    private static IReadOnlyList<TrackerRepositoryEntry> ParseTrackerRepositories(
+        IReadOnlyDictionary<string, object?> trackerMap)
+    {
+        if (!trackerMap.TryGetValue("repositories", out var raw) || raw is null)
+        {
+            return [];
+        }
+
+        if (raw is not List<object?> entries)
+        {
+            throw new WorkflowLoadException("invalid_tracker_repositories", "'tracker.repositories' must be a list.");
+        }
+
+        var parsed = new List<TrackerRepositoryEntry>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var entry in entries)
+        {
+            if (entry is not Dictionary<string, object?> map)
+            {
+                throw new WorkflowLoadException(
+                    "invalid_tracker_repositories", "each entry of 'tracker.repositories' must be an object/map.");
+            }
+
+            var entryOwner = GetRequiredString(map, "owner", "invalid_tracker_repository_owner");
+            var entryRepo = GetRequiredString(map, "repo", "invalid_tracker_repository_repo");
+            var entryRemoteUrl = GetOptionalStringFromOptionalMap(map, "remote_url");
+
+            // A repeated repository would be fetched twice, dispatch the same issue
+            // twice, and race itself for its own workspace.
+            if (!seen.Add($"{entryOwner}/{entryRepo}"))
+            {
+                throw new WorkflowLoadException(
+                    "duplicate_tracker_repository",
+                    $"tracker.repositories lists {entryOwner}/{entryRepo} more than once.");
+            }
+
+            parsed.Add(new TrackerRepositoryEntry(entryOwner, entryRepo, entryRemoteUrl));
+        }
+
+        if (parsed.Count == 0)
+        {
+            throw new WorkflowLoadException(
+                "invalid_tracker_repositories",
+                "'tracker.repositories' was given but empty; remove it, or list at least one repository.");
+        }
+
+        return parsed;
+    }
+
+    /// <summary>
+    /// Gives every tracked repository its own clone and worktrees root, because two
+    /// repositories can each have an issue #115 and a shared path would put both in
+    /// the same directory.
+    ///
+    /// The FIRST repository keeps the configured <c>workspace.*</c> paths verbatim.
+    /// That is deliberate: it is the repository a single-repository install is
+    /// already using, and re-deriving its paths would strand the clone and any
+    /// worktrees currently on disk. Additional repositories get slugged siblings
+    /// under <c>workspace.root</c> - siblings rather than children, so one
+    /// repository's cleanup sweep never walks into another's worktrees.
+    /// </summary>
+    private static IReadOnlyList<WorkflowRepositorySettings> BuildRepositorySettings(
+        IReadOnlyList<TrackerRepositoryEntry> entries,
+        string primaryOwner,
+        string primaryRepo,
+        string workspaceRoot,
+        string sharedClonePath,
+        string worktreesRoot,
+        string? remoteUrl)
+    {
+        var effective = entries.Count > 0
+            ? entries
+            : [new TrackerRepositoryEntry(primaryOwner, primaryRepo, remoteUrl)];
+
+        var repositories = new List<WorkflowRepositorySettings>(effective.Count);
+        for (var i = 0; i < effective.Count; i++)
+        {
+            var entry = effective[i];
+            var isPrimary = i == 0;
+            var slug = SanitizeRepositorySlug($"{entry.Owner}-{entry.Repo}");
+
+            repositories.Add(new WorkflowRepositorySettings(
+                entry.Owner,
+                entry.Repo,
+                isPrimary ? sharedClonePath : Path.Combine(workspaceRoot, "repos", slug),
+                isPrimary ? worktreesRoot : Path.Combine(workspaceRoot, $"worktrees-{slug}"),
+                entry.RemoteUrl
+                    ?? (isPrimary && !string.IsNullOrWhiteSpace(remoteUrl)
+                        ? remoteUrl
+                        : $"https://github.com/{entry.Owner}/{entry.Repo}.git")));
+        }
+
+        return repositories;
+    }
+
+    private static string SanitizeRepositorySlug(string value)
+    {
+        var sanitized = new string(value.Select(c =>
+            char.IsLetterOrDigit(c) || c is '.' or '-' or '_' ? c : '-').ToArray()).Trim('-');
+        return string.IsNullOrWhiteSpace(sanitized) ? "repository" : sanitized.ToLowerInvariant();
     }
 
     /// <summary>

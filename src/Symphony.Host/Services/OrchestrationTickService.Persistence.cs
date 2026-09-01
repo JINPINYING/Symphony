@@ -22,37 +22,41 @@ public sealed partial class OrchestrationTickService
             return;
         }
 
-        var query = BuildTrackerQuery(workflowDefinition, apiKey);
-
-        IReadOnlyList<NormalizedIssue> terminalIssues;
-        try
+        // Per repository, and each one's failure is its own: a repository the plane
+        // cannot reach at startup must not stop the others being tidied.
+        var terminalIssues = new List<NormalizedIssue>();
+        foreach (var repositoryQuery in BuildTrackerQueries(workflowDefinition, apiKey).All)
         {
-            terminalIssues = await trackerClient.FetchIssuesByStatesAsync(query, terminalStates, cancellationToken);
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            logger.LogWarning(
-                ex,
-                "Startup terminal cleanup could not fetch terminal issues for {Owner}/{Repo}. Continuing startup.",
-                query.Owner,
-                query.Repo);
-            return;
+            try
+            {
+                terminalIssues.AddRange(
+                    await trackerClient.FetchIssuesByStatesAsync(repositoryQuery, terminalStates, cancellationToken));
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(
+                    ex,
+                    "Startup terminal cleanup could not fetch terminal issues for {Owner}/{Repo}. Continuing startup.",
+                    repositoryQuery.Owner,
+                    repositoryQuery.Repo);
+            }
         }
 
         foreach (var issue in terminalIssues)
         {
             try
             {
+                var repository = ResolveRepository(workflowDefinition, issue.Repository);
                 var cleanupResult = await workspaceManager.CleanupIssueWorkspaceAsync(
                     new WorkspaceCleanupRequest(
                         issue.Identifier,
                         workflowDefinition.Runtime.Workspace.Root,
-                        workflowDefinition.Runtime.Workspace.SharedClonePath,
-                        workflowDefinition.Runtime.Workspace.WorktreesRoot,
+                        repository.SharedClonePath,
+                        repository.WorktreesRoot,
                         workflowDefinition.Runtime.Hooks.BeforeRemove,
                         workflowDefinition.Runtime.Hooks.TimeoutMs),
                     cancellationToken);
@@ -141,6 +145,7 @@ public sealed partial class OrchestrationTickService
             }
 
             existing.Identifier = issue.Identifier;
+            existing.Repository = issue.Repository;
             existing.Title = issue.Title;
             existing.Description = issue.Description;
             existing.Priority = issue.Priority;
@@ -278,12 +283,13 @@ public sealed partial class OrchestrationTickService
 
         try
         {
+            var repository = ResolveRepository(workflowDefinition, cachedIssue.Repository);
             var cleanupResult = await workspaceManager.CleanupIssueWorkspaceAsync(
                 new WorkspaceCleanupRequest(
                     cachedIssue.Identifier,
                     workflowDefinition.Runtime.Workspace.Root,
-                    workflowDefinition.Runtime.Workspace.SharedClonePath,
-                    workflowDefinition.Runtime.Workspace.WorktreesRoot,
+                    repository.SharedClonePath,
+                    repository.WorktreesRoot,
                     workflowDefinition.Runtime.Hooks.BeforeRemove,
                     workflowDefinition.Runtime.Hooks.TimeoutMs),
                 cancellationToken);
@@ -407,6 +413,7 @@ public sealed partial class OrchestrationTickService
         {
             IssueId = issue.Id,
             Identifier = issue.Identifier,
+            Repository = issue.Repository,
             Title = issue.Title,
             Description = issue.Description,
             Priority = issue.Priority,
@@ -445,16 +452,33 @@ public sealed partial class OrchestrationTickService
         });
     }
 
-    private static TrackerQuery BuildTrackerQuery(WorkflowDefinition workflowDefinition, string apiKey)
+    // Falls back to the primary repository, which is what an empty repository key
+    // has always meant: every row written before multi-repository tracking, and
+    // every row in a single-repository install.
+    private static WorkflowRepositorySettings ResolveRepository(
+        WorkflowDefinition workflowDefinition,
+        string? repositoryKey)
     {
-        return new TrackerQuery(
-            workflowDefinition.Runtime.Tracker.Endpoint,
-            apiKey,
-            workflowDefinition.Runtime.Tracker.Owner,
-            workflowDefinition.Runtime.Tracker.Repo,
-            workflowDefinition.Runtime.Tracker.ActiveStates,
-            workflowDefinition.Runtime.Tracker.Labels,
-            workflowDefinition.Runtime.Tracker.Milestone,
-            workflowDefinition.Runtime.Tracker.IncludePullRequests);
+        var tracker = workflowDefinition.Runtime.Tracker;
+        return tracker.FindRepository(repositoryKey) ?? tracker.PrimaryRepository;
     }
+
+    private static TrackerQuerySet BuildTrackerQueries(WorkflowDefinition workflowDefinition, string apiKey)
+    {
+        var tracker = workflowDefinition.Runtime.Tracker;
+        return new TrackerQuerySet(tracker.TrackedRepositories
+            .Select(repository => new TrackerQuery(
+                tracker.Endpoint,
+                apiKey,
+                repository.Owner,
+                repository.Repo,
+                tracker.ActiveStates,
+                tracker.Labels,
+                tracker.Milestone,
+                tracker.IncludePullRequests))
+            .ToList());
+    }
+
+    private static TrackerQuery BuildTrackerQuery(WorkflowDefinition workflowDefinition, string apiKey) =>
+        BuildTrackerQueries(workflowDefinition, apiKey).Primary;
 }
