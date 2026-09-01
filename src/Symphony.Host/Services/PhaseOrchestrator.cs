@@ -728,6 +728,10 @@ public sealed class PhaseOrchestrator(
                     $"No {reviewPhase} run found for PR #{ledger.PrNumber}; re-dispatching the review.");
                 await dbContext.SaveChangesAsync(cancellationToken);
             }
+            else if (latestReview.Status is RunStatusNames.Running or RunStatusNames.Retrying)
+            {
+                // Genuinely still working. This is the only reason to keep waiting.
+            }
             else if (latestReview.Status is RunStatusNames.Failed or RunStatusNames.TimedOut or RunStatusNames.Stalled)
             {
                 await EscalateAsync(ledger,
@@ -739,6 +743,26 @@ public sealed class PhaseOrchestrator(
                 await EscalateAsync(ledger,
                     $"The {reviewPhase} run for PR #{ledger.PrNumber} succeeded but posted no verdict comment with the exact-head marker — contract violation.",
                     cancellationToken);
+            }
+            else
+            {
+                // The run is over and never produced a verdict, but the review
+                // itself did not fail - it was cancelled out from under the phase,
+                // most often by restart reconciliation. That is the engine's doing,
+                // not the reviewer's, so the recovery is to ask again rather than
+                // to escalate a reviewer that was never given its turn.
+                //
+                // Waiting was the previous behaviour, and it was silent and
+                // permanent: every terminal status outside the three named above
+                // fell through to "keep waiting", so #128 sat at `reviewing` with a
+                // canceled_by_reconciliation review run while the page correctly
+                // showed Codex idle. The owner spotted the contradiction - the
+                // pipeline said reviewing, the reviewer was doing nothing.
+                ledger.Stage = PhaseStages.AwaitingReview;
+                ledger.UpdatedAtUtc = timeProvider.GetUtcNow();
+                AddPhaseEvent(ledger.IssueId, ledger.IssueIdentifier, "phase_review_redispatch",
+                    $"The {reviewPhase} run for PR #{ledger.PrNumber} ended '{latestReview.Status}' before producing a verdict; re-dispatching the review.");
+                await dbContext.SaveChangesAsync(cancellationToken);
             }
 
             return;

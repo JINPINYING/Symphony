@@ -793,6 +793,54 @@ public sealed class OrchestrationTickServiceTests
         Assert.Empty(harness.Coordinator.StartRequests);
     }
 
+    // The reviewing stage waited forever on any terminal status it did not name.
+    // #128 sat at `reviewing` with a canceled_by_reconciliation review run - the
+    // pipeline claimed Codex was reviewing while the staff panel correctly showed
+    // it idle, and the owner spotted the contradiction. A cancellation is the
+    // engine's doing, not the reviewer's, so the recovery is to ask again rather
+    // than escalate a reviewer that never got its turn.
+    [Fact]
+    public async Task RunTickAsync_ShouldRedispatchAReviewThatWasCancelledBeforeItCouldReport()
+    {
+        var issue = BuildIssue("issue-1", "#1", "Open", null,
+            pullRequests: [new PullRequestRef("pr-5", 5, "OPEN", null, "symphony/1", "main")]);
+        var tracker = new FakeTrackerClient([issue]);
+        tracker.IssuesById["issue-1"] = issue;
+        tracker.PullRequestStatusByNumber[5] = new PullRequestStatus(5, "OPEN", false, "aaa111", "SUCCESS", "MERGEABLE");
+        tracker.OpenPullRequestNumberByHeadBranch["symphony/1"] = 5;
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success));
+
+        await harness.InsertRunAsync("issue-1", "#1", "Open", "instance-1", RunStatusNames.Succeeded);
+        await harness.InsertWorkspaceRecordAsync("issue-1", "#1", "symphony/1");
+
+        // Seed the ledger, pass verify, dispatch the review.
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        Assert.Equal(PhaseStages.Reviewing,
+            (await harness.DbContext.PhaseLedger.SingleAsync()).Stage);
+
+        // The review run is cancelled out from under the phase, as restart
+        // reconciliation does, and never posts a verdict.
+        foreach (var run in await harness.DbContext.Runs.Where(r => r.Phase == RunPhaseNames.Review).ToListAsync())
+        {
+            run.Status = RunStatusNames.CanceledByReconciliation;
+        }
+        await harness.DbContext.SaveChangesAsync();
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        // Recovered rather than parked: back to awaiting_review so the next tick
+        // asks the reviewer again.
+        var ledger = await harness.DbContext.PhaseLedger.SingleAsync();
+        Assert.Equal(PhaseStages.AwaitingReview, ledger.Stage);
+        Assert.Contains(
+            await harness.DbContext.EventLog.ToListAsync(),
+            entry => entry.EventName == "phase_review_redispatch");
+    }
+
     [Fact]
     public async Task RunTickAsync_ShouldNotDispatchIssueOwnedByThePhaseOrchestrator()
     {
