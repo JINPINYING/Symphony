@@ -419,12 +419,30 @@ function renderAttention() {
 
   // Work an agent did outside the queue. The counts above only ever described
   // dispatched runs, so without this the page can be busy and look asleep.
-  const activity = (state.snapshot?.agent_activity || []).slice(0, 4).map(report => `
+  //
+  // Every row carries its own age now, and the strip says so when the newest
+  // report has gone cold. This feed is written by agents POSTing into it, so it
+  // reports nothing both when nothing happened and when nobody said anything -
+  // and on 2026-09-01 it showed a day-old Stage 1 handoff as ambient context
+  // while three repositories were being committed to. Undated rows under a
+  // "nothing needs you" headline read as current. A feed that cannot distinguish
+  // quiet from unreported must at least date what it is showing.
+  const reports = (state.snapshot?.agent_activity || []).slice(0, 4);
+  const newest = reports.length
+    ? Math.min(...reports.map(r => Date.now() - Date.parse(r.at)).filter(ms => !isNaN(ms)))
+    : null;
+  const STALE_AFTER_MS = 2 * 60 * 60 * 1000;
+
+  const activity = reports.map(report => `
     <li class="agent-row">
-      <span class="agent-when">${report.live ? "Now" : "Earlier"}</span>
+      <span class="agent-when">${report.live ? "Now" : escapeHtml(formatRelativeTime(report.at))}</span>
       <span class="agent-actor">${escapeHtml(report.actor || "agent")}</span>
       <span class="agent-summary">${escapeHtml(report.summary || "")}</span>
     </li>`).join("");
+
+  const activityNote = newest !== null && newest > STALE_AFTER_MS
+    ? `<div class="agent-stale">Nothing reported for ${escapeHtml(formatDurationFromMilliseconds(newest))}. Agents report into this themselves, so an empty feed means no one has said anything - not that nothing is happening.</div>`
+    : "";
 
   return `
     <div class="attention ${m.tone}">
@@ -432,7 +450,7 @@ function renderAttention() {
       <h1 class="att-headline">${escapeHtml(a.headline)}</h1>
       <p class="att-detail">${escapeHtml(a.detail)}</p>
       ${items ? `<ul class="att-list">${items}</ul>` : ""}
-      ${activity ? `<div class="agent-strip"><div class="agent-kicker">Agent activity</div><ul class="agent-list">${activity}</ul></div>` : ""}
+      ${activity ? `<div class="agent-strip"><div class="agent-kicker">Agent activity</div><ul class="agent-list">${activity}</ul>${activityNote}</div>` : ""}
     </div>`;
 }
 
