@@ -27,6 +27,27 @@ public sealed record AttentionItem(string Label, string Detail, string Severity,
 /// </summary>
 public static class OwnerAttentionSummary
 {
+    /// <summary>
+    /// "#115" becomes "Symphony#115" when more than one repository is watched,
+    /// following GitHub's own shorthand for a cross-repository reference. Anything
+    /// that is not a bare issue reference gets a space instead, so "PR #122"
+    /// reads "Symphony PR #122" rather than running the words together.
+    ///
+    /// The owner is left off because every repository here shares one, and a label
+    /// too long for the panel is a label nobody reads.
+    /// </summary>
+    private static string Qualify(bool qualifyRepositories, string? repository, string identifier)
+    {
+        if (!qualifyRepositories || string.IsNullOrWhiteSpace(repository) || string.IsNullOrWhiteSpace(identifier))
+        {
+            return identifier;
+        }
+
+        var slash = repository.LastIndexOf('/');
+        var name = slash >= 0 && slash + 1 < repository.Length ? repository[(slash + 1)..] : repository;
+        return identifier.StartsWith('#') ? $"{name}{identifier}" : $"{name} {identifier}";
+    }
+
     public const string LevelClear   = "clear";
     public const string LevelAttention = "attention";
     public const string LevelDown    = "down";
@@ -42,7 +63,12 @@ public static class OwnerAttentionSummary
         IReadOnlyList<WatchedTaskReport> watchedTasks,
         TrackerReachabilitySnapshot? tracker,
         DateTimeOffset? lastEventAtUtc,
-        DateTimeOffset now)
+        DateTimeOffset now,
+        // When the plane watches more than one repository, "#115" stops being an
+        // answer: two repositories can each have one, and a panel that says
+        // "#115 needs a decision" is then telling the reader to go and find out
+        // which. Off for a single repository, so nothing changes there.
+        bool qualifyRepositories = false)
     {
         var items = new List<AttentionItem>();
 
@@ -73,7 +99,7 @@ public static class OwnerAttentionSummary
         {
             var posted = run.EscalationPostedAtUtc is not null;
             items.Add(new AttentionItem(
-                $"{run.IssueIdentifier} needs a decision",
+                $"{Qualify(qualifyRepositories, run.Repository, run.IssueIdentifier)} needs a decision",
                 posted
                     ? "Escalated and posted to GitHub. Reply with a symphony:directive comment to un-park it."
                     : "Escalated but the GitHub comment has not posted yet - the publisher may be failing.",
@@ -85,8 +111,8 @@ public static class OwnerAttentionSummary
         foreach (var phase in phases.Where(p => string.Equals(p.Stage, PhaseStages.Escalated, StringComparison.Ordinal)))
         {
             items.Add(new AttentionItem(
-                $"{phase.IssueIdentifier} stopped at the merge gate",
-                $"PR #{phase.PrNumber} was approved but not merged. The gate escalates rather than merging when a change touches a protected path.",
+                $"{Qualify(qualifyRepositories, phase.Repository, phase.IssueIdentifier)} stopped at the merge gate",
+                $"{Qualify(qualifyRepositories, phase.Repository, $"PR #{phase.PrNumber}")} was approved but not merged. The gate escalates rather than merging when a change touches a protected path.",
                 LevelAttention));
         }
 
@@ -114,10 +140,11 @@ public static class OwnerAttentionSummary
                 ? $" Waiting {Humanise(now - pr.UpdatedAtUtc)}."
                 : string.Empty;
 
+            var prLabel = Qualify(qualifyRepositories, pr.Repository, $"PR #{pr.Number}");
             items.Add(new AttentionItem(
                 failing
-                    ? $"PR #{pr.Number} has failing checks"
-                    : $"PR #{pr.Number} is waiting on you",
+                    ? $"{prLabel} has failing checks"
+                    : $"{prLabel} is waiting on you",
                 failing
                     ? $"{pr.Title} - CI is red, so the merge gate will not take it.{waited}"
                     : $"{pr.Title} - open and not blocked by CI. Nothing will merge it without you.{waited}",

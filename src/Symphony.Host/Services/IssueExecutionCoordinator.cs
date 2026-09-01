@@ -56,6 +56,10 @@ public sealed class IssueExecutionCoordinator(
         var releaseStatus = RunStatusNames.Failed;
         var cleanupWorkspace = false;
 
+        // Hoisted so the cleanup in the finally block uses the same repository's
+        // paths the work was prepared in, not the primary repository's.
+        var repository = ResolveRepository(request.WorkflowDefinition, request.Issue.Repository);
+
         try
         {
             await using var scope = serviceScopeFactory.CreateAsyncScope();
@@ -87,10 +91,14 @@ public sealed class IssueExecutionCoordinator(
                 $"Dispatch started for {request.Issue.Identifier} on runner '{runnerSelection.RunnerName}'.",
                 cancellationToken);
 
+            // The repository this issue belongs to, and therefore the clone and
+            // worktrees root the work happens in. They are per repository because
+            // they have to be: two repositories can each have an issue #115, and a
+            // shared worktrees root would put both in the same directory.
             var remoteUrl = ResolveRemoteUrl(
-                request.WorkflowDefinition.Runtime.Workspace.RemoteUrl,
-                request.WorkflowDefinition.Runtime.Tracker.Owner,
-                request.WorkflowDefinition.Runtime.Tracker.Repo);
+                repository.RemoteUrl,
+                repository.Owner,
+                repository.Repo);
 
             workspace = await workspaceManager.PrepareIssueWorkspaceAsync(
                 new WorkspacePreparationRequest(
@@ -98,8 +106,8 @@ public sealed class IssueExecutionCoordinator(
                     IssueIdentifier: request.Issue.Identifier,
                     SuggestedBranchName: request.Issue.BranchName,
                     WorkspaceRoot: request.WorkflowDefinition.Runtime.Workspace.Root,
-                    SharedClonePath: request.WorkflowDefinition.Runtime.Workspace.SharedClonePath,
-                    WorktreesRoot: request.WorkflowDefinition.Runtime.Workspace.WorktreesRoot,
+                    SharedClonePath: repository.SharedClonePath,
+                    WorktreesRoot: repository.WorktreesRoot,
                     BaseBranch: request.WorkflowDefinition.Runtime.Workspace.BaseBranch,
                     RemoteRepositoryUrl: remoteUrl),
                 cancellationToken);
@@ -161,9 +169,10 @@ public sealed class IssueExecutionCoordinator(
                     "It resolves the previous escalation on this issue; do not restart from scratch unless the directive says to.";
             }
 
-            var trackerQuery = BuildTrackerQuery(
-                request.WorkflowDefinition,
-                WorkflowDispatchPreflightValidator.ValidateAndResolveApiKey(request.WorkflowDefinition));
+            var trackerQuery = BuildTrackerQueries(
+                    request.WorkflowDefinition,
+                    WorkflowDispatchPreflightValidator.ValidateAndResolveApiKey(request.WorkflowDefinition))
+                .For(request.Issue.Repository);
 
             var result = await runnerSelection.Runner.RunIssueAsync(
                 new AgentRunRequest(
@@ -257,8 +266,8 @@ public sealed class IssueExecutionCoordinator(
                             new WorkspaceCleanupRequest(
                                 request.Issue.Identifier,
                                 request.WorkflowDefinition.Runtime.Workspace.Root,
-                                request.WorkflowDefinition.Runtime.Workspace.SharedClonePath,
-                                request.WorkflowDefinition.Runtime.Workspace.WorktreesRoot,
+                                repository.SharedClonePath,
+                                repository.WorktreesRoot,
                                 request.WorkflowDefinition.Runtime.Hooks.BeforeRemove,
                                 request.WorkflowDefinition.Runtime.Hooks.TimeoutMs),
                             CancellationToken.None);
@@ -686,18 +695,35 @@ public sealed class IssueExecutionCoordinator(
         return $"https://github.com/{owner}/{repo}.git";
     }
 
-    private static TrackerQuery BuildTrackerQuery(WorkflowDefinition workflowDefinition, string apiKey)
+    // Falls back to the primary repository, which is what an empty repository key
+    // has always meant: every run recorded before multi-repository tracking, and
+    // every run in a single-repository install.
+    private static WorkflowRepositorySettings ResolveRepository(
+        WorkflowDefinition workflowDefinition,
+        string? repositoryKey)
     {
-        return new TrackerQuery(
-            workflowDefinition.Runtime.Tracker.Endpoint,
-            apiKey,
-            workflowDefinition.Runtime.Tracker.Owner,
-            workflowDefinition.Runtime.Tracker.Repo,
-            workflowDefinition.Runtime.Tracker.ActiveStates,
-            workflowDefinition.Runtime.Tracker.Labels,
-            workflowDefinition.Runtime.Tracker.Milestone,
-            workflowDefinition.Runtime.Tracker.IncludePullRequests);
+        var tracker = workflowDefinition.Runtime.Tracker;
+        return tracker.FindRepository(repositoryKey) ?? tracker.PrimaryRepository;
     }
+
+    private static TrackerQuerySet BuildTrackerQueries(WorkflowDefinition workflowDefinition, string apiKey)
+    {
+        var tracker = workflowDefinition.Runtime.Tracker;
+        return new TrackerQuerySet(tracker.TrackedRepositories
+            .Select(repository => new TrackerQuery(
+                tracker.Endpoint,
+                apiKey,
+                repository.Owner,
+                repository.Repo,
+                tracker.ActiveStates,
+                tracker.Labels,
+                tracker.Milestone,
+                tracker.IncludePullRequests))
+            .ToList());
+    }
+
+    private static TrackerQuery BuildTrackerQuery(WorkflowDefinition workflowDefinition, string apiKey) =>
+        BuildTrackerQueries(workflowDefinition, apiKey).Primary;
 
     private static string? Truncate(string? value, int maxLength)
     {

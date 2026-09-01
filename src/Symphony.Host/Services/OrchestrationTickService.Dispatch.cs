@@ -23,48 +23,70 @@ public sealed partial class OrchestrationTickService
         string instanceId,
         CancellationToken cancellationToken)
     {
-        IReadOnlyList<NormalizedIssue> issues;
-        var query = BuildTrackerQuery(workflowDefinition, apiKey);
-        try
-        {
-            issues = await trackerClient.FetchCandidateIssuesAsync(query, cancellationToken);
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            // The old message was the exception's TYPE and nothing else, which
-            // produced a dozen identical "GitHubTrackerException." rows and sent
-            // the real cause - intermittent DNS - to a 64 MB rotated log where
-            // nobody glancing at the page would ever find it. Record the cause.
-            var transient = TrackerReachability.IsTransientConnectivity(ex);
-            var cause = TrackerReachability.DescribeCause(ex);
-            trackerReachability.RecordFailure(cause, transient);
+        var queries = BuildTrackerQueries(workflowDefinition, apiKey);
+        var query = queries.Primary;
 
-            // Connectivity blips recover within a tick or two and cost nothing;
-            // logging each at Error teaches the reader that red means nothing.
-            // A refusal - bad credentials, a malformed query - will fail the same
-            // way forever, and does deserve the louder level.
-            AddIssueEvent(
-                null,
-                null,
-                null,
-                null,
-                "candidate_scan_failed",
-                transient ? LogLevel.Warning : LogLevel.Error,
-                $"Candidate fetch failed for {query.Owner}/{query.Repo}: {cause}");
-            await dbContext.SaveChangesAsync(cancellationToken);
-            logger.LogWarning(
-                ex,
-                "Candidate fetch failed for {Owner}/{Repo}. Dispatch will be skipped this tick.",
-                query.Owner,
-                query.Repo);
+        // One fetch per tracked repository. A repository that fails is reported and
+        // skipped rather than taking the tick down with it: with more than one
+        // tracked, an outage on the plane's own backlog must not stop the product
+        // queue, and vice versa.
+        var issues = new List<NormalizedIssue>();
+        var reachedAnyRepository = false;
+        string? lastFailureCause = null;
+        var lastFailureTransient = false;
+
+        foreach (var repositoryQuery in queries.All)
+        {
+            try
+            {
+                issues.AddRange(await trackerClient.FetchCandidateIssuesAsync(repositoryQuery, cancellationToken));
+                reachedAnyRepository = true;
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                // The old message was the exception's TYPE and nothing else, which
+                // produced a dozen identical "GitHubTrackerException." rows and sent
+                // the real cause - intermittent DNS - to a 64 MB rotated log where
+                // nobody glancing at the page would ever find it. Record the cause.
+                lastFailureTransient = TrackerReachability.IsTransientConnectivity(ex);
+                lastFailureCause = TrackerReachability.DescribeCause(ex);
+
+                // Connectivity blips recover within a tick or two and cost nothing;
+                // logging each at Error teaches the reader that red means nothing.
+                // A refusal - bad credentials, a malformed query - will fail the same
+                // way forever, and does deserve the louder level.
+                AddIssueEvent(
+                    null,
+                    null,
+                    null,
+                    null,
+                    "candidate_scan_failed",
+                    lastFailureTransient ? LogLevel.Warning : LogLevel.Error,
+                    $"Candidate fetch failed for {repositoryQuery.Owner}/{repositoryQuery.Repo}: {lastFailureCause}");
+                await dbContext.SaveChangesAsync(cancellationToken);
+                logger.LogWarning(
+                    ex,
+                    "Candidate fetch failed for {Owner}/{Repo}. Its issues are skipped this tick.",
+                    repositoryQuery.Owner,
+                    repositoryQuery.Repo);
+            }
+        }
+
+        // Reachability is about GitHub, not about one repository: reaching any of
+        // them proves the tracker is up, and only reaching none is an outage.
+        if (reachedAnyRepository)
+        {
+            trackerReachability.RecordSuccess();
+        }
+        else
+        {
+            trackerReachability.RecordFailure(lastFailureCause ?? "unknown", lastFailureTransient);
             return;
         }
-
-        trackerReachability.RecordSuccess();
 
         await UpsertIssueCacheAsync(issues, workflowDefinition, cancellationToken);
 
@@ -749,6 +771,7 @@ public sealed partial class OrchestrationTickService
                 OwnerInstanceId = instanceId,
                 Status = RunStatusNames.Running,
                 State = issue.State,
+                Repository = issue.Repository,
                 Phase = dispatchPhase,
                 CurrentRetryAttempt = attempt,
                 StartedAtUtc = nowUtc
@@ -760,6 +783,7 @@ public sealed partial class OrchestrationTickService
             run.OwnerInstanceId = instanceId;
             run.Status = RunStatusNames.Running;
             run.State = issue.State;
+            run.Repository = issue.Repository;
             run.Phase = dispatchPhase;
             run.CurrentRetryAttempt = attempt;
             run.CompletedAtUtc = null;
@@ -1570,6 +1594,7 @@ public sealed partial class OrchestrationTickService
             .OrderBy(issue => issue.Priority.HasValue ? 0 : 1)
             .ThenBy(issue => issue.Priority ?? int.MaxValue)
             .ThenBy(issue => issue.CreatedAt ?? DateTimeOffset.MaxValue)
+            .ThenBy(issue => issue.Repository, StringComparer.OrdinalIgnoreCase)
             .ThenBy(issue => issue.Identifier, StringComparer.OrdinalIgnoreCase)
             .ThenBy(issue => issue.Id, StringComparer.OrdinalIgnoreCase);
     }

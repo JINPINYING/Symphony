@@ -485,12 +485,13 @@ public sealed partial class OrchestrationTickService
         var workflowDefinition = await workflowDefinitionProvider.GetCurrentAsync(cancellationToken);
         try
         {
+            var repository = ResolveRepository(workflowDefinition, run.Repository);
             await workspaceManager.CleanupIssueWorkspaceAsync(
                 new WorkspaceCleanupRequest(
                     run.IssueIdentifier,
                     workflowDefinition.Runtime.Workspace.Root,
-                    workflowDefinition.Runtime.Workspace.SharedClonePath,
-                    workflowDefinition.Runtime.Workspace.WorktreesRoot,
+                    repository.SharedClonePath,
+                    repository.WorktreesRoot,
                     workflowDefinition.Runtime.Hooks.BeforeRemove,
                     workflowDefinition.Runtime.Hooks.TimeoutMs),
                 cancellationToken);
@@ -510,7 +511,8 @@ public sealed partial class OrchestrationTickService
                     [],
                     [],
                     null,
-                    null),
+                    null,
+                    run.Repository),
                 RunStopReasons.Terminal,
                 cancellationToken);
         }

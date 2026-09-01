@@ -24,4 +24,9 @@ public sealed record OpenPullRequest(
     bool IsDraft,
     string? ChecksState,
     string? Mergeable,
-    DateTimeOffset UpdatedAtUtc);
+    DateTimeOffset UpdatedAtUtc,
+    // "owner/repo". Trailing with a default because this record is deserialized
+    // from snapshots written before multi-repository tracking; empty means the
+    // repository that was the only one at the time. Needed because "PR #122" is
+    // unique only within a repository.
+    string Repository = "");

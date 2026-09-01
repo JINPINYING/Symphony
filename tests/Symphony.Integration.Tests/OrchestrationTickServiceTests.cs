@@ -467,6 +467,98 @@ public sealed class OrchestrationTickServiceTests
         Assert.Empty(tracker.RemovedLabelsByIssue);
     }
 
+    // The multi-repository tracker. Until this, WORKFLOW.md had a single owner/repo
+    // and the plane could only ever be pointed at one backlog - which is why every
+    // control-plane repair had to be done by hand.
+    [Fact]
+    public async Task RunTickAsync_ShouldFindWorkInEveryTrackedRepository()
+    {
+        var tracker = new FakeTrackerClient([]);
+        tracker.IssuesByRepository["JINPINYING/Product"] = [BuildIssue("issue-p", "#1", "Open", null, repository: "JINPINYING/Product")];
+        tracker.IssuesByRepository["JINPINYING/Symphony"] = [BuildIssue("issue-s", "#1", "Open", null, repository: "JINPINYING/Symphony")];
+
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(
+                maxConcurrentAgents: 1,
+                repositories: [("JINPINYING", "Product"), ("JINPINYING", "Symphony")]),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        // Both repositories were asked, and both issues are known - note they share
+        // the identifier "#1", which is exactly the collision a single owner/repo
+        // never had to handle.
+        Assert.Equal(
+            ["JINPINYING/Product", "JINPINYING/Symphony"],
+            tracker.CandidateFetchRepositories.Distinct().OrderBy(name => name).ToArray());
+        Assert.Equal(2, await harness.DbContext.IssueCache.CountAsync());
+
+        // One slot, so exactly one ran - and it recorded which repository it came
+        // from, because "#1" alone cannot say.
+        var run = Assert.Single(await harness.DbContext.Runs.ToListAsync());
+        Assert.False(string.IsNullOrWhiteSpace(run.Repository));
+        Assert.Equal(run.Repository, Assert.Single(harness.Coordinator.StartRequests).Issue.Repository);
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldKeepWorkingWhenOneRepositoryIsUnreachable()
+    {
+        var tracker = new FakeTrackerClient([]);
+        tracker.IssuesByRepository["JINPINYING/Product"] = [BuildIssue("issue-p", "#1", "Open", null, repository: "JINPINYING/Product")];
+        tracker.RepositoriesThatFail.Add("JINPINYING/Symphony");
+
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(
+                maxConcurrentAgents: 1,
+                repositories: [("JINPINYING", "Product"), ("JINPINYING", "Symphony")]),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        // An outage on the plane's own backlog must not stop the product queue.
+        Assert.Equal("issue-p", Assert.Single(harness.Coordinator.StartRequests).Issue.Id);
+        Assert.Contains(
+            await harness.DbContext.EventLog.ToListAsync(),
+            entry => entry.EventName == "candidate_scan_failed" && entry.Message.Contains("Symphony"));
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldAskTheRightRepositoryAboutAPullRequestNumber()
+    {
+        var tracker = new FakeTrackerClient([]);
+        tracker.PullRequestStatusByNumber[122] = new PullRequestStatus(122, "MERGED", false, "aaa111", "SUCCESS", null);
+
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(
+                maxConcurrentAgents: 1,
+                repositories: [("JINPINYING", "Product"), ("JINPINYING", "Symphony")]),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        harness.DbContext.PhaseLedger.Add(new PhaseLedgerEntity
+        {
+            IssueId = "issue-s",
+            IssueIdentifier = "#1",
+            Repository = "JINPINYING/Symphony",
+            Stage = PhaseStages.Escalated,
+            PrNumber = 122,
+            HeadSha = "aaa111",
+            ImplementerRunner = "claude",
+            CreatedAtUtc = DateTimeOffset.UtcNow,
+            UpdatedAtUtc = DateTimeOffset.UtcNow,
+        });
+        await harness.DbContext.SaveChangesAsync();
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        // Both repositories can have a PR #122. Asking the wrong one would read
+        // another repository's pull request and act on it.
+        Assert.Contains(("JINPINYING/Symphony", 122), tracker.PullRequestStatusRequests);
+        Assert.DoesNotContain(("JINPINYING/Product", 122), tracker.PullRequestStatusRequests);
+    }
+
     // ADCP#22. An escalated ledger is deliberately parked so the phase machine does
     // not resume it - but "parked" was implemented as "never looked at again", so
     // #111 was still listed on the owner's panel as stopped at the merge gate long
@@ -2089,7 +2181,8 @@ public sealed class OrchestrationTickServiceTests
         IReadOnlyList<string>? protectedPaths = null,
         IReadOnlyList<string>? trackerLabels = null,
         string defaultRunner = "codex",
-        string? fallbackRunner = null)
+        string? fallbackRunner = null,
+        IReadOnlyList<(string Owner, string Repo)>? repositories = null)
     {
         var runtime = new WorkflowRuntimeSettings(
             new WorkflowTrackerSettings(
@@ -2102,7 +2195,15 @@ public sealed class OrchestrationTickServiceTests
                 IncludePullRequests: includePullRequests,
                 Labels: trackerLabels ?? [],
                 ActiveStates: activeStates ?? ["Open"],
-                TerminalStates: ["Closed"]),
+                TerminalStates: ["Closed"],
+                Repositories: repositories?
+                    .Select((entry, index) => new WorkflowRepositorySettings(
+                        entry.Owner,
+                        entry.Repo,
+                        index == 0 ? "./workspaces/repo" : $"./workspaces/repos/{entry.Repo.ToLowerInvariant()}",
+                        index == 0 ? "./workspaces/worktrees" : $"./workspaces/worktrees-{entry.Repo.ToLowerInvariant()}",
+                        $"https://github.com/{entry.Owner}/{entry.Repo}.git"))
+                    .ToList()),
             new WorkflowPollingSettings(600_000),
             new WorkflowAgentSettings(
                 MaxConcurrentAgents: maxConcurrentAgents,
@@ -2136,7 +2237,8 @@ public sealed class OrchestrationTickServiceTests
         string identifier,
         string state,
         IReadOnlyList<BlockerRef>? blockedBy,
-        IReadOnlyList<PullRequestRef>? pullRequests = null)
+        IReadOnlyList<PullRequestRef>? pullRequests = null,
+        string repository = "")
     {
         return new NormalizedIssue(
             id,
@@ -2152,7 +2254,8 @@ public sealed class OrchestrationTickServiceTests
             pullRequests ?? [],
             blockedBy ?? [],
             DateTimeOffset.UtcNow,
-            DateTimeOffset.UtcNow);
+            DateTimeOffset.UtcNow,
+            repository);
     }
 
     private sealed class TestHarness : IAsyncDisposable
@@ -2493,6 +2596,13 @@ public sealed class OrchestrationTickServiceTests
         bool throwOnFetchStatesByIds = false,
         bool throwOnFetchCandidates = false) : IGitHubTrackerClient
     {
+        // Per-repository candidates and per-repository outages, so a fan-out can be
+        // told apart from a single fetch that happens to return everything.
+        public Dictionary<string, IReadOnlyList<NormalizedIssue>> IssuesByRepository { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public HashSet<string> RepositoriesThatFail { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public List<string> CandidateFetchRepositories { get; } = [];
+        public List<(string Repository, int Number)> PullRequestStatusRequests { get; } = [];
+
         private readonly Dictionary<string, string> statesById = issueStatesById is null
             ? new(StringComparer.OrdinalIgnoreCase)
             : new(issueStatesById, StringComparer.OrdinalIgnoreCase);
@@ -2501,13 +2611,18 @@ public sealed class OrchestrationTickServiceTests
 
         public Task<IReadOnlyList<NormalizedIssue>> FetchCandidateIssuesAsync(TrackerQuery query, CancellationToken cancellationToken = default)
         {
-            if (throwOnFetchCandidates)
+            var repository = $"{query.Owner}/{query.Repo}";
+            CandidateFetchRepositories.Add(repository);
+
+            if (throwOnFetchCandidates || RepositoriesThatFail.Contains(repository))
             {
                 throw new InvalidOperationException("simulated candidate scan outage");
             }
 
             FetchCandidateIssuesCalled = true;
-            return Task.FromResult(issues);
+            return Task.FromResult(IssuesByRepository.Count > 0
+                ? IssuesByRepository.TryGetValue(repository, out var perRepository) ? perRepository : []
+                : issues);
         }
 
         public Task<IReadOnlyList<NormalizedIssue>> FetchIssuesByStatesAsync(TrackerQuery query, IReadOnlyList<string> states, CancellationToken cancellationToken = default)
@@ -2714,6 +2829,7 @@ public sealed class OrchestrationTickServiceTests
             int pullRequestNumber,
             CancellationToken cancellationToken = default)
         {
+            PullRequestStatusRequests.Add(($"{query.Owner}/{query.Repo}", pullRequestNumber));
             return Task.FromResult(
                 PullRequestStatusByNumber.TryGetValue(pullRequestNumber, out var status) ? status : null);
         }
