@@ -121,6 +121,21 @@ public sealed class StaffSummaryTests
         Assert.Equal(StaffSummary.StateLate, Assert.Single(staff, m => m.Role == StaffSummary.RoleScheduler).State);
     }
 
+    // Health answers "is it still being started", not "is it running now". Mapping
+    // only on health produced a row reading "Idle - Currently running, started less
+    // than a minute ago", contradicting itself in the space of one line.
+    [Fact]
+    public void ASchedulerThatIsExecutingRightNowReadsAsWorking()
+    {
+        var staff = StaffSummary.Build(
+            [], activeRuns: [], recentRuns: [], Now,
+            schedulers: [new WatchedTaskReport("ADCP Commander", @"\ADCP Commander", "Enabled", "Running",
+                Now.AddSeconds(-20), 0, Now.AddMinutes(15), 15, WatchedTaskReport.HealthOk,
+                "Currently running, started less than a minute ago.")]);
+
+        Assert.Equal(StaffSummary.StateWorking, Assert.Single(staff, m => m.Role == StaffSummary.RoleScheduler).State);
+    }
+
     // Yesterday's session is not a colleague today.
     [Fact]
     public void ASessionThatWentQuietLongAgoLeavesTheTeam()

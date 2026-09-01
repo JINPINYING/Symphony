@@ -124,12 +124,19 @@ public static class StaffSummary
         schedulers.Select(task => new StaffMember(
             Runner: task.Name,
             Role: RoleScheduler,
-            State: task.Health switch
-            {
-                WatchedTaskReport.HealthOk => StateIdle,
-                WatchedTaskReport.HealthLate => StateLate,
-                _ => StateLate
-            },
+            // Health answers "is this scheduler still being started?", which is not
+            // the same question as "is it running right now". Mapping only on
+            // health produced a row reading "Idle - Currently running, started less
+            // than a minute ago", where the state and the sentence beside it
+            // contradicted each other. The scheduler's own Status is the authority
+            // on whether it is executing.
+            State: string.Equals(task.Status, "Running", StringComparison.OrdinalIgnoreCase)
+                ? StateWorking
+                : task.Health switch
+                {
+                    WatchedTaskReport.HealthOk => StateIdle,
+                    _ => StateLate
+                },
             IssueIdentifier: null,
             Phase: null,
             Activity: task.Explanation,
