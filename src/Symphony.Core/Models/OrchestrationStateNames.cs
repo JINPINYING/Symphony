@@ -16,6 +16,13 @@ public static class RunStatusNames
     // command-center directive (M3): the directive either re-dispatched the issue
     // as a fresh run or closed it.
     public const string ResolvedByDirective = "resolved_by_directive";
+
+    // Terminal outcome for a run whose escalation stopped being real on its own:
+    // the pull request it was escalated over reached a terminal state, so there
+    // is no longer a decision to make. Kept distinct from ResolvedByDirective so
+    // the record says HOW it ended - a person answering, or the question simply
+    // going away - which is exactly the attribution this system keeps needing.
+    public const string ResolvedByPhaseClear = "resolved_by_phase_clear";
 }
 
 public static class RunPhaseNames

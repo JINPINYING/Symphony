@@ -36,6 +36,29 @@ public static class OwnerAttentionSummary
     /// The owner is left off because every repository here shares one, and a label
     /// too long for the panel is a label nobody reads.
     /// </summary>
+    /// <summary>
+    /// Where to go and do the thing. An item that names a decision and makes the
+    /// reader hunt for the issue is only half an answer - the escalation items
+    /// carried no link at all until 2026-09-01, while the pull-request items
+    /// beside them did.
+    ///
+    /// Returns null rather than a guess when the repository is unknown: a wrong
+    /// link is worse than none, because none is obviously absent and a wrong one
+    /// is discovered only after following it.
+    /// </summary>
+    private static string? IssueUrl(string? repository, string identifier)
+    {
+        if (string.IsNullOrWhiteSpace(repository) || string.IsNullOrWhiteSpace(identifier))
+        {
+            return null;
+        }
+
+        var number = identifier.TrimStart('#');
+        return number.Length > 0 && number.All(char.IsDigit)
+            ? $"https://github.com/{repository}/issues/{number}"
+            : null;
+    }
+
     private static string Qualify(string? primaryRepository, string? repository, string identifier)
     {
         if (string.IsNullOrWhiteSpace(primaryRepository) || string.IsNullOrWhiteSpace(identifier))
@@ -101,15 +124,39 @@ public static class OwnerAttentionSummary
                 LevelDown));
         }
 
-        foreach (var run in escalatedRuns)
+        // Issues whose phase has already reached a terminal stage. The reconciler
+        // in PhaseOrchestrator now resolves the run when it closes the ledger, so
+        // this should always be empty - it is kept because the failure it guards
+        // against was silent and expensive. On 2026-09-01 the ledger said closed
+        // while the runs stayed needs_command_center, and the page led with "2
+        // things are waiting on you" for two issues its own event stream reported
+        // as resolved. Reporting a decision that is not needed costs more trust
+        // than missing one: the reader stops believing the number.
+        var settledIssues = phases
+            .Where(p => string.Equals(p.Stage, PhaseStages.Closed, StringComparison.Ordinal)
+                     || string.Equals(p.Stage, PhaseStages.Merged, StringComparison.Ordinal))
+            .Select(p => p.IssueId)
+            .ToHashSet(StringComparer.Ordinal);
+
+        foreach (var run in escalatedRuns.Where(run => !settledIssues.Contains(run.IssueId)))
         {
             var posted = run.EscalationPostedAtUtc is not null;
+
+            // The run already knows why it stopped. Saying only "escalated and
+            // posted" sends the reader to GitHub to find out what the engine had
+            // in hand the whole time - "CI rollup is FAILURE at head 214a4406" is
+            // the difference between a notification and something actionable.
+            var why = string.IsNullOrWhiteSpace(run.LastMessage)
+                ? "The engine did not record a reason."
+                : run.LastMessage!.Trim();
+
             items.Add(new AttentionItem(
                 $"{Qualify(primaryRepository, run.Repository, run.IssueIdentifier)} needs a decision",
                 posted
-                    ? "Escalated and posted to GitHub. Reply with a symphony:directive comment to un-park it."
-                    : "Escalated but the GitHub comment has not posted yet - the publisher may be failing.",
-                posted ? LevelAttention : LevelDown));
+                    ? $"{why} Reply with a symphony:directive comment to un-park it."
+                    : $"{why} The GitHub comment has not posted yet - the publisher may be failing.",
+                posted ? LevelAttention : LevelDown,
+                IssueUrl(run.Repository, run.IssueIdentifier)));
         }
 
         // A PR that reached ready and stayed there means the merge gate refused it

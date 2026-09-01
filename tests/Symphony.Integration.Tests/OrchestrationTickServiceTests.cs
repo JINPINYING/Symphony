@@ -585,6 +585,41 @@ public sealed class OrchestrationTickServiceTests
             entry => entry.EventName == "phase_escalation_cleared");
     }
 
+    // The half ADCP#22 missed. Clearing the LEDGER was not enough, because the
+    // owner's attention panel is built from `runs` - so on 2026-09-01 the page led
+    // with "2 things are waiting on you" for #115 and #118 while its own event
+    // stream, further down the same page, reported both as resolved. The two
+    // records have to move together or the page contradicts itself on the one
+    // line that matters most.
+    [Fact]
+    public async Task RunTickAsync_ShouldResolveTheStrandedRunWhenItClearsTheEscalation()
+    {
+        var tracker = new FakeTrackerClient([]);
+        tracker.PullRequestStatusByNumber[112] = new PullRequestStatus(112, "MERGED", false, "dbbbae5c", "SUCCESS", null);
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await SeedEscalatedLedgerAsync(harness, prNumber: 112);
+        harness.DbContext.Runs.Add(new RunEntity
+        {
+            Id = Guid.NewGuid().ToString("N"),
+            IssueId = "issue-1",
+            IssueIdentifier = "#111",
+            Status = RunStatusNames.NeedsCommandCenter,
+            EscalationPostedAtUtc = DateTimeOffset.UtcNow.AddMinutes(-30),
+            StartedAtUtc = DateTimeOffset.UtcNow.AddHours(-1),
+        });
+        await harness.DbContext.SaveChangesAsync();
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var run = Assert.Single(await harness.DbContext.Runs.ToListAsync());
+        Assert.Equal(RunStatusNames.ResolvedByPhaseClear, run.Status);
+        Assert.NotNull(run.CompletedAtUtc);
+    }
+
     [Fact]
     public async Task RunTickAsync_ShouldLeaveAMergeGateEscalationUpWhileItsPullRequestIsStillOpen()
     {
