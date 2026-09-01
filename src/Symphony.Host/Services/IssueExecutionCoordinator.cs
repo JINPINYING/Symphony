@@ -215,33 +215,15 @@ public sealed class IssueExecutionCoordinator(
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             var stopState = await ReadStopStateAsync(request, CancellationToken.None);
-            switch (stopState.RequestedStopReason)
-            {
-                case RunStopReasons.Terminal:
-                    finalStatus = RunStatusNames.CanceledByReconciliation;
-                    finalError = "terminal state reached";
-                    releaseClaim = true;
-                    releaseStatus = RunStatusNames.CanceledByReconciliation;
-                    cleanupWorkspace = stopState.CleanupWorkspaceOnStop;
-                    break;
-                case RunStopReasons.Inactive:
-                    finalStatus = RunStatusNames.CanceledByReconciliation;
-                    finalError = "issue is no longer active";
-                    releaseClaim = true;
-                    releaseStatus = RunStatusNames.CanceledByReconciliation;
-                    cleanupWorkspace = false;
-                    break;
-                case RunStopReasons.Stalled:
-                    finalStatus = RunStatusNames.Stalled;
-                    finalError = "stall timeout exceeded";
-                    retryPlan = CreateFailureRetryPlan(request.Attempt, finalError, request.WorkflowDefinition.Runtime.Agent.MaxRetryBackoffMs);
-                    break;
-                default:
-                    finalStatus = RunStatusNames.Failed;
-                    finalError = "run canceled";
-                    retryPlan = CreateFailureRetryPlan(request.Attempt, finalError, request.WorkflowDefinition.Runtime.Agent.MaxRetryBackoffMs);
-                    break;
-            }
+            var outcome = ResolveStopOutcome(stopState.RequestedStopReason, stopState.CleanupWorkspaceOnStop);
+            finalStatus = outcome.FinalStatus;
+            finalError = outcome.Error;
+            releaseClaim = outcome.ReleaseClaim;
+            releaseStatus = outcome.ReleaseStatus;
+            cleanupWorkspace = outcome.CleanupWorkspace;
+            retryPlan = outcome.Retry
+                ? CreateFailureRetryPlan(request.Attempt, outcome.Error, request.WorkflowDefinition.Runtime.Agent.MaxRetryBackoffMs)
+                : null;
         }
         catch (Exception ex)
         {
@@ -419,6 +401,65 @@ public sealed class IssueExecutionCoordinator(
         }
 
         await dbContext.SaveChangesAsync(cancellationToken);
+    }
+
+    // How a stop request becomes a final run state. Extracted from the cancellation
+    // handler so the one property that matters operationally is directly testable:
+    // exactly which stop reasons schedule another retry, and which end the run.
+    internal readonly record struct StopOutcome(
+        string FinalStatus,
+        string Error,
+        bool ReleaseClaim,
+        string ReleaseStatus,
+        bool CleanupWorkspace,
+        bool Retry);
+
+    internal static StopOutcome ResolveStopOutcome(string? requestedStopReason, bool cleanupWorkspaceOnStop)
+    {
+        return requestedStopReason switch
+        {
+            RunStopReasons.Terminal => new StopOutcome(
+                RunStatusNames.CanceledByReconciliation,
+                "terminal state reached",
+                ReleaseClaim: true,
+                RunStatusNames.CanceledByReconciliation,
+                CleanupWorkspace: cleanupWorkspaceOnStop,
+                Retry: false),
+            RunStopReasons.Inactive => new StopOutcome(
+                RunStatusNames.CanceledByReconciliation,
+                "issue is no longer active",
+                ReleaseClaim: true,
+                RunStatusNames.CanceledByReconciliation,
+                CleanupWorkspace: false,
+                Retry: false),
+            RunStopReasons.Stalled => new StopOutcome(
+                RunStatusNames.Stalled,
+                "stall timeout exceeded",
+                ReleaseClaim: false,
+                RunStatusNames.Failed,
+                CleanupWorkspace: false,
+                Retry: true),
+
+            // Terminal, and deliberately WITHOUT a retry (ADCP#23). The startup guard
+            // has already spent the pre-session attempt budget, so a retry here only
+            // creates a reservation that TryClaimIssueAsync fences forever - the run
+            // then sits in 'retrying' holding an agent slot with no route out. It ends
+            // here instead, and goes to the Command Center where a person can see it.
+            RunStopReasons.StartupExhausted => new StopOutcome(
+                RunStatusNames.NeedsCommandCenter,
+                "startup retry budget exhausted without an agent session",
+                ReleaseClaim: true,
+                RunStatusNames.NeedsCommandCenter,
+                CleanupWorkspace: false,
+                Retry: false),
+            _ => new StopOutcome(
+                RunStatusNames.Failed,
+                "run canceled",
+                ReleaseClaim: false,
+                RunStatusNames.Failed,
+                CleanupWorkspace: false,
+                Retry: true)
+        };
     }
 
     private async Task<(string? RequestedStopReason, bool CleanupWorkspaceOnStop)> ReadStopStateAsync(

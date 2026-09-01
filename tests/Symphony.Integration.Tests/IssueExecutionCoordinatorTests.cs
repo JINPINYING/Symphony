@@ -38,6 +38,39 @@ public sealed class IssueExecutionCoordinatorTests
         Assert.Equal(42, run.LastReportedTotalTokens);
     }
 
+    // ADCP#23. The live-agent half of the same defect: when the tick asks a running
+    // agent to stop because the startup budget is spent, the coordinator must finalize
+    // that run terminally. Mapping it to "stalled" schedules a retry the claim store
+    // then fences forever, and the run never leaves 'retrying'.
+    [Theory]
+    [InlineData(RunStopReasons.Terminal, RunStatusNames.CanceledByReconciliation, false)]
+    [InlineData(RunStopReasons.Inactive, RunStatusNames.CanceledByReconciliation, false)]
+    [InlineData(RunStopReasons.Stalled, RunStatusNames.Stalled, true)]
+    [InlineData(RunStopReasons.StartupExhausted, RunStatusNames.NeedsCommandCenter, false)]
+    [InlineData(null, RunStatusNames.Failed, true)]
+    public void ResolveStopOutcome_ShouldOnlyRetryStopReasonsThatCanStillMakeProgress(
+        string? stopReason,
+        string expectedStatus,
+        bool expectedRetry)
+    {
+        var outcome = IssueExecutionCoordinator.ResolveStopOutcome(stopReason, cleanupWorkspaceOnStop: false);
+
+        Assert.Equal(expectedStatus, outcome.FinalStatus);
+        Assert.Equal(expectedRetry, outcome.Retry);
+    }
+
+    [Fact]
+    public void ResolveStopOutcome_ShouldReleaseTheClaimWhenStartupBudgetIsExhausted()
+    {
+        var outcome = IssueExecutionCoordinator.ResolveStopOutcome(
+            RunStopReasons.StartupExhausted,
+            cleanupWorkspaceOnStop: false);
+
+        // Without this the issue keeps its active claim and the only agent slot with it.
+        Assert.True(outcome.ReleaseClaim);
+        Assert.Equal(RunStatusNames.NeedsCommandCenter, outcome.ReleaseStatus);
+    }
+
     private static AgentRunUpdate CreateTokenUpdate(
         int inputTokens,
         int outputTokens,

@@ -103,6 +103,122 @@ public sealed partial class OrchestrationTickService
         await dbContext.SaveChangesAsync(cancellationToken);
     }
 
+    // A run that can never reach a terminal status is a leak, whichever code path
+    // forgot it. ADCP#23 found one such path - the startup fence refusing every
+    // claim for a reservation it had itself scheduled - but the shape is general,
+    // and two more routes into it already exist: a run in 'retrying' whose
+    // reservation row is gone, and a phase-owned run in 'retrying', which the
+    // retry loop skips (the phase orchestrator owns it) while the phase
+    // orchestrator only reacts to running/succeeded/failed/timed_out/stalled.
+    //
+    // This is the net under all of them. A run parked in 'retrying' is never
+    // executing - that status is written only once the agent process is gone - so
+    // if its reservation stays due and undispatched, nothing is coming for it,
+    // and it holds an agent slot the whole time it waits.
+    private static readonly TimeSpan WedgedRetryFloor = TimeSpan.FromMinutes(15);
+
+    // Overdue in the database is not enough on its own: after the service has been
+    // stopped for an hour, every pending reservation is overdue through no fault of
+    // its own, and the very next tick would dispatch it. What identifies a wedge is
+    // that THIS instance has watched the reservation stay due across a full grace
+    // period of its own ticks and never managed to act on it. In-memory is the
+    // right lifetime for that: a restart genuinely should start the clock again.
+    private readonly Dictionary<string, DateTimeOffset> firstObservedOverdueRetries = new(StringComparer.OrdinalIgnoreCase);
+
+    private async Task ReconcileWedgedRetriesAsync(
+        WorkflowDefinition workflowDefinition,
+        string instanceId,
+        CancellationToken cancellationToken)
+    {
+        var nowUtc = timeProvider.GetUtcNow();
+
+        var retryingRuns = await dbContext.Runs
+            .Where(run =>
+                run.Status == RunStatusNames.Retrying &&
+                run.CompletedAtUtc == null &&
+                run.OwnerInstanceId == instanceId)
+            .ToListAsync(cancellationToken);
+
+        var stillRetrying = new HashSet<string>(retryingRuns.Select(run => run.Id), StringComparer.OrdinalIgnoreCase);
+        foreach (var runId in firstObservedOverdueRetries.Keys.Where(id => !stillRetrying.Contains(id)).ToList())
+        {
+            firstObservedOverdueRetries.Remove(runId);
+        }
+
+        if (retryingRuns.Count == 0)
+        {
+            return;
+        }
+
+        // Generous on purpose. A retry that is merely waiting its turn has its due
+        // time pushed forward each tick, so it never accumulates overdue time at all;
+        // only a reservation nobody can act on does.
+        var backoffCeiling = TimeSpan.FromMilliseconds(
+            Math.Max(workflowDefinition.Runtime.Agent.MaxRetryBackoffMs, 0)) * 4;
+        var grace = backoffCeiling > WedgedRetryFloor ? backoffCeiling : WedgedRetryFloor;
+
+        var issueIds = retryingRuns.Select(run => run.IssueId).ToList();
+        var reservations = (await dbContext.RetryQueue
+                .Where(retry => issueIds.Contains(retry.IssueId))
+                .ToListAsync(cancellationToken))
+            .ToDictionary(retry => retry.IssueId, StringComparer.OrdinalIgnoreCase);
+
+        foreach (var run in retryingRuns)
+        {
+            var hasReservation = reservations.TryGetValue(run.IssueId, out var reservation);
+
+            // A reservation that is not due yet is simply waiting, and a run with no
+            // reservation at all has nothing that could ever fire for it.
+            if (hasReservation && reservation!.DueAtUtc > nowUtc)
+            {
+                firstObservedOverdueRetries.Remove(run.Id);
+                continue;
+            }
+
+            if (!firstObservedOverdueRetries.TryGetValue(run.Id, out var firstObservedUtc))
+            {
+                firstObservedOverdueRetries[run.Id] = nowUtc;
+                continue;
+            }
+
+            var stuckFor = nowUtc - firstObservedUtc;
+            if (stuckFor <= grace)
+            {
+                continue;
+            }
+
+            var reason = hasReservation
+                ? $"Run for issue {run.IssueIdentifier} has been parked in '{RunStatusNames.Retrying}' with a retry " +
+                  $"reservation that has been due since {reservation!.DueAtUtc:O} and has stayed undispatched for " +
+                  $"{(int)stuckFor.TotalMinutes} minutes, past the {(int)grace.TotalMinutes}-minute wedge threshold. " +
+                  "No dispatch path is able to act on it, so it is ended here rather than left holding an agent slot " +
+                  $"indefinitely. Latest recorded cause: {reservation.Error ?? run.LastMessage ?? "unknown"}."
+                : $"Run for issue {run.IssueIdentifier} has been parked in '{RunStatusNames.Retrying}' with no retry " +
+                  $"reservation at all for {(int)stuckFor.TotalMinutes} minutes, so nothing will ever re-dispatch it. " +
+                  $"Latest recorded cause: {run.LastMessage ?? "unknown"}.";
+
+            dbContext.EventLog.Add(new EventLogEntity
+            {
+                IssueId = run.IssueId,
+                IssueIdentifier = run.IssueIdentifier,
+                RunId = run.Id,
+                EventName = "wedged_retry_reconciled",
+                Level = LogLevel.Warning.ToString(),
+                Message = reason,
+                OccurredAtUtc = nowUtc
+            });
+
+            firstObservedOverdueRetries.Remove(run.Id);
+            await EscalateRunToCommandCenterAsync(
+                run,
+                run.IssueId,
+                run.IssueIdentifier,
+                instanceId,
+                reason,
+                cancellationToken);
+        }
+    }
+
     private async Task ReconcileRunningIssuesAsync(
         WorkflowDefinition workflowDefinition,
         string? apiKey,
@@ -257,14 +373,31 @@ public sealed partial class OrchestrationTickService
 
         if (latestAttempt is not null)
         {
-            latestAttempt.Status = stopReason == RunStopReasons.Stalled
-                ? RunStatusNames.Stalled
-                : RunStatusNames.CanceledByReconciliation;
+            latestAttempt.Status = stopReason switch
+            {
+                RunStopReasons.Stalled => RunStatusNames.Stalled,
+                RunStopReasons.StartupExhausted => RunStatusNames.NeedsCommandCenter,
+                _ => RunStatusNames.CanceledByReconciliation
+            };
             latestAttempt.Error = stopReason;
             latestAttempt.CompletedAtUtc = nowUtc;
         }
 
-        if (stopReason == RunStopReasons.Stalled)
+        if (stopReason == RunStopReasons.StartupExhausted)
+        {
+            // Terminal, and deliberately without a retry reservation: the guard has
+            // spent the budget, so a reservation here would only be fenced forever
+            // (ADCP#23). EscalateRunToCommandCenterAsync drops the reservation,
+            // releases the claim and saves.
+            await EscalateRunToCommandCenterAsync(
+                run,
+                run.IssueId,
+                run.IssueIdentifier,
+                instanceId,
+                run.LastMessage ?? "Startup retry budget exhausted without an agent session.",
+                cancellationToken);
+        }
+        else if (stopReason == RunStopReasons.Stalled)
         {
             run.Status = RunStatusNames.Retrying;
             run.CurrentRetryAttempt = (run.CurrentRetryAttempt ?? 0) + 1;

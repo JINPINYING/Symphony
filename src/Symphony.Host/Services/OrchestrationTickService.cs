@@ -156,6 +156,7 @@ public sealed partial class OrchestrationTickService
         {
             await RecoverOrphanedStateAsync(instanceId, workflowDefinition, cancellationToken);
             await ReconcileStartupAttemptsAsync(workflowDefinition, instanceId, cancellationToken);
+            await ReconcileWedgedRetriesAsync(workflowDefinition, instanceId, cancellationToken);
             await ReconcileRunningIssuesAsync(workflowDefinition, apiKey, preflightError, instanceId, cancellationToken);
             await PruneEventLogIfDueAsync(workflowDefinition, cancellationToken);
             if (preflightError is null && !string.IsNullOrWhiteSpace(apiKey))

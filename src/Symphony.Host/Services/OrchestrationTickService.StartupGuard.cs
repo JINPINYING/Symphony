@@ -73,12 +73,15 @@ public sealed partial class OrchestrationTickService
                 exhausted,
                 (int)age.TotalSeconds);
 
-            // Use the stalled path for both cases so the issue claim remains owned. When the
-            // second pre-session attempt is exhausted, TryClaimIssueAsync observes the durable
-            // attempt history and refuses any third dispatch even after the retry due time.
+            // A stalled attempt keeps its claim and retries. An exhausted budget must
+            // NOT: stopping it as "stalled" schedules a retry that TryClaimIssueAsync
+            // then refuses forever with startup_attempt_fence, so the run sits in
+            // 'retrying' with an elapsed due_at, holding the only agent slot, until
+            // somebody clears it by hand (ADCP#23). Exhaustion is terminal and goes to
+            // the Command Center instead.
             await RequestRunStopAsync(
                 run,
-                RunStopReasons.Stalled,
+                exhausted ? RunStopReasons.StartupExhausted : RunStopReasons.Stalled,
                 cleanupWorkspace: false,
                 workflowDefinition.Runtime.Agent.MaxRetryBackoffMs,
                 instanceId,
