@@ -9,6 +9,14 @@ public sealed partial class OrchestrationTickService
 {
     private static readonly TimeSpan AcquisitionDiagnosticThreshold = TimeSpan.FromMinutes(2);
 
+    // Ordinary failures used to retry without limit. That was survivable only while a
+    // retrying run quietly surrendered its slot to whoever asked next - which is the
+    // starvation in ADCP#25. Now that a reservation is honoured for the life of the
+    // run, an unbounded retry would hold the queue against everything behind it, so
+    // the run has to be able to give up. Six attempts spans roughly ten minutes of
+    // backoff, after which the cause is not transient and a person should see it.
+    private const int MaxRetryAttempts = 6;
+
     private async Task DispatchCandidatesAsync(
         WorkflowDefinition workflowDefinition,
         string apiKey,
@@ -60,18 +68,33 @@ public sealed partial class OrchestrationTickService
 
         await UpsertIssueCacheAsync(issues, workflowDefinition, cancellationToken);
 
-        var runningIssues = await dbContext.Runs
-            .Where(run => run.Status == RunStatusNames.Running)
+        var activeRuns = await dbContext.Runs
+            .Where(run => run.Status == RunStatusNames.Running || run.Status == RunStatusNames.Retrying)
             .ToListAsync(cancellationToken);
 
         // Issues finalized during this tick (legacy continuation drain) must not be
         // re-dispatched in the same tick; the next tick's phase-aware checks govern them.
         var finalizedThisTick = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        var countsByState = runningIssues
-            .GroupBy(run => NormalizeStateKey(run.State), StringComparer.OrdinalIgnoreCase)
-            .ToDictionary(group => group.Key, group => group.Count(), StringComparer.OrdinalIgnoreCase);
-        var runningIssueIds = new HashSet<string>(runningIssues.Select(run => run.IssueId), StringComparer.OrdinalIgnoreCase);
+        // Two different questions, and conflating them is ADCP#25. "Is this issue
+        // executing right now" is about live agent processes. "Is there room to start
+        // something new" is about work in flight - and a run waiting for its retry is
+        // still in flight: it owns a workspace, a claim and an attempt history.
+        // Counting only live processes left the slot apparently free in the gap between
+        // a failure and its retry, a competing issue was dispatched into it, and the
+        // retry that came back to a full plane was then destroyed rather than made to
+        // wait its turn. Two ready issues took it in turns to do that to each other,
+        // every three minutes, indefinitely.
+        var runningIssueIds = new HashSet<string>(
+            activeRuns.Where(run => run.Status == RunStatusNames.Running).Select(run => run.IssueId),
+            StringComparer.OrdinalIgnoreCase);
+        var reservedStateByIssueId = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var activeRun in activeRuns)
+        {
+            reservedStateByIssueId[activeRun.IssueId] = NormalizeStateKey(activeRun.State);
+        }
+
+        var countsByState = CountReservationsByState(reservedStateByIssueId);
 
         var dueRetries = await dbContext.RetryQueue
             .FromSqlInterpolated($"""
@@ -124,6 +147,20 @@ public sealed partial class OrchestrationTickService
                 continue;
             }
 
+            if (retryEntry.Attempt > MaxRetryAttempts)
+            {
+                await EscalateRunToCommandCenterAsync(
+                    await FindLatestRunWithStatusAsync(retryEntry.IssueId, RunStatusNames.Retrying, cancellationToken),
+                    retryEntry.IssueId,
+                    retryEntry.IssueIdentifier,
+                    instanceId,
+                    $"Issue {retryEntry.IssueIdentifier} has failed {MaxRetryAttempts} bounded attempts and is not " +
+                    "recovering on its own. The run is ended here so it stops holding an agent slot against the rest " +
+                    $"of the queue. Latest recorded cause: {retryEntry.Error ?? "unknown"}.",
+                    cancellationToken);
+                continue;
+            }
+
             if (!candidatesById.TryGetValue(retryEntry.IssueId, out var retryIssue))
             {
                 await HandleMissingRetryCandidateAsync(
@@ -135,14 +172,24 @@ public sealed partial class OrchestrationTickService
                 continue;
             }
 
-            if (!IsDispatchEligible(retryIssue, workflowDefinition, runningIssueIds, countsByState))
+            // Capacity is deliberately NOT part of this check (ADCP#25). It used to be,
+            // via IsDispatchEligible, and that made "the plane is busy" indistinguishable
+            // from "this issue is closed" - both released the reservation and finalized
+            // the run as released_ineligible, which is how work in flight was thrown
+            // away for losing a race it should simply have waited out. Capacity is
+            // handled below, where it reschedules.
+            var retryRefusal = DetermineIneligibilityReasonIgnoringCapacity(
+                retryIssue,
+                workflowDefinition,
+                runningIssueIds);
+            if (retryRefusal is not null)
             {
-                await RecordCandidateRefusalAsync(retryIssue, "non_eligible_label_state", cancellationToken);
+                await RecordCandidateRefusalAsync(retryIssue, retryRefusal, cancellationToken);
                 await ReleaseRetryReservationAsync(
                     retryEntry.IssueId,
                     retryEntry.IssueIdentifier,
                     instanceId,
-                    "issue no longer eligible for dispatch",
+                    $"issue no longer eligible for dispatch: {retryRefusal}",
                     cancellationToken);
                 continue;
             }
@@ -157,8 +204,12 @@ public sealed partial class OrchestrationTickService
                 continue;
             }
 
-            if (!HasGlobalSlot(workflowDefinition, runningIssueIds.Count) ||
-                !HasStateSlot(retryIssue.State, workflowDefinition, countsByState))
+            // The retry already holds a reservation, so it must not be counted against
+            // itself; it is resuming its own slot, not asking for a second one.
+            var otherReservations = CountReservationsByState(reservedStateByIssueId, excludeIssueId: retryIssue.Id);
+            var otherReservationCount = reservedStateByIssueId.Count - (reservedStateByIssueId.ContainsKey(retryIssue.Id) ? 1 : 0);
+            if (!HasGlobalSlot(workflowDefinition, otherReservationCount) ||
+                !HasStateSlot(retryIssue.State, workflowDefinition, otherReservations))
             {
                 await RecordCandidateRefusalAsync(retryIssue, "concurrency_limit", cancellationToken);
                 await RescheduleRetryAsync(
@@ -166,20 +217,31 @@ public sealed partial class OrchestrationTickService
                     instanceId,
                     "no available orchestrator slots",
                     workflowDefinition.Runtime.Agent.MaxRetryBackoffMs,
-                    cancellationToken);
+                    cancellationToken,
+                    // Waiting for a slot is not a failed attempt. Counting it as one
+                    // would inflate the backoff and spend the retry budget of work that
+                    // has not been tried yet.
+                    advanceAttempt: false);
                 continue;
             }
+
+            var quotaFallbackRunner = await ResolveQuotaFallbackRunnerAsync(
+                retryEntry,
+                workflowDefinition,
+                cancellationToken);
 
             if (await DispatchIssueAsync(
                     retryIssue,
                     workflowDefinition,
                     instanceId,
                     retryEntry.Attempt,
-                    countsByState,
                     cancellationToken,
-                    resetContinuousTurnBudget: retryEntry.DelayType == RetryDelayTypes.Backoff))
+                    resetContinuousTurnBudget: retryEntry.DelayType == RetryDelayTypes.Backoff,
+                    runnerOverride: quotaFallbackRunner))
             {
                 runningIssueIds.Add(retryIssue.Id);
+                reservedStateByIssueId[retryIssue.Id] = NormalizeStateKey(retryIssue.State);
+                countsByState = CountReservationsByState(reservedStateByIssueId);
             }
         }
 
@@ -189,7 +251,7 @@ public sealed partial class OrchestrationTickService
         for (var issueIndex = 0; issueIndex < orderedIssues.Count; issueIndex++)
         {
             var issue = orderedIssues[issueIndex];
-            if (!HasGlobalSlot(workflowDefinition, runningIssueIds.Count))
+            if (!HasGlobalSlot(workflowDefinition, reservedStateByIssueId.Count))
             {
                 var remainingIssues = orderedIssues
                     .Skip(issueIndex)
@@ -197,8 +259,7 @@ public sealed partial class OrchestrationTickService
                 await RecordRemainingCapacityRefusalsAsync(
                     remainingIssues,
                     workflowDefinition,
-                    runningIssueIds,
-                    countsByState,
+                    reservedStateByIssueId,
                     cancellationToken);
                 break;
             }
@@ -211,12 +272,15 @@ public sealed partial class OrchestrationTickService
                 continue;
             }
 
+            // Reserved, not merely running: an issue with a pending retry is already
+            // being worked and must not be started a second time from here.
+            var reservedIssueIds = new HashSet<string>(reservedStateByIssueId.Keys, StringComparer.OrdinalIgnoreCase);
             if (finalizedThisTick.Contains(issue.Id) ||
-                !IsDispatchEligible(issue, workflowDefinition, runningIssueIds, countsByState))
+                !IsDispatchEligible(issue, workflowDefinition, reservedIssueIds, countsByState))
             {
                 if (!finalizedThisTick.Contains(issue.Id))
                 {
-                    var reason = DetermineIneligibilityReason(issue, workflowDefinition, runningIssueIds, countsByState);
+                    var reason = DetermineIneligibilityReason(issue, workflowDefinition, reservedIssueIds, countsByState);
                     if (!string.Equals(reason, "already_running", StringComparison.OrdinalIgnoreCase))
                     {
                         await RecordCandidateRefusalAsync(issue, reason, cancellationToken);
@@ -232,11 +296,83 @@ public sealed partial class OrchestrationTickService
                 continue;
             }
 
-            if (await DispatchIssueAsync(issue, workflowDefinition, instanceId, attempt: null, countsByState, cancellationToken))
+            if (await DispatchIssueAsync(issue, workflowDefinition, instanceId, attempt: null, cancellationToken))
             {
                 runningIssueIds.Add(issue.Id);
+                reservedStateByIssueId[issue.Id] = NormalizeStateKey(issue.State);
+                countsByState = CountReservationsByState(reservedStateByIssueId);
             }
         }
+    }
+
+    // ADCP#24. Retrying a quota-exhausted vendor cannot succeed however many
+    // attempts are left, so when the account that just ran out is not the only one
+    // available, the retry goes to the other one.
+    //
+    // Only on exhaustion. An ordinary implementation failure stays with the vendor
+    // that produced it, because repairing your own work and having someone else
+    // redo it are different things, and only the first is what a retry means.
+    //
+    // ADR-006 (independent review is dispatched on the OTHER vendor) survives this
+    // by construction, twice over. The retry loop never touches phase-owned issues,
+    // so a review or repair dispatch cannot be re-vendored here; and reviewer
+    // selection is derived from the run's recorded Runner, which is written from
+    // the runner that actually executed - so a fallen-back implementation is
+    // reviewed by the vendor that did not implement it, not by the configured
+    // default that never ran.
+    private async Task<string?> ResolveQuotaFallbackRunnerAsync(
+        RetryQueueEntity retryEntry,
+        WorkflowDefinition workflowDefinition,
+        CancellationToken cancellationToken)
+    {
+        if (!AgentQuotaSignals.IsQuotaExhaustion(retryEntry.Error))
+        {
+            return null;
+        }
+
+        var exhaustedRun = await FindLatestRunWithStatusAsync(
+            retryEntry.IssueId,
+            RunStatusNames.Retrying,
+            cancellationToken);
+        var fallbackRunner = AgentQuotaSignals.ResolveFallbackRunner(
+            workflowDefinition.Runtime.Agent.FallbackRunner,
+            exhaustedRun?.Runner);
+        if (fallbackRunner is null)
+        {
+            return null;
+        }
+
+        AddIssueEvent(
+            retryEntry.IssueId,
+            retryEntry.IssueIdentifier,
+            exhaustedRun?.Id,
+            null,
+            "quota_fallback_dispatched",
+            LogLevel.Warning,
+            $"Runner '{exhaustedRun?.Runner ?? "unknown"}' is out of quota for {retryEntry.IssueIdentifier}, so this " +
+            $"attempt is dispatched to '{fallbackRunner}' instead of retrying into the same limit. Recorded cause: " +
+            $"{retryEntry.Error}.");
+        await dbContext.SaveChangesAsync(cancellationToken);
+
+        return fallbackRunner;
+    }
+
+    private static Dictionary<string, int> CountReservationsByState(
+        IReadOnlyDictionary<string, string> reservedStateByIssueId,
+        string? excludeIssueId = null)
+    {
+        var counts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (issueId, stateKey) in reservedStateByIssueId)
+        {
+            if (excludeIssueId is not null && issueId.Equals(excludeIssueId, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            counts[stateKey] = counts.GetValueOrDefault(stateKey) + 1;
+        }
+
+        return counts;
     }
 
     private async Task<HashSet<string>> ReconcileStaleReservationsBeforeCandidateSelectionAsync(
@@ -509,19 +645,11 @@ public sealed partial class OrchestrationTickService
         DirectiveDispatchContext directive,
         CancellationToken cancellationToken)
     {
-        var runningRuns = await dbContext.Runs
-            .Where(run => run.Status == RunStatusNames.Running)
-            .ToListAsync(cancellationToken);
-        var countsByState = runningRuns
-            .GroupBy(run => NormalizeStateKey(run.State), StringComparer.OrdinalIgnoreCase)
-            .ToDictionary(group => group.Key, group => group.Count(), StringComparer.OrdinalIgnoreCase);
-
         return await DispatchIssueAsync(
             issue,
             workflowDefinition,
             instanceId,
             attempt: null,
-            countsByState,
             cancellationToken,
             directive: directive);
     }
@@ -535,19 +663,11 @@ public sealed partial class OrchestrationTickService
         PhaseDispatchRequest phaseRequest,
         CancellationToken cancellationToken)
     {
-        var runningRuns = await dbContext.Runs
-            .Where(run => run.Status == RunStatusNames.Running)
-            .ToListAsync(cancellationToken);
-        var countsByState = runningRuns
-            .GroupBy(run => NormalizeStateKey(run.State), StringComparer.OrdinalIgnoreCase)
-            .ToDictionary(group => group.Key, group => group.Count(), StringComparer.OrdinalIgnoreCase);
-
         return await DispatchIssueAsync(
             issue,
             workflowDefinition,
             instanceId,
             attempt: null,
-            countsByState,
             cancellationToken,
             phaseDispatch: phaseRequest);
     }
@@ -557,11 +677,11 @@ public sealed partial class OrchestrationTickService
         WorkflowDefinition workflowDefinition,
         string instanceId,
         int? attempt,
-        Dictionary<string, int> countsByState,
         CancellationToken cancellationToken,
         bool resetContinuousTurnBudget = false,
         DirectiveDispatchContext? directive = null,
-        PhaseDispatchRequest? phaseDispatch = null)
+        PhaseDispatchRequest? phaseDispatch = null,
+        string? runnerOverride = null)
     {
         AddIssueEvent(
             issue.Id,
@@ -709,7 +829,7 @@ public sealed partial class OrchestrationTickService
                 DirectiveAction: directive?.Action,
                 DirectivePhase: directive?.Phase,
                 PromptOverride: phaseDispatch?.Prompt,
-                RunnerOverride: phaseDispatch?.RunnerName),
+                RunnerOverride: phaseDispatch?.RunnerName ?? runnerOverride),
             cancellationToken);
 
         if (!started)
@@ -742,22 +862,19 @@ public sealed partial class OrchestrationTickService
             return false;
         }
 
-        var stateKey = NormalizeStateKey(issue.State);
-        countsByState[stateKey] = countsByState.GetValueOrDefault(stateKey) + 1;
         return true;
     }
 
     private async Task RecordRemainingCapacityRefusalsAsync(
         IEnumerable<NormalizedIssue> issues,
         WorkflowDefinition workflowDefinition,
-        HashSet<string> runningIssueIds,
-        IReadOnlyDictionary<string, int> countsByState,
+        IReadOnlyDictionary<string, string> reservedStateByIssueId,
         CancellationToken cancellationToken)
     {
         foreach (var issue in issues)
         {
             if (IsCandidateEligibleForAcquisitionSlo(issue, workflowDefinition) &&
-                !runningIssueIds.Contains(issue.Id))
+                !reservedStateByIssueId.ContainsKey(issue.Id))
             {
                 await RecordCandidateRefusalAsync(issue, "concurrency_limit", cancellationToken);
             }
@@ -903,6 +1020,46 @@ public sealed partial class OrchestrationTickService
                PassesBlockerRule(issue, workflowDefinition);
     }
 
+    // The same checks as DetermineIneligibilityReason minus capacity. Kept separate
+    // and explicit because the distinction is the whole of ADCP#25: everything this
+    // reports is a durable "no" that should release the reservation, whereas a
+    // capacity refusal is a "not yet" that must reschedule it.
+    private static string? DetermineIneligibilityReasonIgnoringCapacity(
+        NormalizedIssue issue,
+        WorkflowDefinition workflowDefinition,
+        HashSet<string> activeIssueIds)
+    {
+        if (string.IsNullOrWhiteSpace(issue.Id) ||
+            string.IsNullOrWhiteSpace(issue.Identifier) ||
+            string.IsNullOrWhiteSpace(issue.Title) ||
+            string.IsNullOrWhiteSpace(issue.State))
+        {
+            return "invalid_candidate_payload";
+        }
+
+        if (activeIssueIds.Contains(issue.Id))
+        {
+            return "already_running";
+        }
+
+        if (MatchesTerminalState(issue.State, workflowDefinition.Runtime.Tracker.TerminalStates))
+        {
+            return "terminal_state";
+        }
+
+        if (!IssueStateMatcher.MatchesConfiguredActiveState(issue.State, workflowDefinition.Runtime.Tracker.ActiveStates))
+        {
+            return "non_eligible_label_state";
+        }
+
+        if (!PassesBlockerRule(issue, workflowDefinition))
+        {
+            return "active_blocker";
+        }
+
+        return null;
+    }
+
     private static string DetermineIneligibilityReason(
         NormalizedIssue issue,
         WorkflowDefinition workflowDefinition,
@@ -1010,7 +1167,7 @@ public sealed partial class OrchestrationTickService
             RunId = retryEntry.RunId,
             EventName = "implicit_continuation_suppressed",
             Level = LogLevel.Information.ToString(),
-            Message = "Successful Codex execution was finalized without starting another implementation run.",
+            Message = "A successful bounded execution was finalized without starting another implementation run.",
             OccurredAtUtc = nowUtc
         });
 
@@ -1372,9 +1529,10 @@ public sealed partial class OrchestrationTickService
         string instanceId,
         string error,
         int maxRetryBackoffMs,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool advanceAttempt = true)
     {
-        var nextAttempt = retryEntry.Attempt + 1;
+        var nextAttempt = advanceAttempt ? retryEntry.Attempt + 1 : retryEntry.Attempt;
         retryEntry.OwnerInstanceId = instanceId;
         retryEntry.Attempt = nextAttempt;
         retryEntry.Error = error;

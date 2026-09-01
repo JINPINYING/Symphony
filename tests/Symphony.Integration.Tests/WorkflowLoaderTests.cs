@@ -120,6 +120,74 @@ public sealed class WorkflowLoaderTests
     }
 
     [Fact]
+    public async Task LoadAsync_ShouldParseFallbackRunnerAndDefaultItToOff()
+    {
+        var withFallback = CreateWorkflowPath();
+        var withoutFallback = CreateWorkflowPath();
+        await File.WriteAllTextAsync(withFallback, BuildAgentWorkflow("""
+              default_runner: claude
+              fallback_runner: codex
+            """));
+        await File.WriteAllTextAsync(withoutFallback, BuildAgentWorkflow("""
+              default_runner: claude
+            """));
+
+        try
+        {
+            var definition = await new WorkflowLoader().LoadAsync(withFallback);
+            Assert.Equal("codex", definition.Runtime.Agent.FallbackRunner);
+
+            // Off unless asked for: re-vendoring work is not something to inherit.
+            var noFallback = await new WorkflowLoader().LoadAsync(withoutFallback);
+            Assert.Null(noFallback.Runtime.Agent.FallbackRunner);
+        }
+        finally
+        {
+            File.Delete(withFallback);
+            File.Delete(withoutFallback);
+        }
+    }
+
+    [Theory]
+    [InlineData("gemini")]
+    // Falling back to the vendor that just ran out of quota cannot help, and a
+    // config that says so is a mistake worth refusing at load rather than at 2am.
+    [InlineData("claude")]
+    public async Task LoadAsync_ShouldRejectAFallbackRunnerThatCannotHelp(string fallbackRunner)
+    {
+        var workflowPath = CreateWorkflowPath();
+        await File.WriteAllTextAsync(workflowPath, BuildAgentWorkflow($"""
+              default_runner: claude
+              fallback_runner: {fallbackRunner}
+            """));
+
+        try
+        {
+            var exception = await Assert.ThrowsAsync<WorkflowLoadException>(
+                () => new WorkflowLoader().LoadAsync(workflowPath));
+            Assert.Equal("invalid_agent_fallback_runner", exception.Code);
+        }
+        finally
+        {
+            File.Delete(workflowPath);
+        }
+    }
+
+    private static string BuildAgentWorkflow(string agentBlock) => $"""
+        ---
+        tracker:
+          kind: github
+          endpoint: https://api.github.com/graphql
+          api_key: test-token
+          owner: released
+          repo: symphony
+        agent:
+        {agentBlock}
+        ---
+        Prompt.
+        """;
+
+    [Fact]
     public async Task LoadAsync_ShouldRejectUnknownRunnerNames()
     {
         var workflowPath = CreateWorkflowPath();

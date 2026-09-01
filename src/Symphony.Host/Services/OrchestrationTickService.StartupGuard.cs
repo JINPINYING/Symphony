@@ -17,7 +17,6 @@ public sealed partial class OrchestrationTickService
         CancellationToken cancellationToken)
     {
         var nowUtc = timeProvider.GetUtcNow();
-        var startupTimeout = ResolveStartupAttemptTimeout(workflowDefinition);
 
         var startupRuns = await dbContext.Runs
             .Where(run =>
@@ -35,6 +34,12 @@ public sealed partial class OrchestrationTickService
             var activeAttempt = activeAttempts
                 .OrderByDescending(attempt => attempt.StartedAtUtc)
                 .FirstOrDefault();
+
+            // Per runner, not per plane (ADCP#26). This used to read the Codex stall
+            // timeout whichever agent had actually been dispatched, so a Claude run -
+            // whose configured window is more than three times wider - was measured
+            // against 180 seconds and killed while it was working.
+            var startupTimeout = ResolveStartupAttemptTimeout(workflowDefinition, run.Runner);
             if (activeAttempt is null || !IsStartupAttemptStale(activeAttempt.StartedAtUtc, nowUtc, startupTimeout))
             {
                 continue;
@@ -44,9 +49,10 @@ public sealed partial class OrchestrationTickService
                 .CountAsync(attempt => attempt.RunId == run.Id, cancellationToken);
             var exhausted = HasExhaustedStartupAttemptBudget(attemptCount);
             var age = nowUtc - activeAttempt.StartedAtUtc;
+            var runnerName = string.IsNullOrWhiteSpace(run.Runner) ? "agent" : run.Runner;
             var message = exhausted
-                ? $"Startup retry budget exhausted after {attemptCount} attempts without a Codex session. Latest attempt {activeAttempt.Id} remained pre-session for {(int)age.TotalSeconds}s. The active claim remains reserved so ordinary candidate polling cannot start a third attempt."
-                : $"Startup attempt {activeAttempt.Id} remained pre-session for {(int)age.TotalSeconds}s and exceeded the {startupTimeout.TotalSeconds:0}s startup timeout.";
+                ? $"Startup retry budget exhausted after {attemptCount} attempts without a {runnerName} session. Latest attempt {activeAttempt.Id} remained pre-session for {(int)age.TotalSeconds}s. The run is ended and escalated rather than left reserved."
+                : $"Startup attempt {activeAttempt.Id} remained pre-session for {(int)age.TotalSeconds}s and exceeded the {startupTimeout.TotalSeconds:0}s {runnerName} startup timeout.";
 
             dbContext.EventLog.Add(new EventLogEntity
             {
@@ -73,12 +79,15 @@ public sealed partial class OrchestrationTickService
                 exhausted,
                 (int)age.TotalSeconds);
 
-            // Use the stalled path for both cases so the issue claim remains owned. When the
-            // second pre-session attempt is exhausted, TryClaimIssueAsync observes the durable
-            // attempt history and refuses any third dispatch even after the retry due time.
+            // A stalled attempt keeps its claim and retries. An exhausted budget must
+            // NOT: stopping it as "stalled" schedules a retry that TryClaimIssueAsync
+            // then refuses forever with startup_attempt_fence, so the run sits in
+            // 'retrying' with an elapsed due_at, holding the only agent slot, until
+            // somebody clears it by hand (ADCP#23). Exhaustion is terminal and goes to
+            // the Command Center instead.
             await RequestRunStopAsync(
                 run,
-                RunStopReasons.Stalled,
+                exhausted ? RunStopReasons.StartupExhausted : RunStopReasons.Stalled,
                 cleanupWorkspace: false,
                 workflowDefinition.Runtime.Agent.MaxRetryBackoffMs,
                 instanceId,
@@ -86,9 +95,11 @@ public sealed partial class OrchestrationTickService
         }
     }
 
-    private static TimeSpan ResolveStartupAttemptTimeout(WorkflowDefinition workflowDefinition)
+    private static TimeSpan ResolveStartupAttemptTimeout(WorkflowDefinition workflowDefinition, string? runner)
     {
-        var configuredMs = workflowDefinition.Runtime.Codex.StallTimeoutMs;
+        var configuredMs = string.Equals(runner, AgentRunnerNames.Claude, StringComparison.OrdinalIgnoreCase)
+            ? workflowDefinition.Runtime.Claude.StallTimeoutMs
+            : workflowDefinition.Runtime.Codex.StallTimeoutMs;
         var boundedMs = configuredMs > 0
             ? Math.Min(configuredMs, DefaultStartupTimeoutMs)
             : DefaultStartupTimeoutMs;

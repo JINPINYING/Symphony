@@ -1,4 +1,4 @@
-﻿using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
@@ -1351,8 +1351,25 @@ public sealed class OrchestrationTickServiceTests
 
         await harness.Service.RunTickAsync(CancellationToken.None);
 
+        // The incumbent stalls and schedules a retry. Its slot is NOT handed to the
+        // waiting issue mid-flight: that hand-off is what made two ready issues take
+        // turns destroying each other's runs every three minutes (ADCP#25). The waiting
+        // issue is still visibly waiting, and the SLO diagnostic still says so.
         var retryingRun = await harness.DbContext.Runs.SingleAsync(run => run.IssueId == "issue-1");
         Assert.Equal(RunStatusNames.Retrying, retryingRun.Status);
+        Assert.Empty(harness.Coordinator.StartRequests);
+        Assert.Contains(
+            await harness.DbContext.EventLog.ToListAsync(),
+            entry => entry.EventName == "candidate_acquisition_delayed" && entry.IssueId == "issue-86");
+
+        // Once the incumbent's run is genuinely over, the long-waiting issue is acquired.
+        retryingRun.Status = RunStatusNames.CanceledByReconciliation;
+        retryingRun.CompletedAtUtc = now;
+        harness.DbContext.RetryQueue.RemoveRange(await harness.DbContext.RetryQueue.ToListAsync());
+        await harness.DbContext.SaveChangesAsync();
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
         Assert.Single(harness.Coordinator.StartRequests);
         Assert.Equal("issue-86", harness.Coordinator.StartRequests.Single().Issue.Id);
         var run = await harness.DbContext.Runs.SingleAsync(run => run.IssueId == "issue-86");
@@ -1617,6 +1634,366 @@ public sealed class OrchestrationTickServiceTests
         Assert.Empty(await harness.DbContext.RetryQueue.ToListAsync());
     }
 
+    // ADCP#24. Every queued implementer starved in the same minute when the shared
+    // Claude account hit its session limit, and each one retried into the same wall.
+    [Fact]
+    public async Task RunTickAsync_ShouldRetryOnTheOtherVendorWhenTheDispatchedOneIsOutOfQuota()
+    {
+        var now = DateTimeOffset.Parse("2026-09-01T10:00:00Z");
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1, defaultRunner: "claude", fallbackRunner: "codex"),
+            tracker: new FakeTrackerClient(
+                [BuildIssue("issue-1", "#1", "Open", null)],
+                issueStatesById: new Dictionary<string, string> { ["issue-1"] = "Open" }),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning),
+            timeProvider: new FixedTimeProvider(now));
+
+        await harness.InsertRetryingRunAsync("issue-1", "#1", "Open", "instance-1", nowUtcOverride: now);
+        var run = await harness.DbContext.Runs.SingleAsync();
+        run.Runner = "claude";
+        (await harness.DbContext.RetryQueue.SingleAsync()).Error =
+            "You've hit your session limit · resets 1:40am (America/New_York)";
+        await harness.DbContext.SaveChangesAsync();
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var request = Assert.Single(harness.Coordinator.StartRequests);
+        Assert.Equal("codex", request.RunnerOverride);
+        Assert.Contains(
+            await harness.DbContext.EventLog.ToListAsync(),
+            entry => entry.EventName == "quota_fallback_dispatched");
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldKeepAnOrdinaryFailureWithTheVendorThatProducedIt()
+    {
+        var now = DateTimeOffset.Parse("2026-09-01T10:00:00Z");
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1, defaultRunner: "claude", fallbackRunner: "codex"),
+            tracker: new FakeTrackerClient(
+                [BuildIssue("issue-1", "#1", "Open", null)],
+                issueStatesById: new Dictionary<string, string> { ["issue-1"] = "Open" }),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning),
+            timeProvider: new FixedTimeProvider(now));
+
+        await harness.InsertRetryingRunAsync("issue-1", "#1", "Open", "instance-1", nowUtcOverride: now);
+        var run = await harness.DbContext.Runs.SingleAsync();
+        run.Runner = "claude";
+        (await harness.DbContext.RetryQueue.SingleAsync()).Error = "stall timeout exceeded";
+        await harness.DbContext.SaveChangesAsync();
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        // Handing a failing implementation to a different vendor substitutes its
+        // judgement for the work already done. Only exhaustion justifies that.
+        var request = Assert.Single(harness.Coordinator.StartRequests);
+        Assert.Null(request.RunnerOverride);
+        Assert.DoesNotContain(
+            await harness.DbContext.EventLog.ToListAsync(),
+            entry => entry.EventName == "quota_fallback_dispatched");
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldNotFallBackWhenNoOtherVendorIsConfigured()
+    {
+        var now = DateTimeOffset.Parse("2026-09-01T10:00:00Z");
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1, defaultRunner: "claude"),
+            tracker: new FakeTrackerClient(
+                [BuildIssue("issue-1", "#1", "Open", null)],
+                issueStatesById: new Dictionary<string, string> { ["issue-1"] = "Open" }),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning),
+            timeProvider: new FixedTimeProvider(now));
+
+        await harness.InsertRetryingRunAsync("issue-1", "#1", "Open", "instance-1", nowUtcOverride: now);
+        var run = await harness.DbContext.Runs.SingleAsync();
+        run.Runner = "claude";
+        (await harness.DbContext.RetryQueue.SingleAsync()).Error = "You've hit your session limit";
+        await harness.DbContext.SaveChangesAsync();
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Null(Assert.Single(harness.Coordinator.StartRequests).RunnerOverride);
+    }
+
+    // ADCP#25. Replays the observed alternation: two issues carrying symphony-ready,
+    // max_concurrent_agents 1, one agent that keeps stalling. Before the fix the two
+    // issues took it in turns to destroy each other's runs every ~3 minutes and nothing
+    // ever finished - released_ineligible became the most common status in the database.
+    [Fact]
+    public async Task RunTickAsync_ShouldNotDestroyADueRetryThatMerelyLostTheSlotToAnotherIssue()
+    {
+        var clock = new MutableTimeProvider(DateTimeOffset.Parse("2026-09-01T10:00:00Z"));
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: new FakeTrackerClient(
+                [BuildIssue("issue-1", "#1", "Open", null), BuildIssue("issue-2", "#2", "Open", null)],
+                issueStatesById: new Dictionary<string, string>
+                {
+                    ["issue-1"] = "Open",
+                    ["issue-2"] = "Open"
+                }),
+            coordinator: new FakeIssueExecutionCoordinator(
+                FakeDispatchOutcome.LeaveRunning,
+                stopReturnsFalse: true),
+            timeProvider: clock);
+
+        // #1 is dispatched; #2 waits for the slot.
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        Assert.Equal(
+            RunStatusNames.Running,
+            (await harness.DbContext.Runs.SingleAsync(run => run.IssueId == "issue-1")).Status);
+        Assert.False(await harness.DbContext.Runs.AnyAsync(run => run.IssueId == "issue-2"));
+
+        // #1 stalls and schedules a retry. Its reservation survives: work in flight is
+        // not surrendered to a competitor just because no process is live this instant.
+        clock.Advance(TimeSpan.FromMinutes(6));
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        clock.Advance(TimeSpan.FromMinutes(1));
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var issueOneRun = await harness.DbContext.Runs.SingleAsync(run => run.IssueId == "issue-1");
+        Assert.NotEqual(RunStatusNames.ReleasedIneligible, issueOneRun.Status);
+        Assert.Null(issueOneRun.CompletedAtUtc);
+
+        // #2 was never started into the gap, so nothing was spent on work that would
+        // have been thrown away three minutes later.
+        Assert.DoesNotContain(harness.Coordinator.StartRequests, request => request.Issue.Id == "issue-2");
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldRescheduleRatherThanReleaseARetryRefusedForCapacity()
+    {
+        var now = DateTimeOffset.Parse("2026-09-01T10:00:00Z");
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: new FakeTrackerClient(
+                [BuildIssue("issue-1", "#1", "Open", null)],
+                issueStatesById: new Dictionary<string, string> { ["issue-1"] = "Open" }),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning),
+            timeProvider: new FixedTimeProvider(now));
+
+        // #1 has a due retry; a different issue is occupying the only slot.
+        await harness.InsertRetryingRunAsync("issue-1", "#1", "Open", "instance-1", nowUtcOverride: now);
+        await harness.InsertRunningRunAsync("issue-2", "#2", "Open", "instance-1", startedAtUtc: now);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var run = await harness.DbContext.Runs.SingleAsync(entity => entity.IssueId == "issue-1");
+        Assert.Equal(RunStatusNames.Retrying, run.Status);
+        Assert.Null(run.CompletedAtUtc);
+
+        // The reservation is kept and pushed forward, and waiting does not spend the
+        // retry budget of work that has not been tried yet.
+        var reservation = await harness.DbContext.RetryQueue.SingleAsync(entry => entry.IssueId == "issue-1");
+        Assert.Equal(1, reservation.Attempt);
+        Assert.True(reservation.DueAtUtc > now);
+        Assert.Equal("no available orchestrator slots", reservation.Error);
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldStillReleaseARetryWhoseIssueIsGenuinelyIneligible()
+    {
+        var now = DateTimeOffset.Parse("2026-09-01T10:00:00Z");
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: new FakeTrackerClient(
+                [BuildIssue("issue-1", "#1", "Closed", null)],
+                issueStatesById: new Dictionary<string, string> { ["issue-1"] = "Closed" }),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning),
+            timeProvider: new FixedTimeProvider(now));
+
+        await harness.InsertRetryingRunAsync("issue-1", "#1", "Open", "instance-1", nowUtcOverride: now);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var run = await harness.DbContext.Runs.SingleAsync();
+        Assert.Equal(RunStatusNames.ReleasedIneligible, run.Status);
+
+        // And it now says WHICH kind of ineligible. "Issue no longer eligible for
+        // dispatch" read the same whether the label was removed, the issue was closed,
+        // or the scheduler simply changed its mind - and only one of those was a bug.
+        Assert.Contains("terminal_state", run.LastMessage);
+        Assert.Empty(await harness.DbContext.RetryQueue.ToListAsync());
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldEndARetryThatHasSpentItsAttemptBudget()
+    {
+        var now = DateTimeOffset.Parse("2026-09-01T10:00:00Z");
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: new FakeTrackerClient(
+                [BuildIssue("issue-1", "#1", "Open", null)],
+                issueStatesById: new Dictionary<string, string> { ["issue-1"] = "Open" }),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning),
+            timeProvider: new FixedTimeProvider(now));
+
+        await harness.InsertRetryingRunAsync("issue-1", "#1", "Open", "instance-1", nowUtcOverride: now);
+        var reservation = await harness.DbContext.RetryQueue.SingleAsync();
+        reservation.Attempt = 99;
+        await harness.DbContext.SaveChangesAsync();
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        // Without a ceiling, honouring a reservation for the life of the run would let
+        // one issue that never recovers hold the queue against everything behind it.
+        var run = await harness.DbContext.Runs.SingleAsync();
+        Assert.Equal(RunStatusNames.NeedsCommandCenter, run.Status);
+        Assert.Empty(await harness.DbContext.RetryQueue.ToListAsync());
+        Assert.Empty(harness.Coordinator.StartRequests);
+    }
+
+    // ADCP#23. The reproduction is the whole point: before the fix these three tests
+    // leave a run in 'retrying' forever, with an elapsed due_at and no running run,
+    // which is exactly the state the plane was found in - reporting itself idle with
+    // a free slot while refusing to dispatch anything at all.
+    [Fact]
+    public async Task RunTickAsync_ShouldEndStartupExhaustedRunInsteadOfParkingItInRetryingForever()
+    {
+        var clock = new MutableTimeProvider(DateTimeOffset.Parse("2026-09-01T10:00:00Z"));
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: new FakeTrackerClient(
+                [BuildIssue("issue-1", "#1", "Open", null)],
+                issueStatesById: new Dictionary<string, string> { ["issue-1"] = "Open" }),
+            coordinator: new FakeIssueExecutionCoordinator(
+                FakeDispatchOutcome.LeaveRunning,
+                stopReturnsFalse: true),
+            timeProvider: clock);
+
+        // The agent starts but never reports a session. Any CLI that exits without a
+        // handshake looks like this from here.
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        Assert.Equal(RunStatusNames.Running, (await harness.DbContext.Runs.SingleAsync()).Status);
+
+        // First startup timeout: stalled, one retry scheduled. This part is correct.
+        clock.Advance(TimeSpan.FromMinutes(6));
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        Assert.Equal(RunStatusNames.Retrying, (await harness.DbContext.Runs.SingleAsync()).Status);
+
+        // Second attempt, which also never reaches a session.
+        clock.Advance(TimeSpan.FromSeconds(30));
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        Assert.Equal(RunStatusNames.Running, (await harness.DbContext.Runs.SingleAsync()).Status);
+
+        // Budget exhausted. Before the fix this was stopped as "stalled", which
+        // scheduled a third retry that the claim store then refused forever with
+        // startup_attempt_fence.
+        clock.Advance(TimeSpan.FromMinutes(6));
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var run = await harness.DbContext.Runs.SingleAsync();
+        Assert.Equal(RunStatusNames.NeedsCommandCenter, run.Status);
+        Assert.NotNull(run.CompletedAtUtc);
+        Assert.Empty(await harness.DbContext.RetryQueue.ToListAsync());
+
+        // The slot is free again: the claim is no longer active, so the plane is not
+        // holding the only agent slot against a run that can never resume.
+        Assert.Equal(
+            RunStatusNames.NeedsCommandCenter,
+            (await harness.DbContext.DispatchClaims.SingleAsync()).Status);
+
+        // And it stays terminal - no later tick resurrects it into 'retrying'.
+        clock.Advance(TimeSpan.FromMinutes(10));
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        Assert.Equal(RunStatusNames.NeedsCommandCenter, (await harness.DbContext.Runs.SingleAsync()).Status);
+        Assert.Empty(await harness.DbContext.RetryQueue.ToListAsync());
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldEscalateRetryThatStaysDueAndUndispatchedPastTheWedgeThreshold()
+    {
+        var now = DateTimeOffset.Parse("2026-09-01T10:00:00Z");
+        var clock = new MutableTimeProvider(now);
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            // Not a candidate and not resolvable by id: nothing in the ordinary paths
+            // can act on this reservation, which is what "wedged" means.
+            tracker: new FakeTrackerClient([], throwOnFetchStatesByIds: true),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning),
+            timeProvider: clock);
+
+        await harness.InsertRetryingRunAsync(
+            "issue-1",
+            "#1",
+            "Open",
+            "instance-1",
+            nowUtcOverride: now,
+            dueAtUtc: now.AddMinutes(-90));
+
+        // One tick only observes it; a single overdue reading is not a wedge, because
+        // after downtime every pending reservation reads as overdue.
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        Assert.Equal(RunStatusNames.Retrying, (await harness.DbContext.Runs.SingleAsync()).Status);
+
+        // Still due, still undispatched, a full grace period later.
+        clock.Advance(TimeSpan.FromMinutes(25));
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var run = await harness.DbContext.Runs.SingleAsync();
+        Assert.Equal(RunStatusNames.NeedsCommandCenter, run.Status);
+        Assert.NotNull(run.CompletedAtUtc);
+        Assert.Empty(await harness.DbContext.RetryQueue.ToListAsync());
+        Assert.Contains(
+            await harness.DbContext.EventLog.ToListAsync(),
+            entry => entry.EventName == "wedged_retry_reconciled");
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldEscalateRetryingRunThatHasNoReservationAtAll()
+    {
+        var now = DateTimeOffset.Parse("2026-09-01T10:00:00Z");
+        var clock = new MutableTimeProvider(now);
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: new FakeTrackerClient([], throwOnFetchStatesByIds: true),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning),
+            timeProvider: clock);
+
+        await harness.InsertRetryingRunAsync(
+            "issue-1",
+            "#1",
+            "Open",
+            "instance-1",
+            nowUtcOverride: now,
+            withReservation: false);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        clock.Advance(TimeSpan.FromMinutes(25));
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Equal(RunStatusNames.NeedsCommandCenter, (await harness.DbContext.Runs.SingleAsync()).Status);
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldNotEscalateRetryThatIsSimplyWaitingItsTurn()
+    {
+        var now = DateTimeOffset.Parse("2026-09-01T10:00:00Z");
+        var clock = new MutableTimeProvider(now);
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: new FakeTrackerClient([], throwOnFetchStatesByIds: true),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning),
+            timeProvider: clock);
+
+        await harness.InsertRetryingRunAsync(
+            "issue-1",
+            "#1",
+            "Open",
+            "instance-1",
+            nowUtcOverride: now,
+            dueAtUtc: now.AddHours(4));
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        clock.Advance(TimeSpan.FromMinutes(90));
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Equal(RunStatusNames.Retrying, (await harness.DbContext.Runs.SingleAsync()).Status);
+        Assert.Single(await harness.DbContext.RetryQueue.ToListAsync());
+    }
+
     private static WorkflowDefinition BuildWorkflowDefinition(
         int maxConcurrentAgents,
         IReadOnlyList<string>? activeStates = null,
@@ -1625,7 +2002,9 @@ public sealed class OrchestrationTickServiceTests
         bool includePullRequests = true,
         bool mergePolicyEnabled = false,
         IReadOnlyList<string>? protectedPaths = null,
-        IReadOnlyList<string>? trackerLabels = null)
+        IReadOnlyList<string>? trackerLabels = null,
+        string defaultRunner = "codex",
+        string? fallbackRunner = null)
     {
         var runtime = new WorkflowRuntimeSettings(
             new WorkflowTrackerSettings(
@@ -1645,8 +2024,9 @@ public sealed class OrchestrationTickServiceTests
                 MaxTurns: 20,
                 MaxRetryBackoffMs: 300_000,
                 MaxConcurrentAgentsByState: maxConcurrentByState ?? new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase),
-                DefaultRunner: "codex",
-                RunnerByLabel: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)),
+                DefaultRunner: defaultRunner,
+                RunnerByLabel: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase),
+                FallbackRunner: fallbackRunner),
             new WorkflowServerSettings(Port: null),
             new WorkflowWorkspaceSettings("./workspaces", "./workspaces/repo", "./workspaces/worktrees", "main", null),
             new WorkflowHooksSettings(null, null, null, null, 60_000),
@@ -1928,9 +2308,12 @@ public sealed class OrchestrationTickServiceTests
             int lastReportedOutputTokens = 0,
             int lastReportedTotalTokens = 0,
             string delayType = RetryDelayTypes.Backoff,
-            string? sessionId = null)
+            string? sessionId = null,
+            DateTimeOffset? nowUtcOverride = null,
+            DateTimeOffset? dueAtUtc = null,
+            bool withReservation = true)
         {
-            var nowUtc = DateTimeOffset.UtcNow;
+            var nowUtc = nowUtcOverride ?? DateTimeOffset.UtcNow;
             var run = new RunEntity
             {
                 Id = Guid.NewGuid().ToString("N"),
@@ -1951,19 +2334,22 @@ public sealed class OrchestrationTickServiceTests
             };
 
             DbContext.Runs.Add(run);
-            DbContext.RetryQueue.Add(new RetryQueueEntity
+            if (withReservation)
             {
-                IssueId = issueId,
-                IssueIdentifier = identifier,
-                RunId = run.Id,
-                OwnerInstanceId = instanceId,
-                Attempt = 1,
-                DueAtUtc = nowUtc.AddSeconds(-1),
-                DelayType = delayType,
-                MaxBackoffMs = 300_000,
-                CreatedAtUtc = nowUtc.AddMinutes(-1),
-                UpdatedAtUtc = nowUtc.AddMinutes(-1)
-            });
+                DbContext.RetryQueue.Add(new RetryQueueEntity
+                {
+                    IssueId = issueId,
+                    IssueIdentifier = identifier,
+                    RunId = run.Id,
+                    OwnerInstanceId = instanceId,
+                    Attempt = 1,
+                    DueAtUtc = dueAtUtc ?? nowUtc.AddSeconds(-1),
+                    DelayType = delayType,
+                    MaxBackoffMs = 300_000,
+                    CreatedAtUtc = nowUtc.AddMinutes(-1),
+                    UpdatedAtUtc = nowUtc.AddMinutes(-1)
+                });
+            }
             DbContext.DispatchClaims.Add(new DispatchClaimEntity
             {
                 IssueId = issueId,
@@ -2251,6 +2637,15 @@ public sealed class OrchestrationTickServiceTests
     private sealed class FixedTimeProvider(DateTimeOffset utcNow) : TimeProvider
     {
         public override DateTimeOffset GetUtcNow() => utcNow;
+    }
+
+    private sealed class MutableTimeProvider(DateTimeOffset utcNow) : TimeProvider
+    {
+        private DateTimeOffset current = utcNow;
+
+        public override DateTimeOffset GetUtcNow() => current;
+
+        public void Advance(TimeSpan delta) => current = current.Add(delta);
     }
 
     private sealed class FakeWorkspaceManager : IWorkspaceManager

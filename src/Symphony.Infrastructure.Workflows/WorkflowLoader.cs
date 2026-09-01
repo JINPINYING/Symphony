@@ -187,6 +187,23 @@ public sealed class WorkflowLoader
 
         var runnerByLabel = GetRunnerByLabelMap(agentMap, "runner_by_label");
 
+        var fallbackRunnerValue = GetOptionalStringFromOptionalMap(agentMap, "fallback_runner")?.Trim().ToLowerInvariant();
+        var fallbackRunner = string.IsNullOrWhiteSpace(fallbackRunnerValue) ? null : fallbackRunnerValue;
+        if (fallbackRunner is not null && !AgentRunnerNames.IsKnown(fallbackRunner))
+        {
+            throw new WorkflowLoadException(
+                "invalid_agent_fallback_runner",
+                $"agent.fallback_runner must be one of: {string.Join(", ", AgentRunnerNames.All)}.");
+        }
+
+        if (fallbackRunner is not null && string.Equals(fallbackRunner, defaultRunner, StringComparison.Ordinal))
+        {
+            throw new WorkflowLoadException(
+                "invalid_agent_fallback_runner",
+                "agent.fallback_runner must name a different runner from agent.default_runner; falling back to the " +
+                "vendor that just ran out of quota cannot help.");
+        }
+
         var serverMap = GetOptionalMap(config, "server");
         var serverPort = GetOptionalNullableInt(serverMap, "port");
         if (serverPort is < 0)
@@ -357,7 +374,8 @@ public sealed class WorkflowLoader
                 maxRetryBackoffMs,
                 maxConcurrentAgentsByState,
                 defaultRunner,
-                runnerByLabel),
+                runnerByLabel,
+                fallbackRunner),
             new WorkflowServerSettings(serverPort),
             new WorkflowWorkspaceSettings(
                 workspaceRoot,

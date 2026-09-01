@@ -38,4 +38,12 @@ public static class RunStopReasons
     public const string Inactive = "inactive";
     public const string Stalled = "stalled";
     public const string Shutdown = "shutdown";
+
+    // The startup guard has spent the whole pre-session attempt budget. This is
+    // terminal, not stalled: stopping such a run as "stalled" schedules a retry
+    // that the claim store then fences forever, leaving the run in 'retrying'
+    // with an elapsed due_at and no route to any terminal status. That takes the
+    // whole plane offline, because a reserved issue holds its slot and nothing
+    // reconciles a reservation that is still nominally active (ADCP#23).
+    public const string StartupExhausted = "startup_exhausted";
 }

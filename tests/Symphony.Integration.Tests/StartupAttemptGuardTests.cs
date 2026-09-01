@@ -48,18 +48,43 @@ public sealed class StartupAttemptGuardTests
         int stallTimeoutMs,
         int expectedTimeoutMs)
     {
+        var workflow = BuildWorkflowDefinition(stallTimeoutMs);
+        Assert.Equal(expectedTimeoutMs, (int)ResolveStartupAttemptTimeout(workflow, "codex").TotalMilliseconds);
+    }
+
+    // ADCP#26. The guard used to read the Codex stall timeout whichever runner had
+    // actually been dispatched. WORKFLOW.md gives Claude 600s and Codex 180s, so
+    // every Claude run was measured against 180 seconds and killed mid-work: two
+    // attempts plus the gap between them landed within 22 seconds of the observed
+    // 6m07s-6m29s run lifetimes, three times running.
+    [Theory]
+    [InlineData("codex", 180_000)]
+    [InlineData("claude", 300_000)]
+    [InlineData("", 180_000)]
+    public void ResolveStartupAttemptTimeout_ShouldUseTheDispatchedRunnersWindow(
+        string runner,
+        int expectedTimeoutMs)
+    {
+        var workflow = BuildWorkflowDefinition(codexStallTimeoutMs: 180_000, claudeStallTimeoutMs: 600_000);
+        Assert.Equal(expectedTimeoutMs, (int)ResolveStartupAttemptTimeout(workflow, runner).TotalMilliseconds);
+    }
+
+    private static TimeSpan ResolveStartupAttemptTimeout(WorkflowDefinition workflow, string? runner)
+    {
         var method = typeof(OrchestrationTickService).GetMethod(
             "ResolveStartupAttemptTimeout",
             BindingFlags.NonPublic | BindingFlags.Static);
 
         Assert.NotNull(method);
-        var workflow = BuildWorkflowDefinition(stallTimeoutMs);
-        var timeout = (TimeSpan)method!.Invoke(null, [workflow])!;
-        Assert.Equal(expectedTimeoutMs, (int)timeout.TotalMilliseconds);
+        return (TimeSpan)method!.Invoke(null, [workflow, runner])!;
     }
 
-    private static WorkflowDefinition BuildWorkflowDefinition(int stallTimeoutMs)
+    private static WorkflowDefinition BuildWorkflowDefinition(
+        int stallTimeoutMs = 300_000,
+        int? codexStallTimeoutMs = null,
+        int claudeStallTimeoutMs = 600_000)
     {
+        var codexStall = codexStallTimeoutMs ?? stallTimeoutMs;
         var runtime = new WorkflowRuntimeSettings(
             new WorkflowTrackerSettings(
                 Kind: "github",
@@ -83,8 +108,8 @@ public sealed class StartupAttemptGuardTests
             new WorkflowServerSettings(Port: null),
             new WorkflowWorkspaceSettings("./workspaces", "./workspaces/repo", "./workspaces/worktrees", "main", null),
             new WorkflowHooksSettings(null, null, null, null, 60_000),
-            new WorkflowCodexSettings("codex app-server", 30_000, "never", "danger-full-access", "danger-full-access", 5_000, stallTimeoutMs),
-            new WorkflowClaudeSettings("claude", 30_000, "bypassPermissions", null, 600_000),
+            new WorkflowCodexSettings("codex app-server", 30_000, "never", "danger-full-access", "danger-full-access", 5_000, codexStall),
+            new WorkflowClaudeSettings("claude", 30_000, "bypassPermissions", null, claudeStallTimeoutMs),
             new WorkflowMergePolicySettings(false, "squash", [], 50),
             new WorkflowEventLogRetentionSettings(
                 Enabled: false,
