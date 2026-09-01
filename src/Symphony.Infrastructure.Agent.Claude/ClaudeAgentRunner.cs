@@ -262,6 +262,21 @@ public sealed class ClaudeAgentRunner(ILogger<ClaudeAgentRunner> logger) : IAgen
 
             switch (type)
             {
+                // The plane could see Codex quota and nothing else, so when the Claude
+                // account hit its session limit every queued implementer starved while
+                // the dashboard showed a healthy 27% and the plane read as idle with
+                // capacity (ADCP#24). Claude reports its limits in the stream; this
+                // runner was mapping the event to a bare name and discarding the one
+                // number that would have explained the outage.
+                case "rate_limit_event":
+                    return new AgentRunUpdate(
+                        EventType: "claude_rate_limit_event",
+                        Timestamp: DateTimeOffset.UtcNow,
+                        ThreadId: sessionId,
+                        TurnId: BoundedTurnId,
+                        RateLimitsJson: root.TryGetProperty("rate_limit_info", out var rateLimitInfo)
+                            ? SecretRedactor.Redact(rateLimitInfo.GetRawText())
+                            : null);
                 case "system":
                     return new AgentRunUpdate(
                         EventType: $"claude_system_{subtype ?? "event"}",

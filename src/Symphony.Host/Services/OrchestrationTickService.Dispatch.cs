@@ -225,13 +225,19 @@ public sealed partial class OrchestrationTickService
                 continue;
             }
 
+            var quotaFallbackRunner = await ResolveQuotaFallbackRunnerAsync(
+                retryEntry,
+                workflowDefinition,
+                cancellationToken);
+
             if (await DispatchIssueAsync(
                     retryIssue,
                     workflowDefinition,
                     instanceId,
                     retryEntry.Attempt,
                     cancellationToken,
-                    resetContinuousTurnBudget: retryEntry.DelayType == RetryDelayTypes.Backoff))
+                    resetContinuousTurnBudget: retryEntry.DelayType == RetryDelayTypes.Backoff,
+                    runnerOverride: quotaFallbackRunner))
             {
                 runningIssueIds.Add(retryIssue.Id);
                 reservedStateByIssueId[retryIssue.Id] = NormalizeStateKey(retryIssue.State);
@@ -297,6 +303,58 @@ public sealed partial class OrchestrationTickService
                 countsByState = CountReservationsByState(reservedStateByIssueId);
             }
         }
+    }
+
+    // ADCP#24. Retrying a quota-exhausted vendor cannot succeed however many
+    // attempts are left, so when the account that just ran out is not the only one
+    // available, the retry goes to the other one.
+    //
+    // Only on exhaustion. An ordinary implementation failure stays with the vendor
+    // that produced it, because repairing your own work and having someone else
+    // redo it are different things, and only the first is what a retry means.
+    //
+    // ADR-006 (independent review is dispatched on the OTHER vendor) survives this
+    // by construction, twice over. The retry loop never touches phase-owned issues,
+    // so a review or repair dispatch cannot be re-vendored here; and reviewer
+    // selection is derived from the run's recorded Runner, which is written from
+    // the runner that actually executed - so a fallen-back implementation is
+    // reviewed by the vendor that did not implement it, not by the configured
+    // default that never ran.
+    private async Task<string?> ResolveQuotaFallbackRunnerAsync(
+        RetryQueueEntity retryEntry,
+        WorkflowDefinition workflowDefinition,
+        CancellationToken cancellationToken)
+    {
+        if (!AgentQuotaSignals.IsQuotaExhaustion(retryEntry.Error))
+        {
+            return null;
+        }
+
+        var exhaustedRun = await FindLatestRunWithStatusAsync(
+            retryEntry.IssueId,
+            RunStatusNames.Retrying,
+            cancellationToken);
+        var fallbackRunner = AgentQuotaSignals.ResolveFallbackRunner(
+            workflowDefinition.Runtime.Agent.FallbackRunner,
+            exhaustedRun?.Runner);
+        if (fallbackRunner is null)
+        {
+            return null;
+        }
+
+        AddIssueEvent(
+            retryEntry.IssueId,
+            retryEntry.IssueIdentifier,
+            exhaustedRun?.Id,
+            null,
+            "quota_fallback_dispatched",
+            LogLevel.Warning,
+            $"Runner '{exhaustedRun?.Runner ?? "unknown"}' is out of quota for {retryEntry.IssueIdentifier}, so this " +
+            $"attempt is dispatched to '{fallbackRunner}' instead of retrying into the same limit. Recorded cause: " +
+            $"{retryEntry.Error}.");
+        await dbContext.SaveChangesAsync(cancellationToken);
+
+        return fallbackRunner;
     }
 
     private static Dictionary<string, int> CountReservationsByState(
@@ -622,7 +680,8 @@ public sealed partial class OrchestrationTickService
         CancellationToken cancellationToken,
         bool resetContinuousTurnBudget = false,
         DirectiveDispatchContext? directive = null,
-        PhaseDispatchRequest? phaseDispatch = null)
+        PhaseDispatchRequest? phaseDispatch = null,
+        string? runnerOverride = null)
     {
         AddIssueEvent(
             issue.Id,
@@ -770,7 +829,7 @@ public sealed partial class OrchestrationTickService
                 DirectiveAction: directive?.Action,
                 DirectivePhase: directive?.Phase,
                 PromptOverride: phaseDispatch?.Prompt,
-                RunnerOverride: phaseDispatch?.RunnerName),
+                RunnerOverride: phaseDispatch?.RunnerName ?? runnerOverride),
             cancellationToken);
 
         if (!started)

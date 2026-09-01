@@ -1634,6 +1634,88 @@ public sealed class OrchestrationTickServiceTests
         Assert.Empty(await harness.DbContext.RetryQueue.ToListAsync());
     }
 
+    // ADCP#24. Every queued implementer starved in the same minute when the shared
+    // Claude account hit its session limit, and each one retried into the same wall.
+    [Fact]
+    public async Task RunTickAsync_ShouldRetryOnTheOtherVendorWhenTheDispatchedOneIsOutOfQuota()
+    {
+        var now = DateTimeOffset.Parse("2026-09-01T10:00:00Z");
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1, defaultRunner: "claude", fallbackRunner: "codex"),
+            tracker: new FakeTrackerClient(
+                [BuildIssue("issue-1", "#1", "Open", null)],
+                issueStatesById: new Dictionary<string, string> { ["issue-1"] = "Open" }),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning),
+            timeProvider: new FixedTimeProvider(now));
+
+        await harness.InsertRetryingRunAsync("issue-1", "#1", "Open", "instance-1", nowUtcOverride: now);
+        var run = await harness.DbContext.Runs.SingleAsync();
+        run.Runner = "claude";
+        (await harness.DbContext.RetryQueue.SingleAsync()).Error =
+            "You've hit your session limit · resets 1:40am (America/New_York)";
+        await harness.DbContext.SaveChangesAsync();
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var request = Assert.Single(harness.Coordinator.StartRequests);
+        Assert.Equal("codex", request.RunnerOverride);
+        Assert.Contains(
+            await harness.DbContext.EventLog.ToListAsync(),
+            entry => entry.EventName == "quota_fallback_dispatched");
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldKeepAnOrdinaryFailureWithTheVendorThatProducedIt()
+    {
+        var now = DateTimeOffset.Parse("2026-09-01T10:00:00Z");
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1, defaultRunner: "claude", fallbackRunner: "codex"),
+            tracker: new FakeTrackerClient(
+                [BuildIssue("issue-1", "#1", "Open", null)],
+                issueStatesById: new Dictionary<string, string> { ["issue-1"] = "Open" }),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning),
+            timeProvider: new FixedTimeProvider(now));
+
+        await harness.InsertRetryingRunAsync("issue-1", "#1", "Open", "instance-1", nowUtcOverride: now);
+        var run = await harness.DbContext.Runs.SingleAsync();
+        run.Runner = "claude";
+        (await harness.DbContext.RetryQueue.SingleAsync()).Error = "stall timeout exceeded";
+        await harness.DbContext.SaveChangesAsync();
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        // Handing a failing implementation to a different vendor substitutes its
+        // judgement for the work already done. Only exhaustion justifies that.
+        var request = Assert.Single(harness.Coordinator.StartRequests);
+        Assert.Null(request.RunnerOverride);
+        Assert.DoesNotContain(
+            await harness.DbContext.EventLog.ToListAsync(),
+            entry => entry.EventName == "quota_fallback_dispatched");
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldNotFallBackWhenNoOtherVendorIsConfigured()
+    {
+        var now = DateTimeOffset.Parse("2026-09-01T10:00:00Z");
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1, defaultRunner: "claude"),
+            tracker: new FakeTrackerClient(
+                [BuildIssue("issue-1", "#1", "Open", null)],
+                issueStatesById: new Dictionary<string, string> { ["issue-1"] = "Open" }),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning),
+            timeProvider: new FixedTimeProvider(now));
+
+        await harness.InsertRetryingRunAsync("issue-1", "#1", "Open", "instance-1", nowUtcOverride: now);
+        var run = await harness.DbContext.Runs.SingleAsync();
+        run.Runner = "claude";
+        (await harness.DbContext.RetryQueue.SingleAsync()).Error = "You've hit your session limit";
+        await harness.DbContext.SaveChangesAsync();
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Null(Assert.Single(harness.Coordinator.StartRequests).RunnerOverride);
+    }
+
     // ADCP#25. Replays the observed alternation: two issues carrying symphony-ready,
     // max_concurrent_agents 1, one agent that keeps stalling. Before the fix the two
     // issues took it in turns to destroy each other's runs every ~3 minutes and nothing
@@ -1920,7 +2002,9 @@ public sealed class OrchestrationTickServiceTests
         bool includePullRequests = true,
         bool mergePolicyEnabled = false,
         IReadOnlyList<string>? protectedPaths = null,
-        IReadOnlyList<string>? trackerLabels = null)
+        IReadOnlyList<string>? trackerLabels = null,
+        string defaultRunner = "codex",
+        string? fallbackRunner = null)
     {
         var runtime = new WorkflowRuntimeSettings(
             new WorkflowTrackerSettings(
@@ -1940,8 +2024,9 @@ public sealed class OrchestrationTickServiceTests
                 MaxTurns: 20,
                 MaxRetryBackoffMs: 300_000,
                 MaxConcurrentAgentsByState: maxConcurrentByState ?? new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase),
-                DefaultRunner: "codex",
-                RunnerByLabel: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)),
+                DefaultRunner: defaultRunner,
+                RunnerByLabel: new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase),
+                FallbackRunner: fallbackRunner),
             new WorkflowServerSettings(Port: null),
             new WorkflowWorkspaceSettings("./workspaces", "./workspaces/repo", "./workspaces/worktrees", "main", null),
             new WorkflowHooksSettings(null, null, null, null, 60_000),

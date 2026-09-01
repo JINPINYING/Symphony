@@ -71,13 +71,52 @@ public sealed class RuntimeStateService(
         var attempts = await dbContext.RunAttempts
             .AsNoTracking()
             .ToListAsync(cancellationToken);
-        var latestRateLimitsJson = (await dbContext.EventLog
+        // Per vendor, not one global slot (ADCP#24). A single latest row cannot say
+        // "Claude is exhausted and Codex is fine", which is exactly the question an
+        // operator has when the plane looks idle but nothing is moving. The row does
+        // not carry the runner, but it carries the run that produced it, and the run
+        // does - so the join answers it without a schema change.
+        var rateLimitEvents = (await dbContext.EventLog
             .AsNoTracking()
             .Where(entry => entry.EventName == "rate_limits_updated" && entry.DataJson != null)
             .ToListAsync(cancellationToken))
             .OrderByDescending(entry => entry.OccurredAtUtc)
-            .Select(entry => entry.DataJson)
-            .FirstOrDefault();
+            .ToList();
+        var runnerByRunId = (await dbContext.Runs
+            .AsNoTracking()
+            .Select(run => new { run.Id, run.Runner })
+            .ToListAsync(cancellationToken))
+            .ToDictionary(run => run.Id, run => run.Runner, StringComparer.OrdinalIgnoreCase);
+
+        var rateLimitsByRunner = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+        foreach (var entry in rateLimitEvents)
+        {
+            if (entry.RunId is null ||
+                !runnerByRunId.TryGetValue(entry.RunId, out var runner) ||
+                string.IsNullOrWhiteSpace(runner) ||
+                rateLimitsByRunner.ContainsKey(runner))
+            {
+                continue;
+            }
+
+            rateLimitsByRunner[runner] = new
+            {
+                runner,
+                observed_at = entry.OccurredAtUtc,
+                limits = ParseJsonValue(entry.DataJson)
+            };
+        }
+
+        // rate_limits keeps its existing shape and meaning - the Codex payload the
+        // status page already renders - so adding Claude does not silently change
+        // what an existing reader is looking at.
+        var latestRateLimitsJson = rateLimitEvents
+            .FirstOrDefault(entry =>
+                entry.RunId is not null &&
+                runnerByRunId.TryGetValue(entry.RunId, out var runner) &&
+                string.Equals(runner, AgentRunnerNames.Codex, StringComparison.OrdinalIgnoreCase))
+            ?.DataJson
+            ?? rateLimitEvents.FirstOrDefault()?.DataJson;
         var issueCacheEntries = (await dbContext.IssueCache
             .AsNoTracking()
             .ToListAsync(cancellationToken))
@@ -395,7 +434,8 @@ public sealed class RuntimeStateService(
                     .SumAsync(run => run.TotalTokens, cancellationToken),
                 seconds_running = Math.Round(secondsRunning, 3)
             },
-            rate_limits = ParseJsonValue(latestRateLimitsJson)
+            rate_limits = ParseJsonValue(latestRateLimitsJson),
+            rate_limits_by_runner = rateLimitsByRunner
         };
     }
 

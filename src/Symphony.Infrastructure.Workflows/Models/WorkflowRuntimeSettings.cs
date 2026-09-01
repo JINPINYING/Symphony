@@ -53,7 +53,12 @@ public sealed record WorkflowAgentSettings(
     // DefaultRunner applies unless one of the issue's labels appears in
     // RunnerByLabel (first matching label wins). Valid runners: codex, claude.
     string DefaultRunner,
-    IReadOnlyDictionary<string, string> RunnerByLabel);
+    IReadOnlyDictionary<string, string> RunnerByLabel,
+    // ADCP#24: which runner takes over when the dispatched one is out of quota,
+    // and ONLY then. Null disables the fallback. An ordinary failure stays with
+    // the vendor that produced it - only exhaustion, which no number of retries
+    // can clear, justifies changing who runs.
+    string? FallbackRunner = null);
 
 public sealed record WorkflowServerSettings(int? Port);
 

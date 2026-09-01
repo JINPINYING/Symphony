@@ -95,6 +95,44 @@ public sealed class ClaudeAgentRunnerTests
         Assert.Equal(init.SessionId, Assert.Single(updates, update => update.EventType == "turn_completed").SessionId);
     }
 
+    // ADCP#24. The plane reported Codex quota and nothing else, so when the shared
+    // Claude account ran out the dashboard showed a healthy percentage and the plane
+    // read as idle with capacity. Claude does report its limits; this runner was
+    // dropping the payload on the floor.
+    [Fact]
+    public async Task RunIssueAsync_ShouldCarryClaudeRateLimitsInsteadOfDiscardingThem()
+    {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            return;
+        }
+
+        using var harness = CreateClaudeHarness("""
+            $null = [Console]::In.ReadToEnd()
+            @{ type = 'system'; subtype = 'init'; session_id = 'sess-1' } | ConvertTo-Json -Compress
+            @{ type = 'rate_limit_event'; session_id = 'sess-1'; rate_limit_info = @{ status = 'allowed'; resetsAt = 1788277200; rateLimitType = 'five_hour' } } | ConvertTo-Json -Compress -Depth 4
+            @{ type = 'result'; subtype = 'success'; is_error = $false; session_id = 'sess-1'; result = 'done' } | ConvertTo-Json -Compress -Depth 4
+            """);
+
+        var updates = new List<AgentRunUpdate>();
+        var runner = new ClaudeAgentRunner(NullLogger<ClaudeAgentRunner>.Instance);
+
+        var result = await runner.RunIssueAsync(
+            CreateRequest(harness, timeoutMs: 120_000),
+            (update, _) =>
+            {
+                updates.Add(update);
+                return Task.CompletedTask;
+            });
+
+        Assert.True(result.Success, result.Stderr);
+
+        var rateLimit = Assert.Single(updates, update => update.EventType == "claude_rate_limit_event");
+        Assert.NotNull(rateLimit.RateLimitsJson);
+        Assert.Contains("five_hour", rateLimit.RateLimitsJson);
+        Assert.Contains("1788277200", rateLimit.RateLimitsJson);
+    }
+
     [Fact]
     public async Task RunIssueAsync_ShouldFailOnErrorResult()
     {
