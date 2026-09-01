@@ -394,7 +394,64 @@ public sealed class WorkflowLoader
                 retentionEnabled,
                 protocolRetentionDays,
                 operationalRetentionDays,
-                retentionMaxRows));
+                retentionMaxRows),
+            ParseWatchedTasks(config));
+    }
+
+    /// <summary>
+    /// Reads the <c>watched_tasks</c> list: the schedulers that are supposed to
+    /// wake this plane. Misconfiguration throws rather than being skipped, because
+    /// a watch entry that silently does nothing is worse than no watch at all -
+    /// it reports health for something nobody is actually checking.
+    /// </summary>
+    private static IReadOnlyList<WorkflowWatchedTaskSettings> ParseWatchedTasks(
+        IReadOnlyDictionary<string, object?> config)
+    {
+        if (!config.TryGetValue("watched_tasks", out var raw) || raw is null)
+        {
+            return [];
+        }
+
+        if (raw is not List<object?> entries)
+        {
+            throw new WorkflowLoadException("invalid_watched_tasks", "'watched_tasks' must be a list.");
+        }
+
+        var tasks = new List<WorkflowWatchedTaskSettings>();
+        foreach (var entry in entries)
+        {
+            if (entry is not Dictionary<string, object?> map)
+            {
+                throw new WorkflowLoadException(
+                    "invalid_watched_tasks", "each entry of 'watched_tasks' must be an object/map.");
+            }
+
+            var path = GetRequiredString(map, "path", "invalid_watched_task_path");
+            var name = GetOptionalString(map, "name");
+            var expectEvery = GetOptionalInt(map, "expect_every_minutes", 0);
+            if (expectEvery <= 0)
+            {
+                throw new WorkflowLoadException(
+                    "invalid_watched_task_interval",
+                    $"watched_tasks entry '{path}' needs expect_every_minutes > 0; without it there is no schedule to be late against.");
+            }
+
+            var lateAfter = GetOptionalInt(map, "late_after_minutes", 0);
+            if (lateAfter < 0)
+            {
+                throw new WorkflowLoadException(
+                    "invalid_watched_task_late_after",
+                    $"watched_tasks entry '{path}' has a negative late_after_minutes.");
+            }
+
+            tasks.Add(new WorkflowWatchedTaskSettings(
+                string.IsNullOrWhiteSpace(name) ? path.TrimStart('\\') : name,
+                path,
+                expectEvery,
+                lateAfter > 0 ? lateAfter : null));
+        }
+
+        return tasks;
     }
 
     private static bool GetOptionalBool(Dictionary<string, object?>? source, string key, bool defaultValue)

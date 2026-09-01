@@ -39,6 +39,7 @@ public static class OwnerAttentionSummary
         IReadOnlyList<PhaseLedgerEntity> phases,
         IReadOnlyList<OpenPullRequest> openPullRequests,
         IReadOnlyList<AgentActivityReport> agentActivity,
+        IReadOnlyList<WatchedTaskReport> watchedTasks,
         DateTimeOffset? lastEventAtUtc,
         DateTimeOffset now)
     {
@@ -106,6 +107,39 @@ public static class OwnerAttentionSummary
                     : $"{pr.Title} - open and not blocked by CI. Nothing will merge it without you.{waited}",
                 LevelAttention,
                 string.IsNullOrWhiteSpace(pr.Url) ? null : pr.Url));
+        }
+
+        // A scheduler that has stopped firing is the one fault this summary used
+        // to be structurally incapable of seeing. Every other input here is the
+        // engine's own state, and the engine's state looks identical whether the
+        // queue is empty because there is no work or because nothing is left to
+        // notice the work. That blind spot cost 27 hours of silence.
+        //
+        // Ordered worst-first so that, when several drift at once, the headline
+        // count still leads with the one that stopped rather than the one that is
+        // merely late.
+        foreach (var task in watchedTasks
+                     .Where(t => t.Health != WatchedTaskReport.HealthOk)
+                     .OrderBy(t => t.Health switch
+                     {
+                         WatchedTaskReport.HealthDisabled => 0,
+                         WatchedTaskReport.HealthFailing => 1,
+                         WatchedTaskReport.HealthLate => 2,
+                         _ => 3
+                     }))
+        {
+            // Disabled and failing are hard stops: the task will not recover on
+            // its own. Late and unknown are reported at attention level, because a
+            // busy host can legitimately delay a run and a page that escalates
+            // ordinary jitter to "down" is one that gets ignored.
+            var severity = task.Health is WatchedTaskReport.HealthDisabled or WatchedTaskReport.HealthFailing
+                ? LevelDown
+                : LevelAttention;
+
+            items.Add(new AttentionItem(
+                $"{task.Name} is not running as scheduled",
+                task.Explanation,
+                severity));
         }
 
         if (retryQueueCount > 0)

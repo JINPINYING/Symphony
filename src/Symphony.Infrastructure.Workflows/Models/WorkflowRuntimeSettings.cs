@@ -10,7 +10,25 @@ public sealed record WorkflowRuntimeSettings(
     WorkflowCodexSettings Codex,
     WorkflowClaudeSettings Claude,
     WorkflowMergePolicySettings MergePolicy,
-    WorkflowEventLogRetentionSettings EventLogRetention);
+    WorkflowEventLogRetentionSettings EventLogRetention,
+    // Trailing with a default so the six existing construction sites keep
+    // compiling; an absent list simply means nothing is being watched.
+    IReadOnlyList<WorkflowWatchedTaskSettings>? WatchedTasks = null);
+
+// The plane is woken by schedulers it does not own, and until now it could not
+// see them. When the artifact publisher stopped being started, the engine had no
+// way to know: from inside, a scheduler that never fires and a quiet week look
+// identical. Naming the tasks here makes their silence legible.
+//
+// ExpectEveryMinutes is what the schedule promises, not a deadline - lateness is
+// judged at a multiple of it (see WatchedTaskEvaluator), so ordinary host jitter
+// does not raise an alarm. LateAfterMinutes overrides that when a task deserves
+// a tighter or looser leash than the default.
+public sealed record WorkflowWatchedTaskSettings(
+    string Name,
+    string Path,
+    int ExpectEveryMinutes,
+    int? LateAfterMinutes);
 
 public sealed record WorkflowTrackerSettings(
     string Kind,

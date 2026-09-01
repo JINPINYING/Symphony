@@ -10,6 +10,7 @@ namespace Symphony.Host.Services;
 public sealed class RuntimeStateService(
     SymphonyDbContext dbContext,
     IWorkflowDefinitionProvider workflowDefinitionProvider,
+    IWatchedTaskReader watchedTaskReader,
     TimeProvider timeProvider)
 {
     // A malformed or older snapshot must never take the page down. An empty list
@@ -135,6 +136,25 @@ public sealed class RuntimeStateService(
             .Select(report => report!)
             .ToList();
 
+        // The schedulers that wake this plane. The engine cannot see its own
+        // liveness from the inside - a scheduler that stopped firing and a genuinely
+        // quiet week produce identical internal state - so it asks the host.
+        // A failure here must never blank the page: an unreadable scheduler is
+        // reported as unmonitored by the reader itself, and an outright throw
+        // leaves the rest of the page intact.
+        var watchedTasks = new List<WatchedTaskReport>();
+        try
+        {
+            var workflowForTasks = await workflowDefinitionProvider.GetCurrentAsync(cancellationToken);
+            watchedTasks.AddRange(await watchedTaskReader.ReadAsync(
+                workflowForTasks.Runtime.WatchedTasks ?? [], cancellationToken));
+        }
+        catch (Exception) when (!cancellationToken.IsCancellationRequested)
+        {
+            // Leave the list empty; the page then simply shows no watched tasks
+            // rather than claiming they are healthy.
+        }
+
         var attention = OwnerAttentionSummary.Build(
             engineHealthy: true, // this code only runs when the engine is serving
             escalatedRuns: escalatedRuns,
@@ -143,6 +163,7 @@ public sealed class RuntimeStateService(
             phases: phaseRows,
             openPullRequests: openPullRequests,
             agentActivity: agentActivity,
+            watchedTasks: watchedTasks,
             lastEventAtUtc: recentActivity.Count > 0 ? recentActivity[0].At : null,
             now: generatedAt);
 
@@ -203,6 +224,19 @@ public sealed class RuntimeStateService(
                     url = item.Url
                 })
             },
+            watched_tasks = watchedTasks.Select(task => new
+            {
+                name = task.Name,
+                path = task.Path,
+                state = task.State,
+                status = task.Status,
+                last_run = task.LastRunUtc?.ToString("o"),
+                last_result = task.LastResult,
+                next_run = task.NextRunUtc?.ToString("o"),
+                expect_every_minutes = task.ExpectEveryMinutes,
+                health = task.Health,
+                explanation = task.Explanation
+            }),
             agent_activity = agentActivity.Select(report => new
             {
                 actor = report.Actor,
