@@ -54,4 +54,53 @@ public static class AgentActivity
         var trimmed = value.Trim();
         return trimmed.Length <= MaxFieldLength ? trimmed : trimmed[..MaxFieldLength];
     }
+
+    /// <summary>The shortest thing that can honestly be called a report.</summary>
+    public const int MinSummaryLength = 12;
+
+    /// <summary>
+    /// The longest run of non-space characters a summary may contain. A real
+    /// sentence has none this long; a pasted token, a base64 blob or a stuck key
+    /// does, and it renders as an unbroken bar across the most prominent panel on
+    /// the page.
+    /// </summary>
+    public const int MaxWordLength = 60;
+
+    /// <summary>
+    /// Why a summary is not a report, or null when it is fine.
+    ///
+    /// Endpoint probes reached the owner's page and stayed there: a bare "a", the
+    /// word "test", and two hundred consecutive x's, sitting above real work in
+    /// the panel that answers "what is the team doing". Nothing rejected them,
+    /// because the only rule was a length ceiling.
+    ///
+    /// These checks are deliberately blunt - length, a space, no absurd run of
+    /// characters. Anything cleverer starts guessing at meaning and will one day
+    /// throw away a real report that happened to be terse, which is the worse
+    /// failure: a dropped report looks exactly like an idle plane, and that is the
+    /// bug this whole feed exists to prevent. The caller is told why, rather than
+    /// having the post silently discarded.
+    /// </summary>
+    public static string? DescribeRejection(string summary)
+    {
+        if (summary.Length < MinSummaryLength)
+        {
+            return $"a summary of {summary.Length} character(s) is too short to be a report; say what is being worked on.";
+        }
+
+        if (!summary.Any(char.IsWhiteSpace))
+        {
+            return "a summary should be a sentence, not a single token.";
+        }
+
+        var longestWord = summary
+            .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries)
+            .Max(word => word.Length);
+        if (longestWord > MaxWordLength)
+        {
+            return $"a summary contains a {longestWord}-character run with no break, which is not prose and does not render.";
+        }
+
+        return null;
+    }
 }

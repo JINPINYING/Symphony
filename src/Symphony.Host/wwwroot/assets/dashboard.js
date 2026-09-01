@@ -105,6 +105,69 @@ window.addEventListener("hashchange", () => {
 
 void loadDashboard();
 scheduleRefresh();
+watchForFrozenTab();
+
+/* A background tab is not a paused tab - it is a LYING tab.
+ *
+ * Edge sleeps inactive tabs by default and browsers throttle background timers
+ * hard, so the 15-second poll simply stops. The page then keeps displaying its
+ * last render, including the words "updated now", because that label is drawn
+ * from the last successful load rather than from the clock. A two-hour-old view
+ * therefore reported an idle plane, confidently, while work was in flight - the
+ * owner saw "the team is not doing anything" and the engine was mid-run.
+ *
+ * That is the worst version of a fault this page keeps having: a surface that
+ * cannot tell "nothing is happening" from "I stopped looking". It is worse here
+ * because the staleness stamp is part of what freezes.
+ *
+ * Two defences, because either alone leaves a hole:
+ *   - refetch the moment the tab is looked at again, so a woken tab corrects
+ *     itself before it can be believed;
+ *   - independently, notice when the data on screen has aged past the poll
+ *     interval by a wide margin and say so, which also covers a tab that is
+ *     visible but whose timer was throttled or whose fetches are failing. */
+function watchForFrozenTab() {
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") {
+      void loadDashboard();
+    }
+  });
+  window.addEventListener("pageshow", () => void loadDashboard());
+  window.addEventListener("focus", () => void loadDashboard());
+
+  // Cheap, and deliberately not the poll: this only repaints the staleness
+  // banner, so it stays correct even when a fetch is what is broken.
+  window.setInterval(renderStalenessBanner, 5000);
+}
+
+// How far past the poll interval the view may drift before it stops being
+// trustworthy. Generous - a slow tick or one missed poll is not staleness - but
+// far short of the hours a slept tab can sit at.
+const staleAfterMs = 90000;
+
+function viewAgeMs() {
+  const stamp = state.snapshot?.generated_at || state.lastLoadedAt;
+  if (!stamp) return null;
+  const age = Date.now() - new Date(stamp).getTime();
+  return Number.isNaN(age) ? null : age;
+}
+
+function renderStalenessBanner() {
+  const banner = document.getElementById("staleness-banner");
+  if (!banner) return;
+
+  const age = viewAgeMs();
+  if (age === null || age <= staleAfterMs) {
+    banner.innerHTML = "";
+    return;
+  }
+
+  banner.innerHTML =
+    `<div class="stale-view">This view is ${escapeHtml(formatDurationFromMilliseconds(age))} old and is not updating. ` +
+    `The tab was probably asleep - browsers freeze background tabs. Nothing here can be trusted until it refreshes.` +
+    `<button type="button" data-action="refresh" class="stale-refresh">Refresh now</button></div>`;
+}
+
 
 async function loadDashboard({ queueRefresh = false } = {}) {
   if (state.loading) {
@@ -215,6 +278,7 @@ function render() {
   elements.issueDetail.innerHTML = renderIssueDetail();
   elements.instanceStatus.innerHTML = renderInstanceStatus();
   elements.rateLimits.innerHTML = renderRateLimits();
+  renderStalenessBanner();
 
   const autoRefreshToggle = document.getElementById("auto-refresh");
   if (autoRefreshToggle) {
@@ -427,7 +491,24 @@ function renderAttention() {
   // while three repositories were being committed to. Undated rows under a
   // "nothing needs you" headline read as current. A feed that cannot distinguish
   // quiet from unreported must at least date what it is showing.
-  const reports = (state.snapshot?.agent_activity || []).slice(0, 4);
+  /* Rows stored before the endpoint enforced this - a bare "a", the word "test",
+   * two hundred consecutive x's - sat above real work in the panel that answers
+   * "what is the team doing". The endpoint refuses them now, so this only ever
+   * applies to what is already in the log; the rows stay there for audit rather
+   * than being deleted, and simply stop being presented as reports.
+   *
+   * The same three blunt rules as the server, deliberately: if the two ever
+   * disagree, the page is showing something the engine would not have accepted. */
+  const looksLikeAReport = summary => {
+    const t = (summary || "").trim();
+    if (t.length < 12) return false;
+    if (!/\s/.test(t)) return false;
+    return !t.split(/\s+/).some(word => word.length > 60);
+  };
+
+  const reports = (state.snapshot?.agent_activity || [])
+    .filter(r => looksLikeAReport(r.summary))
+    .slice(0, 4);
   const newest = reports.length
     ? Math.min(...reports.map(r => Date.now() - Date.parse(r.at)).filter(ms => !isNaN(ms)))
     : null;
@@ -467,7 +548,7 @@ function renderHeroPanel() {
         <span class="ms-name">Watchtower</span>
         <span class="status-chip ${getHealthTone()}">${escapeHtml(state.health?.label || (state.loading ? "Syncing" : "Unknown"))}</span>
         <span class="ms-sep"></span>
-        <span class="ms-fact"><b>${escapeHtml(workflow?.tracker?.owner || "owner")}/${escapeHtml(workflow?.tracker?.repo || "repo")}</b></span>
+        <span class="ms-fact" title="${escapeHtml((state.snapshot?.tracked_repositories || []).join(", "))}"><b>${escapeHtml(trackedRepositoriesLabel() || "no repository configured")}</b></span>
         <span class="ms-fact">${counts ? `${escapeHtml(formatNumber(counts.running))} active &middot; ${escapeHtml(formatNumber(counts.retrying))} retrying &middot; ${escapeHtml(formatNumber(counts.tracked))} tracked` : "waiting for telemetry"}</span>
         <span class="ms-fact">polls every ${escapeHtml(formatDurationFromMilliseconds(workflow?.polling?.intervalMs || state.runtime?.runtimeDefaults?.polling?.intervalMs || 0))}</span>
         <span class="ms-fact">updated ${escapeHtml(formatRelativeTime(state.snapshot?.generated_at || state.lastLoadedAt))}</span>
@@ -813,7 +894,13 @@ function renderActivityEntry(entry) {
 }
 
 function renderTrackedIssues() {
-  const issues = state.snapshot?.tracked?.recently_updated || [];
+  // Open work first. The list is ordered by last update, which buried the three
+  // open issues under twenty-seven closed ones from previous days - the opposite
+  // of what a "what is in flight" panel is for. Recency still orders within each
+  // group, so the closed history is intact underneath.
+  const isOpen = issue => !/^(closed|merged|done)$/i.test(issue.state || "");
+  const issues = [...(state.snapshot?.tracked?.recently_updated || [])]
+    .sort((a, b) => (isOpen(b) ? 1 : 0) - (isOpen(a) ? 1 : 0));
   return `
     <div class="panel-body p-6">
       <div class="flex items-center justify-between gap-4">
@@ -1054,11 +1141,28 @@ function renderCompactEmpty(message) {
   return `<div class="rounded-2xl border border-dashed border-white/10 bg-white/[0.02] px-4 py-3 text-sm text-slate-400">${escapeHtml(message)}</div>`;
 }
 
-function updateDocumentTitle() {
+// The tab and the meta strip both named a single repository, left over from
+// when there could only be one. The tracker watches several now, so naming the
+// first of them is not shorthand - it is wrong, and it hides the others.
+function trackedRepositoriesLabel() {
+  const tracked = state.snapshot?.tracked_repositories || [];
+  if (tracked.length > 1) {
+    return `${tracked.length} repositories`;
+  }
+
+  const single = tracked[0];
+  if (single) {
+    return single;
+  }
+
   const owner = state.runtime?.workflow?.tracker?.owner;
   const repo = state.runtime?.workflow?.tracker?.repo;
-  const repoLabel = [owner, repo].filter(Boolean).join("/");
-  document.title = repoLabel ? `${repoLabel} | ${baseDocumentTitle}` : baseDocumentTitle;
+  return [owner, repo].filter(Boolean).join("/");
+}
+
+function updateDocumentTitle() {
+  const label = trackedRepositoriesLabel();
+  document.title = label ? `${label} | ${baseDocumentTitle}` : baseDocumentTitle;
 }
 
 function activeLeaseCount(snapshot) {
