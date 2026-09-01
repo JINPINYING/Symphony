@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Symphony.Core.Configuration;
+using Symphony.Core.Models;
 using Symphony.Infrastructure.Workflows;
 using Symphony.Infrastructure.Workflows.Models;
 
@@ -241,9 +242,18 @@ public sealed class WorkflowLoaderTests
             Assert.NotEqual(primary.WorktreesRoot, secondary.WorktreesRoot);
             Assert.Equal("https://github.com/JINPINYING/Symphony.git", secondary.RemoteUrl);
 
-            // Siblings, not children: one repository's cleanup sweep must never
-            // walk into another's worktrees.
-            Assert.DoesNotContain(primary.WorktreesRoot, secondary.WorktreesRoot);
+            // Siblings, not children: one repository's cleanup sweep must never walk
+            // into another's worktrees. Checked on the boundary rather than as a
+            // substring, because "worktrees-symphony" starts with "worktrees" while
+            // being nowhere inside it - which is exactly the distinction that makes
+            // this safe, and exactly what a substring test would get wrong.
+            var primaryRoot = WorkspacePathSafety.GetAbsolutePath(primary.WorktreesRoot)
+                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            var secondaryRoot = WorkspacePathSafety.GetAbsolutePath(secondary.WorktreesRoot);
+            Assert.False(
+                secondaryRoot.StartsWith(primaryRoot + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase),
+                $"'{secondaryRoot}' must not sit inside '{primaryRoot}'.");
+            Assert.NotEqual(primaryRoot, secondaryRoot);
             Assert.Equal("JINPINYING/Symphony", secondary.Key);
         }
         finally
