@@ -327,6 +327,18 @@ function renderStaff() {
   const staff = state.snapshot?.staff || [];
   if (!staff.length) return "";
 
+  /* "The team" is everyone who acts on this project, so a row has to say what
+   * KIND of member it is - a runner the plane dispatches to, a scheduler that
+   * wakes it, a session working beside the queue, or the owner the decisions land
+   * on. Without that the rows are four different things wearing one costume. */
+  const roleLabel = {
+    runner: "Runner",
+    scheduler: "Scheduler",
+    session: "Session",
+    owner: "You"
+  };
+  const stateLabel = { working: "Working", idle: "Idle", waiting: "Waiting", late: "Late" };
+
   const rows = staff.map(m => {
     const working = m.state === "working";
     const facts = [];
@@ -339,10 +351,10 @@ function renderStaff() {
     }
 
     return `
-      <li class="staff-row ${working ? "staff-working" : "staff-idle"}">
-        <span class="staff-state">${working ? "Working" : "Idle"}</span>
+      <li class="staff-row ${working ? "staff-working" : "staff-idle"} ${m.state === "late" || m.state === "waiting" ? "staff-attention" : ""}">
+        <span class="staff-state">${escapeHtml(stateLabel[m.state] || m.state)}</span>
         <div class="staff-main">
-          <div class="staff-name">${escapeHtml(m.runner)}</div>
+          <div class="staff-name">${escapeHtml(m.runner)}<span class="staff-role">${escapeHtml(roleLabel[m.role] || m.role || "")}</span></div>
           <div class="staff-activity">${escapeHtml(m.activity)}</div>
           ${m.last_message ? `<div class="staff-msg">${escapeHtml(m.last_message)}</div>` : ""}
         </div>
