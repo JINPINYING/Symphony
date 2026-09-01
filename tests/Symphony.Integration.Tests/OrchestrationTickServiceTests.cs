@@ -1761,6 +1761,7 @@ public sealed class OrchestrationTickServiceTests
                     dbContext,
                     clock,
                     NullLogger<EventLogRetentionService>.Instance),
+                new TrackerReachability(clock),
                 Options.Create(new OrchestrationOptions
                 {
                     InstanceId = "instance-1",

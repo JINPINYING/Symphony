@@ -40,10 +40,26 @@ public static class OwnerAttentionSummary
         IReadOnlyList<OpenPullRequest> openPullRequests,
         IReadOnlyList<AgentActivityReport> agentActivity,
         IReadOnlyList<WatchedTaskReport> watchedTasks,
+        TrackerReachabilitySnapshot? tracker,
         DateTimeOffset? lastEventAtUtc,
         DateTimeOffset now)
     {
         var items = new List<AttentionItem>();
+
+        // A tracker the engine cannot reach is a blind plane: no work is found,
+        // none is dispatched, and every internal signal is indistinguishable from
+        // a quiet queue - the same shape of blind spot as a scheduler that stops
+        // firing. Reported only once it has lasted, because the observed failures
+        // were DNS blips that cleared within a tick, and a page that flags each of
+        // those is one that trains its reader to ignore red.
+        if (tracker?.UnreachableSinceUtc is { } blindSince &&
+            now - blindSince > TrackerReachability.UnreachableGrace)
+        {
+            items.Add(new AttentionItem(
+                "The issue tracker cannot be reached",
+                $"No candidate scan has succeeded for {Humanise(now - blindSince)}, so nothing new will be picked up. Last cause: {tracker.LastFailureReason}",
+                LevelDown));
+        }
 
         if (!engineHealthy)
         {
