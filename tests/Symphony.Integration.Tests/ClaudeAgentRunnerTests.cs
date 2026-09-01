@@ -47,6 +47,54 @@ public sealed class ClaudeAgentRunnerTests
         Assert.Contains("marker-123", final.Message);
     }
 
+    // ADCP#26. AgentRunUpdate.SessionId composes ThreadId with TurnId and is null
+    // unless both are set. Claude reports a session id and no turn id, so before this
+    // fix every update during a live run carried SessionId == null and the run's
+    // session was recorded only by the final turn_completed. The startup guard reads
+    // exactly that field, concluded the run was still "pre-session" three minutes in,
+    // and killed a working agent - every time, for the whole life of the feature.
+    [Fact]
+    public async Task RunIssueAsync_ShouldReportItsSessionFromTheFirstEventNotOnlyAtTheEnd()
+    {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            return;
+        }
+
+        using var harness = CreateClaudeHarness("""
+            $null = [Console]::In.ReadToEnd()
+            @{ type = 'system'; subtype = 'init'; session_id = 'sess-1' } | ConvertTo-Json -Compress
+            @{ type = 'assistant'; session_id = 'sess-1'; message = @{ role = 'assistant'; content = @(@{ type = 'text'; text = 'working on it' }) } } | ConvertTo-Json -Compress -Depth 6
+            @{ type = 'result'; subtype = 'success'; is_error = $false; session_id = 'sess-1'; result = 'done'; usage = @{ input_tokens = 1; output_tokens = 1 } } | ConvertTo-Json -Compress -Depth 4
+            """);
+
+        var updates = new List<AgentRunUpdate>();
+        var runner = new ClaudeAgentRunner(NullLogger<ClaudeAgentRunner>.Instance);
+
+        var result = await runner.RunIssueAsync(
+            CreateRequest(harness, timeoutMs: 120_000),
+            (update, _) =>
+            {
+                updates.Add(update);
+                return Task.CompletedTask;
+            });
+
+        Assert.True(result.Success, result.Stderr);
+
+        var init = Assert.Single(updates, update => update.EventType == "claude_system_init");
+        Assert.False(string.IsNullOrWhiteSpace(init.SessionId));
+
+        // And it is the SAME session throughout, so one run produces one session
+        // record rather than a live one and a separate final one.
+        var sessionIds = updates
+            .Where(update => update.SessionId is not null)
+            .Select(update => update.SessionId)
+            .Distinct()
+            .ToList();
+        Assert.Single(sessionIds);
+        Assert.Equal(init.SessionId, Assert.Single(updates, update => update.EventType == "turn_completed").SessionId);
+    }
+
     [Fact]
     public async Task RunIssueAsync_ShouldFailOnErrorResult()
     {

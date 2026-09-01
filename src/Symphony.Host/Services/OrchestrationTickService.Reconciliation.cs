@@ -318,8 +318,9 @@ public sealed partial class OrchestrationTickService
             if (continuousTurnBudgetExceeded && !inactivityStalled)
             {
                 logger.LogWarning(
-                    "Run for issue {IssueIdentifier} exceeded the continuous turn safety budget with {TurnCount} turns while Codex activity remained live. Requesting a bounded stalled retry.",
+                    "Run for issue {IssueIdentifier} on runner {Runner} exceeded the continuous turn safety budget with {TurnCount} turns while agent activity remained live. Requesting a bounded stalled retry.",
                     run.IssueIdentifier,
+                    run.Runner,
                     run.TurnCount);
             }
 

@@ -170,7 +170,7 @@ public sealed class ClaudeAgentRunner(ILogger<ClaudeAgentRunner> logger) : IAgen
                 EventType: "turn_completed",
                 Timestamp: DateTimeOffset.UtcNow,
                 ThreadId: sessionId,
-                TurnId: "final",
+                TurnId: BoundedTurnId,
                 Message: Truncate(resultText, 2_000),
                 InputTokens: finalInputTokens,
                 OutputTokens: finalOutputTokens,
@@ -218,6 +218,17 @@ public sealed class ClaudeAgentRunner(ILogger<ClaudeAgentRunner> logger) : IAgen
         return builder.ToString();
     }
 
+    // AgentRunUpdate.SessionId is composed from ThreadId AND TurnId, and is null
+    // unless both are present. `claude -p` reports one session id and has no turn
+    // id at all, so every update this runner produced carried a thread with no turn
+    // and the run's session was recorded only by the final turn_completed event -
+    // meaning a live, working Claude run looked "pre-session" for its whole life.
+    // The startup guard reads exactly that, so it killed every Claude run at the
+    // Codex timeout while the agent was mid-sentence (ADCP#26). One bounded turn
+    // per dispatch, so one stable turn id covers the run and yields a single
+    // session row created at the first event and completed by the last.
+    private const string BoundedTurnId = "turn";
+
     private AgentRunUpdate? TryMapStreamEvent(
         string line,
         ref string? sessionId,
@@ -255,7 +266,8 @@ public sealed class ClaudeAgentRunner(ILogger<ClaudeAgentRunner> logger) : IAgen
                     return new AgentRunUpdate(
                         EventType: $"claude_system_{subtype ?? "event"}",
                         Timestamp: DateTimeOffset.UtcNow,
-                        ThreadId: sessionId);
+                        ThreadId: sessionId,
+                        TurnId: BoundedTurnId);
                 case "assistant":
                 case "user":
                     string? excerpt = null;
@@ -279,6 +291,7 @@ public sealed class ClaudeAgentRunner(ILogger<ClaudeAgentRunner> logger) : IAgen
                         EventType: $"claude_{type}",
                         Timestamp: DateTimeOffset.UtcNow,
                         ThreadId: sessionId,
+                        TurnId: BoundedTurnId,
                         Message: excerpt);
                 case "result":
                     resultSubtype = subtype;
@@ -294,12 +307,14 @@ public sealed class ClaudeAgentRunner(ILogger<ClaudeAgentRunner> logger) : IAgen
                         EventType: "claude_result",
                         Timestamp: DateTimeOffset.UtcNow,
                         ThreadId: sessionId,
+                        TurnId: BoundedTurnId,
                         Message: Truncate(resultText, 500));
                 default:
                     return new AgentRunUpdate(
                         EventType: $"claude_{type}",
                         Timestamp: DateTimeOffset.UtcNow,
-                        ThreadId: sessionId);
+                        ThreadId: sessionId,
+                        TurnId: BoundedTurnId);
             }
         }
     }

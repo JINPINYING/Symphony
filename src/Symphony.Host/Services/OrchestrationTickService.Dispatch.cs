@@ -1108,7 +1108,7 @@ public sealed partial class OrchestrationTickService
             RunId = retryEntry.RunId,
             EventName = "implicit_continuation_suppressed",
             Level = LogLevel.Information.ToString(),
-            Message = "Successful Codex execution was finalized without starting another implementation run.",
+            Message = "A successful bounded execution was finalized without starting another implementation run.",
             OccurredAtUtc = nowUtc
         });
 
