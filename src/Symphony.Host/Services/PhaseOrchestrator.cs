@@ -189,16 +189,28 @@ public sealed class PhaseOrchestrator(
         TrackerQuerySet queries,
         CancellationToken cancellationToken)
     {
+        // Repair stranded runs FIRST, and unconditionally.
+        //
+        // The loop below returns early when no ledger is at stage escalated - and
+        // that is precisely the state a stranded run is left in, since its ledger
+        // has already moved on to closed or merged. Running the sweep after that
+        // return meant it never executed in the only situation it exists for.
+        var cleared = await ResolveRunsStrandedAgainstSettledLedgersAsync(cancellationToken);
+
         var escalated = await dbContext.PhaseLedger
             .Where(entry => entry.Stage == PhaseStages.Escalated)
             .ToListAsync(cancellationToken);
         if (escalated.Count == 0)
         {
+            if (cleared)
+            {
+                await dbContext.SaveChangesAsync(cancellationToken);
+            }
+
             return;
         }
 
         var openPullRequestNumbers = await ReadOpenPullRequestNumbersAsync(cancellationToken);
-        var cleared = false;
 
         foreach (var ledger in escalated)
         {
@@ -272,6 +284,58 @@ public sealed class PhaseOrchestrator(
         {
             await dbContext.SaveChangesAsync(cancellationToken);
         }
+    }
+
+    /// <summary>
+    /// Resolves runs left at needs_command_center whose phase has ALREADY settled.
+    ///
+    /// Clearing the run at the moment the ledger closes fixes every future case
+    /// and no past one: this loop only visits ledgers still at stage escalated, so
+    /// anything that diverged before that code existed stays stranded forever.
+    /// #115 and #118 did exactly that - the panel stopped showing them because the
+    /// summary suppresses settled issues, but the runs stayed needs_command_center
+    /// in the database, and the commander's sweep reads the runs rather than the
+    /// panel. A fix that corrects the page while leaving the record wrong just
+    /// moves which surface is lying.
+    ///
+    /// Written as a sweep rather than a migration so it is self-healing: any
+    /// future divergence, from any cause, is repaired on the next tick instead of
+    /// waiting for someone to notice it.
+    /// </summary>
+    private async Task<bool> ResolveRunsStrandedAgainstSettledLedgersAsync(
+        CancellationToken cancellationToken)
+    {
+        var stranded = await dbContext.Runs
+            .Where(run => run.Status == RunStatusNames.NeedsCommandCenter)
+            .ToListAsync(cancellationToken);
+        if (stranded.Count == 0)
+        {
+            return false;
+        }
+
+        var settledIssueIds = await dbContext.PhaseLedger
+            .Where(entry => entry.Stage == PhaseStages.Closed || entry.Stage == PhaseStages.Merged)
+            .Select(entry => entry.IssueId)
+            .ToListAsync(cancellationToken);
+        if (settledIssueIds.Count == 0)
+        {
+            return false;
+        }
+
+        var settled = settledIssueIds.ToHashSet(StringComparer.Ordinal);
+        var now = timeProvider.GetUtcNow();
+        var repaired = 0;
+
+        foreach (var run in stranded.Where(run => settled.Contains(run.IssueId)))
+        {
+            run.Status = RunStatusNames.ResolvedByPhaseClear;
+            run.CompletedAtUtc = now;
+            repaired++;
+            AddPhaseEvent(run.IssueId, run.IssueIdentifier, "phase_escalation_cleared",
+                $"{run.IssueIdentifier} was still recorded as needing the command center while its phase had already settled. Resolved to match.");
+        }
+
+        return repaired > 0;
     }
 
     private async Task<HashSet<int>> ReadOpenPullRequestNumbersAsync(CancellationToken cancellationToken)
