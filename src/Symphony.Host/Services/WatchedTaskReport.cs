@@ -38,6 +38,27 @@ public sealed record WatchedTaskReport(
 public static class WatchedTaskEvaluator
 {
     /// <summary>
+    /// Windows Task Scheduler reports STATUS in the same field it reports a task's
+    /// exit code, and the status values are not errors. Reading them as exit codes
+    /// is what made the panel escalate to its worst level - "something is wrong and
+    /// it will not clear itself" - while the plane was healthy and dispatching
+    /// work (ADCP#22).
+    ///
+    /// <c>SCHED_S_TASK_RUNNING</c> is the one that did the damage. A long-running
+    /// task holds it for as long as it is doing its job, so the healthier the
+    /// Commander was - the longer it worked - the more reliably the panel called it
+    /// broken, clearing only in the gaps between runs. Exactly backwards.
+    /// </summary>
+    internal const int SchedulerTaskRunning = 0x00041301;    // 267009
+    internal const int SchedulerTaskDisabled = 0x00041302;   // 267010
+    internal const int SchedulerTaskHasNotRun = 0x00041303;  // 267011
+    internal const int SchedulerTaskTerminated = 0x00041306; // 267014
+
+    internal static bool IsSchedulerStatusCode(int? lastResult) =>
+        lastResult is SchedulerTaskRunning or SchedulerTaskDisabled
+                   or SchedulerTaskHasNotRun or SchedulerTaskTerminated;
+
+    /// <summary>
     /// How far past its expected interval a task may drift before it counts as
     /// late. Three intervals rather than one: schedulers legitimately slip when
     /// the host is busy, and a heartbeat monitor that cries wolf on ordinary
@@ -75,7 +96,39 @@ public static class WatchedTaskEvaluator
                 "Disabled, so it will not run again until it is re-enabled.");
         }
 
-        if (lastResult is not null && lastResult != 0)
+        if (lastResult == SchedulerTaskDisabled)
+        {
+            return Build(WatchedTaskReport.HealthDisabled,
+                "The scheduler reports it as disabled, so it will not run again until it is re-enabled.");
+        }
+
+        if (lastResult == SchedulerTaskHasNotRun)
+        {
+            return Build(WatchedTaskReport.HealthUnknown,
+                "The scheduler reports it has not run yet, so there is nothing to judge it by.");
+        }
+
+        // Currently working, not currently failing. Liveness for a long-running task
+        // has to come from whether it is being STARTED on schedule, never from a
+        // status sampled mid-run.
+        if (lastResult == SchedulerTaskRunning)
+        {
+            var runningFor = lastRunUtc is null ? (TimeSpan?)null : now - lastRunUtc.Value;
+            if (runningFor is not null && runningFor.Value.TotalMinutes > threshold)
+            {
+                // Still worth saying. A run that has outlasted three of its own
+                // intervals is overlapping its next start, which is a real fault
+                // even though nothing has exited non-zero.
+                return Build(WatchedTaskReport.HealthLate,
+                    $"Still running after {Humanise(runningFor.Value)}, which is past the {Describe(threshold)} it is given. It is overlapping its own schedule.");
+            }
+
+            return Build(WatchedTaskReport.HealthOk, runningFor is null
+                ? "Currently running."
+                : $"Currently running, started {Humanise(runningFor.Value)} ago.");
+        }
+
+        if (lastResult is not null && lastResult != 0 && !IsSchedulerStatusCode(lastResult))
         {
             return Build(WatchedTaskReport.HealthFailing,
                 $"Its last run exited with code {lastResult}. It is still scheduled, so it will keep failing on the same schedule until the cause is fixed.");
@@ -87,15 +140,22 @@ public static class WatchedTaskEvaluator
                 "It has never run, or the scheduler did not report a last run time.");
         }
 
+        // A terminated run did not finish, but the task is not broken - the question
+        // that matters is still whether it keeps being started, so it is judged on
+        // lateness like any other and the termination is only noted.
+        var terminatedNote = lastResult == SchedulerTaskTerminated
+            ? " Its previous run was terminated rather than completing."
+            : string.Empty;
+
         var silentFor = now - lastRunUtc.Value;
         if (silentFor.TotalMinutes > threshold)
         {
             return Build(WatchedTaskReport.HealthLate,
-                $"Expected about every {Describe(expectEveryMinutes)}, but it has not run for {Humanise(silentFor)}. A task that stops being started looks exactly like a calm system from inside the engine.");
+                $"Expected about every {Describe(expectEveryMinutes)}, but it has not run for {Humanise(silentFor)}. A task that stops being started looks exactly like a calm system from inside the engine.{terminatedNote}");
         }
 
         return Build(WatchedTaskReport.HealthOk,
-            $"Last ran {Humanise(silentFor)} ago, on schedule.");
+            $"Last ran {Humanise(silentFor)} ago, on schedule.{terminatedNote}");
 
         WatchedTaskReport Build(string health, string explanation) => new(
             name, path, state, status, lastRunUtc, lastResult, nextRunUtc,

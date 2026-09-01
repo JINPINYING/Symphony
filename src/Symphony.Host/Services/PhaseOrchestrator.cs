@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Symphony.Core.Models;
 using Symphony.Infrastructure.Persistence.Sqlite;
@@ -62,6 +63,7 @@ public sealed class PhaseOrchestrator(
         {
             await SeedLedgersForCompletedImplementationsAsync(query, cancellationToken);
             await AdvanceLedgersAsync(workflowDefinition, query, dispatchAsync, cancellationToken);
+            await ReconcileEscalatedLedgersAsync(query, cancellationToken);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -161,6 +163,115 @@ public sealed class PhaseOrchestrator(
             .FirstOrDefault();
     }
 
+    // An escalated ledger is deliberately parked: the phase machine must not resume
+    // it, because a person or a directive has to resolve it. But "parked" had been
+    // implemented as "never looked at again", so once the PR it referred to was
+    // merged and its issue closed, the item stayed on the owner's attention panel
+    // permanently - #111 was still listed as stopped at the merge gate long after
+    // PR #112 was merged. A resolved alarm that never clears does the same damage
+    // as a false one: it teaches the reader that the panel is not worth reading
+    // (ADCP#22).
+    //
+    // This asks the terminal question and nothing else - it never re-enters the
+    // state machine. The open-PR snapshot the tick already keeps makes it nearly
+    // free: a PR still listed as open cannot be terminal, so the common case (a
+    // genuinely escalated PR still waiting on a person) costs no call at all. Only
+    // a ledger whose PR has dropped out of that list pays for a confirming fetch,
+    // and if the snapshot was merely truncated that fetch answers OPEN and nothing
+    // happens.
+    private async Task ReconcileEscalatedLedgersAsync(
+        TrackerQuery query,
+        CancellationToken cancellationToken)
+    {
+        var escalated = await dbContext.PhaseLedger
+            .Where(entry => entry.Stage == PhaseStages.Escalated)
+            .ToListAsync(cancellationToken);
+        if (escalated.Count == 0)
+        {
+            return;
+        }
+
+        var openPullRequestNumbers = await ReadOpenPullRequestNumbersAsync(cancellationToken);
+        var cleared = false;
+
+        foreach (var ledger in escalated)
+        {
+            if (openPullRequestNumbers.Contains(ledger.PrNumber))
+            {
+                continue;
+            }
+
+            PullRequestStatus? pullRequest;
+            try
+            {
+                pullRequest = await trackerClient.FetchPullRequestStatusAsync(query, ledger.PrNumber, cancellationToken);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(
+                    ex,
+                    "Could not check whether the escalation for {IssueIdentifier} (PR #{PrNumber}) is resolved; leaving it up.",
+                    ledger.IssueIdentifier,
+                    ledger.PrNumber);
+                continue;
+            }
+
+            // Fail closed. Clearing an alarm we could not verify is worse than
+            // leaving one up a little longer.
+            if (pullRequest is null || !IsTerminalPullRequestState(pullRequest.State))
+            {
+                continue;
+            }
+
+            ledger.Stage = PhaseStages.Closed;
+            ledger.UpdatedAtUtc = timeProvider.GetUtcNow();
+            AddPhaseEvent(ledger.IssueId, ledger.IssueIdentifier, "phase_escalation_cleared",
+                $"PR #{ledger.PrNumber} is {pullRequest.State}, so the merge-gate escalation for {ledger.IssueIdentifier} is resolved and no longer needs attention.");
+            cleared = true;
+        }
+
+        if (cleared)
+        {
+            await dbContext.SaveChangesAsync(cancellationToken);
+        }
+    }
+
+    private async Task<HashSet<int>> ReadOpenPullRequestNumbersAsync(CancellationToken cancellationToken)
+    {
+        var json = (await dbContext.EventLog
+                .AsNoTracking()
+                .Where(entry => entry.EventName == OrchestrationTickService.OpenPullRequestsEventName && entry.DataJson != null)
+                .ToListAsync(cancellationToken))
+            .OrderByDescending(entry => entry.OccurredAtUtc)
+            .Select(entry => entry.DataJson)
+            .FirstOrDefault();
+
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            return [];
+        }
+
+        try
+        {
+            var openPullRequests = JsonSerializer.Deserialize<List<OpenPullRequest>>(json);
+            return openPullRequests is null ? [] : [.. openPullRequests.Select(pr => pr.Number)];
+        }
+        catch (JsonException)
+        {
+            // No snapshot means no shortcut, not a wrong answer: every escalated
+            // ledger simply pays for its own confirming fetch this tick.
+            return [];
+        }
+    }
+
+    private static bool IsTerminalPullRequestState(string? state) =>
+        string.Equals(state, "MERGED", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(state, "CLOSED", StringComparison.OrdinalIgnoreCase);
+
     private async Task AdvanceLedgersAsync(
         WorkflowDefinition workflowDefinition,
         TrackerQuery query,
@@ -210,8 +321,7 @@ public sealed class PhaseOrchestrator(
             return;
         }
 
-        if (string.Equals(pullRequest.State, "MERGED", StringComparison.OrdinalIgnoreCase) ||
-            string.Equals(pullRequest.State, "CLOSED", StringComparison.OrdinalIgnoreCase))
+        if (IsTerminalPullRequestState(pullRequest.State))
         {
             ledger.Stage = PhaseStages.Closed;
             ledger.UpdatedAtUtc = timeProvider.GetUtcNow();

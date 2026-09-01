@@ -22,6 +22,51 @@ public sealed class WatchedTaskEvaluatorTests
             lastResult, Now.AddMinutes(expectEveryMinutes),
             expectEveryMinutes, lateAfterMinutes, Now);
 
+    // ADCP#22. 267009 is 0x00041301, SCHED_S_TASK_RUNNING - the scheduler saying
+    // "this task is working right now", not an exit code. Reading it as a failure
+    // escalated the panel to "something is wrong and it will not clear itself"
+    // while the plane was healthy and dispatching, and cleared only in the gaps
+    // between runs. The healthier the Commander, the longer it held this value.
+    [Fact]
+    public void ARunningTaskIsNotAFailingTask()
+    {
+        var report = Evaluate(since: TimeSpan.FromMinutes(4), lastResult: 267009);
+
+        Assert.Equal(WatchedTaskReport.HealthOk, report.Health);
+        Assert.Contains("Currently running", report.Explanation);
+    }
+
+    // Still worth saying, though: a run that has outlasted three of its own
+    // intervals is overlapping its next start.
+    [Fact]
+    public void ARunThatOutlastsItsOwnScheduleIsStillReported()
+    {
+        var report = Evaluate(since: TimeSpan.FromMinutes(90), lastResult: 267009);
+
+        Assert.Equal(WatchedTaskReport.HealthLate, report.Health);
+        Assert.Contains("overlapping its own schedule", report.Explanation);
+    }
+
+    [Theory]
+    [InlineData(267010, WatchedTaskReport.HealthDisabled)]
+    [InlineData(267011, WatchedTaskReport.HealthUnknown)]
+    public void TheOtherSchedulerStatusCodesAreNotFailuresEither(int lastResult, string expectedHealth)
+    {
+        Assert.Equal(expectedHealth, Evaluate(since: TimeSpan.FromMinutes(4), lastResult: lastResult).Health);
+    }
+
+    // 267014 is SCHED_S_TASK_TERMINATED. The previous run did not finish, but the
+    // task is not broken - the question that still matters is whether it keeps
+    // being started - so it is judged on lateness and the termination is noted.
+    [Fact]
+    public void ATerminatedRunIsNotedRatherThanTreatedAsACrash()
+    {
+        var report = Evaluate(since: TimeSpan.FromMinutes(4), lastResult: 267014);
+
+        Assert.Equal(WatchedTaskReport.HealthOk, report.Health);
+        Assert.Contains("terminated rather than completing", report.Explanation);
+    }
+
     [Fact]
     public void ARunWithinItsWindowIsHealthy()
     {
@@ -75,13 +120,17 @@ public sealed class WatchedTaskEvaluatorTests
         Assert.Contains("re-enabled", report.Explanation);
     }
 
+    // Originally written with 267011 as the example of "a non-zero exit", which is
+    // the very confusion ADCP#22 is about - that value is SCHED_S_TASK_HAS_NOT_RUN,
+    // a status. The invariant it was asserting is right and still holds, so it now
+    // uses a code that really is an exit code.
     [Fact]
     public void ANonZeroExitOutranksBeingOnTime()
     {
-        var report = Evaluate(since: TimeSpan.FromMinutes(1), lastResult: 267011);
+        var report = Evaluate(since: TimeSpan.FromMinutes(1), lastResult: 2);
 
         Assert.Equal(WatchedTaskReport.HealthFailing, report.Health);
-        Assert.Contains("267011", report.Explanation);
+        Assert.Contains("exited with code 2", report.Explanation);
     }
 
     [Fact]
