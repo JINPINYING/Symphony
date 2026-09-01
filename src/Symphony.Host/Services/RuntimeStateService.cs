@@ -261,7 +261,11 @@ public sealed class RuntimeStateService(
             .Take(40)
             .ToList();
 
-        var staff = StaffSummary.Build(configuredRunners, runningRuns, recentRuns, generatedAt);
+        var staff = StaffSummary.Build(
+            configuredRunners, runningRuns, recentRuns, generatedAt,
+            schedulers: watchedTasks,
+            sessions: agentActivity,
+            decisionsWaitingOnOwner: attention.Items.Count);
 
         return new
         {
@@ -269,6 +273,7 @@ public sealed class RuntimeStateService(
             staff = staff.Select(member => new
             {
                 runner = member.Runner,
+                role = member.Role,
                 state = member.State,
                 issue_identifier = member.IssueIdentifier,
                 phase = member.Phase,
