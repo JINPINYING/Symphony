@@ -1,11 +1,9 @@
+// Panels are looked up per render rather than cached once: the advanced section
+// creates and destroys the workflow editor as it is opened and closed, so a
+// reference captured at load would go stale.
 const elements = {
-  heroPanel: document.getElementById("hero-panel"),
-  alert: document.getElementById("dashboard-alert"),
-  workflowEditor: document.getElementById("workflow-editor"),
-  liveRuns: document.getElementById("live-runs"),
-  activityFeed: document.getElementById("activity-feed"),
-  instanceStatus: document.getElementById("instance-status"),
-  rateLimits: document.getElementById("rate-limits")
+  get alert() { return document.getElementById("dashboard-alert"); },
+  get workflowEditor() { return document.getElementById("workflow-editor"); }
 };
 
 const toneClasses = {
@@ -35,7 +33,7 @@ const state = {
   showRawEvents: false,
   // Sections the reader has opened. Held in state rather than in the DOM because
   // the page re-renders every 15 seconds, which would slam a <details> shut mid-read.
-  expanded: { roadmap: false, instance: false, telemetry: false },
+  expanded: { roadmap: false, activity: false, queue: false, advanced: false },
   error: null,
   issueError: null,
   lastLoadedAt: null
@@ -96,9 +94,15 @@ document.addEventListener("input", event => {
   syncWorkflowEditorChrome();
 });
 
-void loadDashboard();
-scheduleRefresh();
-watchForFrozenTab();
+/* Bootstrap after the module finishes evaluating. The render layer below
+   declares WT_ICONS and friends with `const`, and calling render() from here
+   would reach them inside their temporal dead zone - the page came up blank
+   with "cannot access before initialization" until this was deferred. */
+queueMicrotask(() => {
+  void loadDashboard();
+  scheduleRefresh();
+  watchForFrozenTab();
+});
 
 /* A background tab is not a paused tab - it is a LYING tab.
  *
@@ -231,17 +235,28 @@ async function loadDashboard({ queueRefresh = false } = {}) {
   }
 }
 
+// Panels in the order the reader needs them, not the order they were built in.
 function render() {
   updateDocumentTitle();
-  elements.heroPanel.innerHTML = renderAttention() + renderHeroPanel() + wrapPanel(renderStaff());
-  elements.alert.innerHTML = renderAlert();
-  renderWorkflowEditorSection();
-  elements.liveRuns.innerHTML = renderLiveRuns() + renderQueue();
-  elements.activityFeed.innerHTML = renderActivityFeed();
-  mountRoadmap();
-  elements.instanceStatus.innerHTML = renderInstanceStatus();
-  elements.rateLimits.innerHTML = renderRateLimits();
+  renderHeaderRight();
+  renderLiveBadge();
   renderStalenessBanner();
+
+  renderAttentionPanel();   // 1. does this need me
+  renderHealthPanel();      // 2. is the machinery healthy
+  renderTeamPanel();        // 3. what is the team doing
+  renderActivityPanel();    // 4. what just happened
+  renderQueuePanel();       // 5. what is queued or blocked, and why
+  renderRoadmapPanel();     // 6. how are the projects progressing
+
+  renderUtilityStrip();
+  renderAdvancedPanel();
+  if (elements.workflowEditor) {
+    renderWorkflowEditorSection(true);
+  }
+
+  const alertHost = elements.alert;
+  if (alertHost) alertHost.innerHTML = renderAlert();
 
   const autoRefreshToggle = document.getElementById("auto-refresh");
   if (autoRefreshToggle) {
@@ -261,16 +276,19 @@ function renderWorkflowEditorSection(force = false) {
       ? "expanded"
       : "collapsed";
 
+  const host = elements.workflowEditor;
+  if (!host) return;
+
   if (
     force ||
     !state.workflowDirty ||
     state.workflowSaving ||
     state.workflowError ||
-    !elements.workflowEditor.innerHTML ||
-    elements.workflowEditor.dataset.renderMode !== desiredMode
+    !host.innerHTML ||
+    host.dataset.renderMode !== desiredMode
   ) {
-    elements.workflowEditor.innerHTML = renderWorkflowEditor();
-    elements.workflowEditor.dataset.renderMode = desiredMode;
+    host.innerHTML = renderWorkflowEditor();
+    host.dataset.renderMode = desiredMode;
     return;
   }
 
@@ -286,138 +304,13 @@ function renderWorkflowEditorSection(force = false) {
 // The workforce view: who is working, on what, for how long. This is the
 // question an operator opens a dashboard to ask, so it sits directly under the
 // summary and above every diagnostic.
-function renderStaff() {
-  const staff = state.snapshot?.staff || [];
-  if (!staff.length) return "";
-
-  /* "The team" is everyone who acts on this project, so a row has to say what
-   * KIND of member it is - a runner the plane dispatches to, a scheduler that
-   * wakes it, a session working beside the queue, or the owner the decisions land
-   * on. Without that the rows are four different things wearing one costume. */
-  const roleLabel = {
-    runner: "Runner",
-    scheduler: "Scheduler",
-    session: "Session",
-    owner: "You"
-  };
-  const stateLabel = { working: "Working", idle: "Idle", waiting: "Waiting", late: "Late" };
-
-  const rows = staff.map(m => {
-    const working = m.state === "working";
-    const facts = [];
-    if (working) {
-      if (m.elapsed_seconds != null) facts.push(`${formatDurationFromMilliseconds(m.elapsed_seconds * 1000)} elapsed`);
-      if (m.turn_count != null) facts.push(`${formatNumber(m.turn_count)} turn${m.turn_count === 1 ? "" : "s"}`);
-      if (m.total_tokens) facts.push(`${formatNumber(m.total_tokens)} tokens`);
-    } else if (m.elapsed_seconds != null) {
-      facts.push(`${formatDurationFromMilliseconds(m.elapsed_seconds * 1000)} ago`);
-    }
-
-    return `
-      <li class="staff-row ${working ? "staff-working" : "staff-idle"} ${m.state === "late" || m.state === "waiting" ? "staff-attention" : ""}">
-        <span class="staff-state">${escapeHtml(stateLabel[m.state] || m.state)}</span>
-        <div class="staff-main">
-          <div class="staff-name">${escapeHtml(m.runner)}<span class="staff-role">${escapeHtml(roleLabel[m.role] || m.role || "")}</span></div>
-          <div class="staff-activity">${escapeHtml(m.activity)}</div>
-          ${m.last_message ? `<div class="staff-msg">${escapeHtml(m.last_message)}</div>` : ""}
-        </div>
-        <div class="staff-facts">${facts.map(f => `<span>${escapeHtml(f)}</span>`).join("")}</div>
-      </li>`;
-  }).join("");
-
-  const busy = staff.filter(m => m.state === "working").length;
-  return `
-    <div class="panel-body p-6">
-      <div class="flex items-center justify-between gap-4">
-        <div>
-          <div class="section-kicker">Right now</div>
-          <h2 class="section-title">What the team is doing</h2>
-        </div>
-        <span class="glass-badge">${escapeHtml(busy ? `${busy} of ${staff.length} working` : "all idle")}</span>
-      </div>
-      <ul class="staff-list">${rows}</ul>
-    </div>`;
-}
-
-
 // The staff panel has no slot in the original markup, so it is wrapped in the
 // same shell the other panels use rather than styled separately.
-function wrapPanel(inner) {
-  return inner ? `<section class="panel mt-4">${inner}</section>` : "";
-}
-
-function roadmapRow(entry) {
-  const word = entry.status === "done" ? "Done" : entry.status === "active" ? "Now" : "Planned";
-  return `
-    <li class="rm-row rm-${escapeHtml(entry.status)}">
-      <span class="rm-status">${escapeHtml(word)}</span>
-      ${entry.milestone ? `<span class="rm-ms">${escapeHtml(entry.milestone)}</span>` : ""}
-      <span class="rm-title">${escapeHtml(entry.title)}</span>
-    </li>`;
-}
-
 // "N of M done" as words, not a bar. The count is the honest summary of a task
 // list and stays readable at a glance on a phone.
-function roadmapTally(items) {
-  const done = items.filter(e => e.status === "done").length;
-  return `${done} of ${items.length} done`;
-}
-
 // The file can carry more than one project - the plane's own milestones and the
 // product it is building - so entries are grouped in the order the file lists
 // them. Ungrouped entries render as one flat list, exactly as before.
-function roadmapGroups(items) {
-  const groups = [];
-  for (const entry of items) {
-    const name = entry.group || "";
-    const last = groups[groups.length - 1];
-    if (last && last.name === name) last.items.push(entry);
-    else groups.push({ name, items: [entry] });
-  }
-  return groups;
-}
-
-function renderRoadmap() {
-  const items = state.snapshot?.roadmap || [];
-  if (!items.length) return "";
-
-  const groups = roadmapGroups(items);
-  const grouped = groups.some(g => g.name);
-  const open = state.expanded.roadmap;
-
-  /* Collapsed, a roadmap answers "where is the work" - which is the active stage
-   * and the one that follows it. Twenty-one rows answer "what is the whole plan",
-   * a question asked once a week and worth a click, not two thirds of the page
-   * every time. Done stages are counted rather than listed: their names have
-   * stopped carrying information, only their number still does. */
-  const visible = g => {
-    if (open) return g.items;
-    const activeAt = g.items.findIndex(i => i.status === "active");
-    if (activeAt < 0) return g.items.filter(i => i.status !== "done").slice(0, 2);
-    return g.items.slice(activeAt, activeAt + 2);
-  };
-
-  const body = grouped
-    ? groups.map(g => `
-        ${g.name ? `<div class="rm-group"><span class="rm-group-name">${escapeHtml(g.name)}</span><span class="rm-group-tally">${escapeHtml(roadmapTally(g.items))}</span></div>` : ""}
-        <ul class="rm-list">${visible(g).map(roadmapRow).join("")}</ul>`).join("")
-    : `<ul class="rm-list">${(open ? items : items.filter(i => i.status !== "done").slice(0, 3)).map(roadmapRow).join("")}</ul>`;
-
-  return `
-    <div class="panel-body p-6">
-      <div class="flex items-center justify-between gap-4">
-        <div>
-          <div class="section-kicker">Roadmap</div>
-          <h2 class="section-title">Where this is going</h2>
-        </div>
-        <button type="button" class="sec-toggle" data-action="toggle-section" data-section="roadmap">${
-          open ? "Show less" : `Show all ${items.length}`}</button>
-      </div>
-      ${body}
-    </div>`;
-}
-
-
 // The roadmap panel has no slot in the original markup, so it is appended once
 // after the tracked-issues panel and re-rendered in place thereafter.
 /* The roadmap has its own container in the markup now.
@@ -428,136 +321,6 @@ function renderRoadmap() {
  * exact failure this page keeps being fixed for, committed by the fix itself. A
  * panel that depends on an unrelated panel existing has a dependency nobody can
  * see in the markup, which is why it is now declared where it lives. */
-function mountRoadmap() {
-  const host = document.getElementById("roadmap-panel");
-  if (!host) return;
-  host.innerHTML = renderRoadmap() || "";
-}
-
-function renderAttention() {
-  const a = state.snapshot?.attention;
-  if (!a) return "";
-
-  // Word first, colour second. The status has to be legible as text before any
-  // colour registers - colour alone is not a signal everyone can read.
-  const map = {
-    clear:     { tone: "att-clear", word: "All clear",  mark: "&#10003;" },
-    attention: { tone: "att-warn",  word: "Needs you",  mark: "!" },
-    down:      { tone: "att-down",  word: "Blocked",    mark: "&#10005;" }
-  };
-  const m = map[a.level] || map.clear;
-
-  // An item that names a decision but makes the reader go and find it is only
-  // half an answer, so the label links straight to the thing when there is one.
-  // http(s) only: the URL arrives as data, and a javascript: label would be a
-  // scripting hole dressed up as a convenience.
-  const items = (a.items || []).map(item => {
-    const safeUrl = /^https?:\/\//i.test(item.url || "") ? item.url : null;
-    const label = escapeHtml(item.label);
-    return `
-    <li class="att-item">
-      <span class="att-sev ${item.severity === "down" ? "att-down" : "att-warn"}">${escapeHtml(item.severity === "down" ? "Blocking" : "Decide")}</span>
-      <div>
-        <div class="att-item-label">${safeUrl
-          ? `<a class="att-item-link" href="${escapeHtml(safeUrl)}" target="_blank" rel="noopener noreferrer">${label}</a>`
-          : label}</div>
-        <div class="att-item-detail">${escapeHtml(item.detail)}</div>
-      </div>
-    </li>`;
-  }).join("");
-
-  // Work an agent did outside the queue. The counts above only ever described
-  // dispatched runs, so without this the page can be busy and look asleep.
-  //
-  // Every row carries its own age now, and the strip says so when the newest
-  // report has gone cold. This feed is written by agents POSTing into it, so it
-  // reports nothing both when nothing happened and when nobody said anything -
-  // and on 2026-09-01 it showed a day-old Stage 1 handoff as ambient context
-  // while three repositories were being committed to. Undated rows under a
-  // "nothing needs you" headline read as current. A feed that cannot distinguish
-  // quiet from unreported must at least date what it is showing.
-  /* Rows stored before the endpoint enforced this - a bare "a", the word "test",
-   * two hundred consecutive x's - sat above real work in the panel that answers
-   * "what is the team doing". The endpoint refuses them now, so this only ever
-   * applies to what is already in the log; the rows stay there for audit rather
-   * than being deleted, and simply stop being presented as reports.
-   *
-   * The same three blunt rules as the server, deliberately: if the two ever
-   * disagree, the page is showing something the engine would not have accepted. */
-  const looksLikeAReport = summary => {
-    const t = (summary || "").trim();
-    if (t.length < 12) return false;
-    if (!/\s/.test(t)) return false;
-    return !t.split(/\s+/).some(word => word.length > 60);
-  };
-
-  const reports = (state.snapshot?.agent_activity || [])
-    .filter(r => looksLikeAReport(r.summary))
-    .slice(0, 4);
-  const newest = reports.length
-    ? Math.min(...reports.map(r => Date.now() - Date.parse(r.at)).filter(ms => !isNaN(ms)))
-    : null;
-  const STALE_AFTER_MS = 2 * 60 * 60 * 1000;
-
-  /* "Now" replaced the age instead of decorating it, and it covered a fifteen
-   * minute window - so a report from 14 minutes ago read "Now" while the one
-   * below it read "16 minutes ago". A two-minute difference rendered as a jump
-   * from nothing to sixteen, which made a correctly ordered list look shuffled.
-   * The owner spotted it and asked whether the feed was even in time order.
-   *
-   * Every row carries its real age now; liveness is a dot beside it rather than
-   * a substitute for the number. Same rule as the rest of this page: a label must
-   * not stand in front of the fact it is describing. */
-  const activity = reports.map(report => `
-    <li class="agent-row">
-      <span class="agent-when">${report.live ? '<span class="agent-live" title="Reported within the last 15 minutes"></span>' : ""}${escapeHtml(formatRelativeTime(report.at))}</span>
-      <span class="agent-actor">${escapeHtml(report.actor || "agent")}</span>
-      <span class="agent-summary">${escapeHtml(report.summary || "")}</span>
-    </li>`).join("");
-
-  const activityNote = newest !== null && newest > STALE_AFTER_MS
-    ? `<div class="agent-stale">Nothing reported for ${escapeHtml(formatDurationFromMilliseconds(newest))}. Agents report into this themselves, so an empty feed means no one has said anything - not that nothing is happening.</div>`
-    : "";
-
-  return `
-    <div class="attention ${m.tone}">
-      <div class="att-status"><span class="att-mark">${m.mark}</span><span class="att-word">${escapeHtml(m.word)}</span></div>
-      <h1 class="att-headline">${escapeHtml(a.headline)}</h1>
-      <p class="att-detail">${escapeHtml(a.detail)}</p>
-      ${items ? `<ul class="att-list">${items}</ul>` : ""}
-      ${activity ? `<div class="agent-strip"><div class="agent-kicker">Agent activity</div><ul class="agent-list">${activity}</ul>${activityNote}</div>` : ""}
-    </div>`;
-}
-
-function renderHeroPanel() {
-  const workflow = state.runtime?.workflow;
-  const counts = state.snapshot?.counts;
-  const refreshLabel = state.refreshQueued ? "Queuing tick..." : state.loading ? "Syncing..." : "Refresh now";
-
-  // Everything here is metadata and controls. It used to carry a 5xl product
-  // name above the actual answer, which read as decoration outranking content.
-  return `
-    <div class="metastrip">
-      <div class="ms-line">
-        <span class="ms-name">Watchtower</span>
-        <span class="status-chip ${getHealthTone()}">${escapeHtml(state.health?.label || (state.loading ? "Syncing" : "Unknown"))}</span>
-        <span class="ms-sep"></span>
-        <span class="ms-fact" title="${escapeHtml((state.snapshot?.tracked_repositories || []).join(", "))}"><b>${escapeHtml(trackedRepositoriesLabel() || "no repository configured")}</b></span>
-        <span class="ms-fact">${counts ? `${escapeHtml(formatNumber(counts.running))} active &middot; ${escapeHtml(formatNumber(counts.retrying))} retrying &middot; ${escapeHtml(formatNumber(counts.tracked))} tracked` : "waiting for telemetry"}</span>
-        <span class="ms-fact">polls every ${escapeHtml(formatDurationFromMilliseconds(workflow?.polling?.intervalMs || state.runtime?.runtimeDefaults?.polling?.intervalMs || 0))}</span>
-        <span class="ms-fact">updated ${escapeHtml(formatRelativeTime(state.snapshot?.generated_at || state.lastLoadedAt))}</span>
-        <!-- Spend was a metric card holding a whole band for one number. It belongs
-             beside the other facts, not above them. -->
-        <span class="ms-fact">${escapeHtml(formatNumber(state.snapshot?.codex_totals?.total_tokens || 0))} tokens</span>
-      </div>
-      <div class="ms-controls">
-        <label class="ms-auto"><input id="auto-refresh" type="checkbox"><span>Auto refresh</span></label>
-        <button type="button" data-action="refresh" class="ms-refresh" ${state.loading ? "disabled" : ""}>${escapeHtml(refreshLabel)}</button>
-      </div>
-    </div>`;
-}
-
-
 function renderAlert() {
   if (!state.error) {
     return "";
@@ -718,182 +481,6 @@ function renderWorkflowEditorFeedback(draft) {
  * "in the pipeline at wait for repair" is progress; an issue sitting labelled
  * while the plane refuses to claim it is a fault, and those three read
  * identically as a bare list of titles. */
-function renderQueue() {
-  const queue = state.snapshot?.queue || [];
-
-  const body = queue.length
-    ? `<ul class="queue-list">${queue.map((q, i) => `
-        <li class="queue-row">
-          <span class="queue-pos">${i + 1}</span>
-          <div class="queue-main">
-            <div class="queue-title">${q.url
-              ? `<a href="${escapeHtml(q.url)}" target="_blank" rel="noreferrer">${escapeHtml(q.issue_identifier)}</a>`
-              : escapeHtml(q.issue_identifier)} ${escapeHtml(q.title || "")}</div>
-            <div class="queue-why">${escapeHtml(q.waiting_on || "")}</div>
-          </div>
-        </li>`).join("")}</ul>`
-    : `<div class="queue-empty">Nothing is queued. Label an issue <span class="k">symphony-ready</span> and it appears here.</div>`;
-
-  return wrapPanel(`
-    <div class="panel-body p-6">
-      <div class="section-kicker">Up next</div>
-      <h2 class="section-title">Queue${queue.length ? ` <span class="queue-count">${queue.length}</span>` : ""}</h2>
-      <div class="mt-4">${body}</div>
-    </div>`);
-}
-
-function renderLiveRuns() {
-  const running = state.snapshot?.running || [];
-  const retrying = state.snapshot?.retrying || [];
-  const maxTurns = state.runtime?.workflow?.agent?.maxTurns || 0;
-
-  return `
-    <div class="panel-body p-6">
-      <div class="flex items-center justify-between gap-4">
-        <div>
-          <div class="section-kicker">Live workload</div>
-          <h2 class="section-title">Runs in flight</h2>
-        </div>
-        <span class="glass-badge">${escapeHtml(`${running.length} active / ${retrying.length} queued`)}</span>
-      </div>
-
-      <div class="mt-6 space-y-4">
-        ${running.length ? running.map(run => renderRunningCard(run, maxTurns)).join("") : renderEmptyState("No agents are running.", "As soon as the worker dispatches an eligible issue, it will appear here with turns, session, and token totals.")}
-      </div>
-
-      <div class="mt-8">
-        <div class="flex items-center justify-between gap-4">
-          <h3 class="text-sm font-semibold uppercase tracking-[0.24em] text-slate-300">Retry queue</h3>
-          <span class="text-xs text-slate-400">${escapeHtml(retrying.length ? "Ordered by due time" : "Idle")}</span>
-        </div>
-        <div class="mt-4 space-y-3">
-          ${retrying.length ? retrying.map(renderRetryRow).join("") : renderCompactEmpty("No retry backlog")}
-        </div>
-      </div>
-    </div>`;
-}
-
-function renderRunningCard(run, maxTurns) {
-  const progress = maxTurns > 0 ? Math.min(run.turn_count / maxTurns, 1) : 0;
-  const width = `${Math.max(progress * 100, run.turn_count > 0 ? 8 : 0)}%`;
-
-  return `
-    <button type="button" data-issue-identifier="${escapeHtml(run.issue_identifier)}" class="issue-row ${run.issue_identifier === state.selectedIssue ? "issue-row-selected" : ""}">
-      <div class="min-w-0 flex-1">
-        <div class="flex flex-wrap items-center gap-2">
-          <span class="status-chip ${toneClasses.info}">Running</span>
-          <span class="text-sm font-semibold text-white">${escapeHtml(run.issue_identifier)}</span>
-          <span class="truncate text-sm text-slate-300">${escapeHtml(run.title || "Untitled issue")}</span>
-        </div>
-        <div class="mt-3 grid gap-3 sm:grid-cols-2">
-          <div>
-            <div class="text-xs uppercase tracking-[0.22em] text-slate-400">Latest event</div>
-            <div class="mt-1 text-sm text-slate-200">${escapeHtml(run.last_event || "waiting")}</div>
-            <div class="mt-1 text-sm text-slate-400">${escapeHtml(run.last_message || "No message recorded")}</div>
-          </div>
-          <div>
-            <div class="text-xs uppercase tracking-[0.22em] text-slate-400">Session and state</div>
-            <div class="mt-1 text-sm text-slate-200">${escapeHtml(run.session_id || "Session not started")} in ${escapeHtml(run.state || "Unknown")}</div>
-            <div class="mt-1 text-sm text-slate-400">Started ${escapeHtml(formatRelativeTime(run.started_at))}</div>
-          </div>
-        </div>
-        <div class="mt-4">
-          <div class="flex items-center justify-between text-xs uppercase tracking-[0.22em] text-slate-400">
-            <span>Turn progress</span>
-            <span>${escapeHtml(maxTurns ? `${run.turn_count}/${maxTurns}` : `${run.turn_count} turns`)}</span>
-          </div>
-          <div class="mt-2 h-2.5 overflow-hidden rounded-full bg-white/8">
-            <div class="h-full rounded-full bg-gradient-to-r from-cyan-300 via-emerald-300 to-orange-300" style="width: ${width};"></div>
-          </div>
-        </div>
-      </div>
-
-      <div class="shrink-0 text-right">
-        <div class="font-display text-2xl font-semibold text-white">${escapeHtml(formatNumber(run.tokens?.total_tokens || 0))}</div>
-        <div class="text-xs uppercase tracking-[0.22em] text-slate-400">Tokens</div>
-      </div>
-    </button>`;
-}
-
-function renderRetryRow(retry) {
-  return `
-    <button type="button" data-issue-identifier="${escapeHtml(retry.issue_identifier)}" class="issue-row ${retry.issue_identifier === state.selectedIssue ? "issue-row-selected" : ""}">
-      <div class="min-w-0 flex-1">
-        <div class="flex flex-wrap items-center gap-2">
-          <span class="status-chip ${toneClasses.warning}">Retry</span>
-          <span class="text-sm font-semibold text-white">${escapeHtml(retry.issue_identifier)}</span>
-          <span class="truncate text-sm text-slate-300">${escapeHtml(retry.title || "Tracked issue")}</span>
-        </div>
-        <div class="mt-2 text-sm text-slate-300">${escapeHtml(retry.error || "Retry waiting for its due time")}</div>
-      </div>
-      <div class="shrink-0 text-right text-sm text-slate-300">
-        <div>Attempt ${escapeHtml(String(retry.attempt || 0))}</div>
-        <div class="mt-1 text-xs uppercase tracking-[0.22em] text-slate-400">${escapeHtml(formatRetryCountdown(retry.due_at))}</div>
-      </div>
-    </button>`;
-}
-
-function renderActivityFeed() {
-  const activity = state.snapshot?.activity || [];
-  return `
-    <div class="panel-body p-6">
-      <div class="flex items-center justify-between gap-4">
-        <div>
-          <div class="section-kicker">Recent activity</div>
-          <h2 class="section-title">Event stream</h2>
-        </div>
-        <div class="flex items-center gap-3">
-          <span class="glass-badge">${escapeHtml(formatNumber(activity.length))} ${state.showRawEvents ? "raw events" : "activities"}</span>
-          <button type="button" data-action="toggle-raw-events" class="glass-badge hover:text-cyan-100" title="Raw events are always recorded; this only changes what is shown.">
-            ${state.showRawEvents ? "Show activity" : "Show raw events"}
-          </button>
-        </div>
-      </div>
-      <div class="mt-6 space-y-3">
-        ${activity.length ? activity.map(renderActivityEntry).join("") : renderEmptyState("No activity logged yet.", "Dispatches, phase changes, verdicts and merges appear here. Streaming protocol events are hidden by default — use Show raw events to see everything.")}
-      </div>
-    </div>`;
-}
-
-function renderActivityEntry(entry) {
-  const tone = getEventTone(entry);
-  return `
-    <div class="rounded-3xl border ${tone} bg-white/[0.035] p-4">
-      <div class="flex flex-wrap items-center gap-2">
-        <span class="status-chip ${tone}">${escapeHtml(entry.label || entry.event)}</span>
-        ${entry.repeat_count > 1 ? `<span class="glass-badge" title="${escapeHtml(String(entry.repeat_count))} consecutive identical events collapsed into one row">&times;${escapeHtml(String(entry.repeat_count))}</span>` : ""}
-        ${entry.issue_identifier ? `<button type="button" data-issue-identifier="${escapeHtml(entry.issue_identifier)}" class="text-sm font-semibold text-white hover:text-cyan-100">${escapeHtml(entry.issue_identifier)}</button>` : ""}
-        <span class="text-xs uppercase tracking-[0.22em] text-slate-400">${escapeHtml(formatRelativeTime(entry.at))}</span>
-      </div>
-      ${entry.message ? `<p class="mt-3 text-sm leading-6 text-slate-300">${escapeHtml(entry.message)}</p>` : ""}
-      <div class="mt-3 flex flex-wrap gap-3 text-xs text-slate-400">
-        ${entry.is_protocol ? `<span class="font-mono">${escapeHtml(entry.event)}</span>` : ""}
-        ${entry.session_id ? `<span>Session ${escapeHtml(entry.session_id)}</span>` : ""}
-        ${entry.level ? `<span>${escapeHtml(entry.level)}</span>` : ""}
-      </div>
-    </div>`;
-}
-
-function renderTrackedIssue(issue) {
-  const trackedState = issue.state || "Unknown state";
-  return `
-    <button type="button" data-issue-identifier="${escapeHtml(issue.issue_identifier)}" class="issue-row ${issue.issue_identifier === state.selectedIssue ? "issue-row-selected" : ""}">
-      <div class="min-w-0 flex-1">
-        <div class="flex flex-wrap items-center gap-2">
-          <span class="status-chip ${getIssueStatusTone(issue.status)}">${escapeHtml(issue.status || "tracked")}</span>
-          <span class="text-sm font-semibold text-white">${escapeHtml(issue.issue_identifier)}</span>
-        </div>
-        <div class="mt-2 text-sm text-slate-200">${escapeHtml(issue.title || "Untitled issue")}</div>
-        <div class="mt-3 flex flex-wrap gap-2 text-xs text-slate-400">
-          <span>${escapeHtml(trackedState)}</span>
-          ${issue.milestone ? `<span>Milestone ${escapeHtml(issue.milestone)}</span>` : ""}
-          <span>Updated ${escapeHtml(formatRelativeTime(issue.updated_at))}</span>
-        </div>
-      </div>
-      <div class="shrink-0 self-center text-xs uppercase tracking-[0.22em] text-slate-400">${escapeHtml(trackedState)}</div>
-    </button>`;
-}
-
 /* The schedulers that wake this plane.
  *
  * Nothing rendered these until one of them died and stayed dead for 27 hours
@@ -904,120 +491,6 @@ function renderTrackedIssue(issue) {
  * Health is spelled out as a word, never colour alone. A healthy scheduler is
  * shown but not emphasised: the point is to make silence legible, not to fill
  * the page with cron chatter nobody reads. */
-function renderWatchedTasks() {
-  const tasks = state.snapshot?.watched_tasks || [];
-  if (!tasks.length) {
-    return "";
-  }
-
-  const tone = health => {
-    switch (health) {
-      case "ok": return toneClasses.healthy;
-      case "late": return toneClasses.warning;
-      case "disabled":
-      case "failing": return toneClasses.danger;
-      default: return toneClasses.neutral;
-    }
-  };
-
-  const label = health => ({
-    ok: "On schedule",
-    late: "Late",
-    failing: "Failing",
-    disabled: "Disabled",
-    unknown: "Unmonitored"
-  }[health] || "Unknown");
-
-  const rows = tasks.map(task => `
-    <div class="border-t border-white/10 pt-3 first:border-t-0 first:pt-0">
-      <div class="flex items-center justify-between gap-3">
-        <div class="text-sm font-medium text-white">${escapeHtml(task.name)}</div>
-        <span class="status-chip ${tone(task.health)}">${escapeHtml(label(task.health))}</span>
-      </div>
-      <div class="mt-1 text-sm text-slate-300">${escapeHtml(task.explanation || "")}</div>
-      <div class="mt-1 text-xs text-slate-400">
-        Last run ${escapeHtml(task.last_run ? formatRelativeTime(task.last_run) : "never")}
-        &middot; next ${escapeHtml(task.next_run ? formatRelativeTime(task.next_run) : "not scheduled")}
-      </div>
-    </div>`).join("");
-
-  return `
-    <div class="rounded-3xl border border-white/10 bg-white/[0.035] p-5">
-      <div class="text-xs uppercase tracking-[0.22em] text-slate-400">What wakes the plane</div>
-      <div class="mt-3 space-y-3">${rows}</div>
-    </div>`;
-}
-
-function renderInstanceStatus() {
-  const runtime = state.runtime;
-  const workflow = runtime?.workflow;
-  const leases = state.snapshot?.coordination?.leases || [];
-  const activeLeases = leases.filter(entry => !entry.is_expired);
-
-  return `
-    <div class="panel-body p-6">
-      <div class="section-kicker">Instance health</div>
-      <h2 class="section-title">Host and coordination</h2>
-
-      <div class="mt-6 grid gap-4">
-        <div class="rounded-3xl border border-white/10 bg-white/[0.035] p-5">
-          <div class="flex items-center justify-between gap-4">
-            <div class="text-sm font-medium text-white">Health</div>
-            <span class="status-chip ${getHealthTone()}">${escapeHtml(state.health?.label || "Unknown")}</span>
-          </div>
-          <div class="mt-3 text-sm text-slate-300">${escapeHtml(state.health?.detail || "No health detail available.")}</div>
-        </div>
-
-        ${renderWatchedTasks()}
-
-        <div class="rounded-3xl border border-white/10 bg-white/[0.035] p-5">
-          <div class="text-xs uppercase tracking-[0.22em] text-slate-400">Orchestrator</div>
-          <div class="mt-2 space-y-2 text-sm text-slate-300">
-            <div>Version: ${escapeHtml(runtime?.application?.version || "unknown")}</div>
-            <div>Instance: ${escapeHtml(runtime?.orchestration?.instanceId || "auto-generated")}</div>
-            <div>Lease: ${escapeHtml(runtime?.orchestration?.leaseName || "poll-dispatch")}</div>
-            <div>Lease TTL: ${escapeHtml(formatSeconds(runtime?.orchestration?.leaseTtlSeconds || 0))}</div>
-            <div>HTTP port: ${escapeHtml(String(workflow?.server?.port || "configured externally"))}</div>
-          </div>
-        </div>
-
-        <div class="rounded-3xl border border-white/10 bg-white/[0.035] p-5">
-          <div class="text-xs uppercase tracking-[0.22em] text-slate-400">Persistence</div>
-          <div class="mt-2 text-sm text-slate-300">${runtime?.persistence?.isConfigured ? "SQLite configured" : "Persistence is not configured"}</div>
-          <div class="mt-4 text-xs uppercase tracking-[0.22em] text-slate-400">Lease rows</div>
-          <div class="mt-3 space-y-3">
-            ${leases.length ? leases.map(lease => `
-                <div class="rounded-2xl border ${lease.is_expired ? toneClasses.warning : toneClasses.healthy} p-3">
-                  <div class="flex items-center justify-between gap-4 text-sm">
-                    <span class="font-medium text-white">${escapeHtml(lease.lease_name)}</span>
-                    <span>${escapeHtml(lease.is_expired ? "Expired" : "Active")}</span>
-                  </div>
-                  <div class="mt-2 text-xs text-slate-300">${escapeHtml(lease.owner_instance_id)} updated ${escapeHtml(formatRelativeTime(lease.updated_at))}</div>
-                </div>`).join("") : renderCompactEmpty("No lease data")}
-          </div>
-          <div class="mt-3 text-xs text-slate-400">${escapeHtml(activeLeases.length ? `${activeLeases.length} active coordination lease(s)` : "Coordination is idle or has not run yet.")}</div>
-        </div>
-      </div>
-    </div>`;
-}
-
-function renderRateLimits() {
-  const rows = flattenEntries(state.snapshot?.rate_limits);
-  return `
-    <div class="panel-body p-6">
-      <div class="section-kicker">Provider telemetry</div>
-      <h2 class="section-title">Rate limits</h2>
-      <p class="mt-3 text-sm leading-6 text-slate-300">Latest rate limit payload recorded from Codex app-server updates.</p>
-      <div class="mt-6 space-y-3">
-        ${rows.length ? rows.map(row => `
-            <div class="rounded-2xl border border-white/8 bg-white/[0.035] px-4 py-3">
-              <div class="text-xs uppercase tracking-[0.22em] text-slate-400">${escapeHtml(row.key)}</div>
-              <div class="mt-1 break-all text-sm text-slate-200">${escapeHtml(row.value)}</div>
-            </div>`).join("") : renderEmptyState("No rate-limit payload captured.", "Once Codex reports provider limits, the latest payload will be surfaced here for capacity debugging.")}
-      </div>
-    </div>`;
-}
-
 function renderEmptyState(title, description) {
   return `
     <div class="rounded-3xl border border-dashed border-white/10 bg-white/[0.03] p-5 text-sm text-slate-300">
@@ -1289,4 +762,573 @@ function escapeHtml(value) {
 
 function escapeAttribute(value) {
   return escapeHtml(value);
+}
+
+/* ===========================================================================
+   WATCHTOWER LAYOUT
+   Panels in priority order: does this need me -> is the machinery healthy ->
+   who is working -> what just happened -> what is queued or blocked -> how are
+   the projects progressing.
+
+   Every state carries a WORD. Where a coloured dot or bar appears it sits
+   beside its label, never instead of one: the reader is colour-weak, so colour
+   is reinforcement and never the message.
+
+   Only fields present in /api/v1/state are read - nothing is invented. Where
+   the engine does not report something the mock-up asked for, the panel says
+   what it actually has rather than filling the shape with a plausible number.
+   =========================================================================== */
+
+/* Inline SVG rather than an icon font: the page must render with the machine
+   offline, and a missing glyph would be invisible rather than obviously wrong.
+   Every icon is decorative - the word beside it carries the meaning. */
+const WT_ICONS = {
+  shield: '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>',
+  users: '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>',
+  clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+  hourglass: '<path d="M6 2h12"/><path d="M6 22h12"/><path d="M6 2c0 5 6 5 6 10 0-5 6-5 6-10"/><path d="M6 22c0-5 6-5 6-10 0 5 6 5 6 10"/>',
+  folder: '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
+  refresh: '<path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 3v6h-6"/>',
+  github: '<path d="M9 19c-4 1.4-4-2.2-6-2.6m12 5.6v-3.6a3.1 3.1 0 0 0-.9-2.4c2.9-.3 6-1.4 6-6.4a4.9 4.9 0 0 0-1.4-3.4 4.6 4.6 0 0 0-.1-3.4S17.4 2 15 3.6a12.4 12.4 0 0 0-6.4 0C6.2 2 5.2 2.8 5.2 2.8a4.6 4.6 0 0 0-.1 3.4A4.9 4.9 0 0 0 3.7 9.6c0 5 3 6.1 5.9 6.4a3.1 3.1 0 0 0-.9 2.4V22"/>',
+  calendar: '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M16 3v4M8 3v4M3 11h18"/>',
+  radar: '<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4"/><path d="M12 12 19 7"/>',
+  external: '<path d="M14 4h6v6"/><path d="M20 4 10 14"/><path d="M18 13v6a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h6"/>',
+  chevron: '<path d="m9 5 7 7-7 7"/>',
+  chevronDown: '<path d="m5 9 7 7 7-7"/>',
+  user: '<circle cx="12" cy="8" r="4"/><path d="M4 21v-1a6 6 0 0 1 6-6h4a6 6 0 0 1 6 6v1"/>'
+};
+
+// Hoisted, not const: the module's initial loadDashboard() call sits near the
+// top of the file and renders before evaluation ever reaches this block.
+function icon(name, size = 15) {
+  const body = WT_ICONS[name];
+  if (!body) return "";
+  return `<svg class="wt-ico" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none"
+    stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"
+    aria-hidden="true">${body}</svg>`;
+}
+
+const WT_HEALTHY = new Set(["ok", "healthy", "green"]);
+
+/* Owner-qualified repository names are long and the owner is always the same
+   person, so the prefix carries no information on this page. */
+function shortRepo(value) {
+  const name = String(value || "");
+  return name.includes("/") ? name.slice(name.lastIndexOf("/") + 1) : name;
+}
+
+function sevGlyph(sev) {
+  return sev === "down" ? "&#10007;" : sev === "attention" ? "!" : "&#10003;";
+}
+
+function panelHead(title, iconName, right) {
+  return `<div class="wt-head">
+    <div class="wt-h">${icon(iconName, 16)}${escapeHtml(title)}</div>
+    ${right || ""}
+  </div>`;
+}
+
+/* A dot alone would be unreadable to this reader, so it never ships without
+   the word next to it. */
+function dotLabel(sev, label) {
+  const cls = sev === "down" ? "is-bad" : sev === "attention" ? "is-attn" : sev === "ok" ? "is-ok" : "";
+  return `<span class="wt-svc-item"><span class="wt-dot ${cls}" aria-hidden="true"></span>${escapeHtml(label)}</span>`;
+}
+
+function chevronLink(url, label) {
+  if (!url) return "";
+  return `<a class="wt-chev" href="${escapeAttribute(url)}" target="_blank" rel="noreferrer"
+    aria-label="${escapeAttribute(label || "Open")}">${icon("chevron", 17)}</a>`;
+}
+
+function actionButton(url, label) {
+  if (!url) return "";
+  return `<a class="wt-btn" href="${escapeAttribute(url)}" target="_blank" rel="noreferrer">${icon("github", 15)}${escapeHtml(label)}</a>`;
+}
+
+/* The owner reads this page; owner-facing surfaces are in their own timezone.
+   Durable records elsewhere stay UTC - this is a reading convenience only, and
+   it is labelled so nobody mistakes it for the stored value. */
+function localStamp(value) {
+  if (!value) return "unknown";
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return "unknown";
+  return d.toLocaleString("en-US", {
+    timeZone: "America/New_York",
+    day: "numeric", month: "short", year: "numeric",
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false
+  }) + " ET";
+}
+
+function clockOnly(value) {
+  if (!value) return "";
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleTimeString("en-US", {
+    timeZone: "America/New_York", hour: "2-digit", minute: "2-digit", hour12: false
+  });
+}
+
+/* ---------- header ---------- */
+function renderHeaderRight() {
+  const host = document.getElementById("header-right");
+  if (!host) return;
+  host.innerHTML = `
+    <label class="wt-switch">
+      <input type="checkbox" id="auto-refresh">
+      <span class="wt-track" aria-hidden="true"></span>
+      <span>Auto-refresh</span>
+    </label>
+    <button type="button" class="wt-btn" data-action="refresh">${icon("refresh", 15)}Refresh now</button>
+    <div class="wt-stamp">
+      <b>Last updated</b>
+      <span>${escapeHtml(localStamp(state.lastLoadedAt))}</span>
+    </div>`;
+}
+
+/* LIVE is a claim about this tab, not about the server: it is driven by how
+   old the rendered view is, so a frozen background tab reads STALE instead of
+   showing an hour-old number as if it were current. */
+function renderLiveBadge() {
+  const badge = document.getElementById("live-badge");
+  if (!badge) return;
+  const age = viewAgeMs();
+  const stale = age == null || age > staleAfterMs;
+  badge.classList.toggle("is-stale", stale);
+  badge.textContent = stale ? "STALE" : "LIVE";
+}
+
+/* ---------- 1. does this need me ---------- */
+function renderAttentionPanel() {
+  const host = document.getElementById("panel-attention");
+  if (!host) return;
+  /* No snapshot is not the same as nothing to report. Saying "nothing is
+     waiting on you" while blind is the exact failure this page exists to
+     avoid, so an unread state says so and reads as a fault. */
+  const blind = !state.snapshot;
+  const attention = state.snapshot?.attention;
+  const items = attention?.items || [];
+  const level = String(attention?.level || "").toLowerCase();
+  const sev = blind || level === "down" || level === "critical"
+    ? "down"
+    : items.length ? "attention" : "ok";
+
+  host.classList.toggle("is-attn", sev === "attention");
+  host.classList.toggle("is-bad", sev === "down");
+  host.classList.toggle("is-ok", sev === "ok");
+
+  const tone = sev === "down" ? "var(--wt-bad)" : sev === "attention" ? "var(--wt-attn)" : "var(--wt-ok)";
+
+  const rows = items.map(i => {
+    const s = String(i.severity || "").toLowerCase() === "down" ? "down" : "attention";
+    const isPr = /\bPR\b|pull request/i.test(`${i.label || ""} ${i.url || ""}`);
+    return `
+      <div class="wt-item sev-${s}">
+        <span class="wt-badge sev-${s}">ATTENTION</span>
+        <div class="wt-item-body">
+          <div class="wt-item-title">${escapeHtml(i.label || "")}</div>
+          <div class="wt-item-why">${escapeHtml(i.detail || "")}</div>
+        </div>
+        <div class="wt-item-right">
+          ${actionButton(i.url, isPr ? "Open PR" : "Open issue")}
+          ${chevronLink(i.url, i.label)}
+        </div>
+      </div>`;
+  }).join("");
+
+  host.innerHTML = `
+    <div class="wt-attn-top">
+      <span class="wt-attn-glyph" style="color:${tone}" aria-hidden="true">
+        ${sev === "ok"
+          ? icon("shield", 28)
+          : `<span style="font-size:30px;font-weight:700;line-height:1">${sevGlyph(sev)}</span>`}
+      </span>
+      <div style="min-width:0">
+        <div class="wt-attn-eyebrow">Needs your attention</div>
+        <h1 class="wt-attn-headline">${escapeHtml(blind
+          ? "Cannot read the plane"
+          : attention?.headline || "Nothing is waiting on you")}</h1>
+        <p class="wt-attn-sub">${escapeHtml(blind
+          ? (state.error?.message || state.error || "No snapshot has loaded, so nothing on this page is current. This says nothing about whether work is waiting.")
+          : attention?.detail || "The plane is running normally.")}</p>
+      </div>
+    </div>
+    ${rows ? `<div class="wt-items">${rows}</div>` : ""}`;
+}
+
+/* ---------- 2. is the machinery healthy ---------- */
+function renderHealthPanel() {
+  const host = document.getElementById("panel-health");
+  if (!host) return;
+  const snap = state.snapshot || {};
+  const reach = snap.tracker_reachability || {};
+  const tasks = snap.watched_tasks || [];
+
+  /* Positive evidence only. Before the first load every field is empty, and
+     "no failures reported" would otherwise render as a clean bill of health. */
+  const blind = !state.snapshot;
+  const trackerOk = !blind && !reach.unreachable_since;
+  const engineOk = state.health?.ok === true;
+  /* The engine reports "ok" here, not "healthy" - matching only "healthy"
+     painted two on-schedule tasks as late and the whole panel as degraded. */
+  const lateTasks = tasks.filter(t => !WT_HEALTHY.has(String(t.health || "").toLowerCase()));
+  const allOk = !blind && trackerOk && engineOk && lateTasks.length === 0;
+
+  const sched = tasks.map(t => {
+    const status = String(t.status || t.state || "").toLowerCase();
+    const running = status.includes("running");
+    const healthy = WT_HEALTHY.has(String(t.health || "").toLowerCase());
+    const word = running ? "Running" : healthy ? "Ready" : (t.health || "Unknown");
+    const cls = running ? "is-run" : healthy ? "is-ok" : "is-bad";
+    return `
+      <div class="wt-sched-row">
+        <span class="wt-sched-ico" aria-hidden="true">${icon(running ? "radar" : "calendar", 16)}</span>
+        <div class="wt-sched-main">
+          <div class="wt-sched-name">${escapeHtml(t.name || "Scheduled task")}</div>
+          <div class="wt-sched-why">${escapeHtml(t.explanation || "")}</div>
+        </div>
+        <div class="wt-sched-right">
+          <div class="wt-sched-state ${cls}">${escapeHtml(word)}</div>
+          <div class="wt-sched-every">${t.expect_every_minutes ? `Every ${escapeHtml(String(t.expect_every_minutes))}m` : "&mdash;"}</div>
+        </div>
+      </div>`;
+  }).join("");
+
+  const age = viewAgeMs();
+  const ageLabel = age == null ? "never" : `${formatDurationFromMilliseconds(age)} ago`;
+
+  host.innerHTML = `
+    ${panelHead("Health & freshness", "shield", `
+      <div class="wt-headmeta">
+        <span class="wt-svc-item">Tracker <span class="wt-dot ${blind ? "" : trackerOk ? "is-ok" : "is-bad"}" aria-hidden="true"></span>
+          <b>${blind ? "Unknown" : trackerOk ? "Reachable" : "Unreachable"}</b></span>
+        <span>Consecutive failures <b>${blind ? "&mdash;" : escapeHtml(String(reach.consecutive_failures ?? 0))}</b></span>
+      </div>`)}
+
+    <div class="wt-health-line">
+      <div class="wt-health-state" style="color:${allOk ? "var(--wt-ok)" : blind ? "var(--wt-bad)" : "var(--wt-attn)"}">
+        <span aria-hidden="true">${sevGlyph(allOk ? "clear" : blind ? "down" : "attention")}</span>
+        ${allOk ? "All systems operational" : blind ? "Cannot reach the engine" : "Something needs looking at"}
+      </div>
+      <span class="wt-pill ${allOk ? "sev-ok" : "sev-attention"}">Updated ${escapeHtml(ageLabel)}</span>
+    </div>
+    <div class="wt-health-sub">
+      Engine: <b>${escapeHtml(state.health?.label || "Unknown")}</b>
+      &middot; Last tracker success: ${escapeHtml(localStamp(reach.last_success))}
+    </div>
+
+    ${tasks.length
+      ? `<div class="wt-sub-h">Scheduler <span>(Windows Task Scheduler)</span></div>
+         <div class="wt-sched">${sched}</div>`
+      : `<div class="wt-empty">No scheduled tasks are being watched, so a dead scheduler would not show here.</div>`}`;
+}
+
+/* ---------- 3. who is working ---------- */
+function avatarFor(name, role) {
+  const n = String(name || "");
+  const cls = role === "owner" ? "is-owner"
+    : /claude/i.test(n) ? "is-claude"
+      : /codex/i.test(n) ? "is-codex" : "";
+  /* Two initials, not one: "Claude" and "Codex" both start with C, and this
+     reader cannot separate them by the chip tint. */
+  const word = n.trim().split(/[^A-Za-z0-9]+/)[0] || "";
+  const letter = role === "owner" ? "" : (word.slice(0, 2) || "?").toUpperCase();
+  return `<span class="wt-avatar ${cls}" aria-hidden="true">${letter || icon("user", 14)}</span>`;
+}
+
+function renderTeamPanel() {
+  const host = document.getElementById("panel-team");
+  if (!host) return;
+  const staff = state.snapshot?.staff || [];
+
+  const rows = staff.map(m => {
+    const word = { working: "WORKING", idle: "IDLE", waiting: "WAITING", late: "LATE" }[m.state]
+      || String(m.state || "").toUpperCase();
+    /* Idle is the normal, healthy resting state and is deliberately NOT styled
+       as a problem - a page that flags calm teaches its reader to ignore it. */
+    const sev = m.state === "working" ? "ok" : m.state === "late" ? "down" : m.state === "waiting" ? "attention" : "";
+    const elapsed = m.elapsed_seconds != null ? formatDurationFromMilliseconds(m.elapsed_seconds * 1000) : "&mdash;";
+    return `
+      <tr>
+        <td>
+          <div class="wt-agent">
+            ${avatarFor(m.runner, m.role)}
+            <div class="wt-who"><b>${escapeHtml(m.runner || "")}</b><span>${escapeHtml(m.role || "")}</span></div>
+          </div>
+        </td>
+        <td><span class="wt-badge ${sev ? "sev-" + sev : ""}">${word}</span></td>
+        <td class="wt-act">${escapeHtml(m.activity || "")}</td>
+        <td class="wt-num">${elapsed}</td>
+      </tr>`;
+  }).join("");
+
+  host.innerHTML = `
+    ${panelHead("What the team is doing", "users", `<span class="wt-count">${staff.length} agents</span>`)}
+    ${staff.length
+      ? `<table class="wt-table">
+           <thead><tr><th>Agent / Role</th><th>State</th><th>Current activity</th><th style="text-align:right">Elapsed</th></tr></thead>
+           <tbody>${rows}</tbody>
+         </table>
+         <div class="wt-foot-link"><button type="button" class="wt-link" data-action="toggle-section" data-section="advanced">View all agents and activity ${icon("chevron", 13)}</button></div>`
+      : `<div class="wt-empty">No workers configured.</div>`}`;
+}
+
+/* ---------- 4. what just happened ---------- */
+function renderActivityPanel() {
+  const host = document.getElementById("panel-activity");
+  if (!host) return;
+  const open = state.expanded.activity;
+
+  const agent = (state.snapshot?.agent_activity || []).map(a => ({
+    at: a.at, who: a.actor || "agent", text: a.summary || "", url: a.url || null, kind: "agent"
+  }));
+  const events = (state.snapshot?.activity || []).map(e => ({
+    at: e.at, who: "engine", text: e.message || e.label || e.event || "", url: null, kind: "event"
+  }));
+  const all = [...agent, ...events].filter(r => r.text).sort((a, b) => new Date(b.at) - new Date(a.at));
+
+  /* Both an absolute clock and a relative age: the clock lets the reader line
+     an event up against what they were doing, the age says how fresh it is. */
+  const rows = (open ? all.slice(0, 24) : all.slice(0, 5)).map(r => `
+      <div class="wt-frow">
+        ${avatarFor(r.kind === "agent" ? r.who : "Engine", "")}
+        <div class="wt-fbody"><div class="wt-fsum">${escapeHtml(r.text)}</div></div>
+        <div class="wt-ftime">
+          <b>${escapeHtml(clockOnly(r.at))}</b>
+          <span>${escapeHtml(formatRelativeTime(r.at))}</span>
+        </div>
+        ${r.url
+          ? `<a class="wt-fopen" href="${escapeAttribute(r.url)}" target="_blank" rel="noreferrer"
+               aria-label="Open">${icon("external", 15)}</a>`
+          : `<span class="wt-fopen" style="opacity:0" aria-hidden="true">${icon("external", 15)}</span>`}
+      </div>`).join("");
+
+  host.innerHTML = `
+    ${panelHead("Recent activity", "clock", `<button type="button" class="wt-link" data-action="toggle-section" data-section="activity">${open ? "Show less" : "View all"}</button>`)}
+    ${rows ? `<div class="wt-feed">${rows}</div>` : `<div class="wt-empty">Nothing reported yet.</div>`}`;
+}
+
+/* ---------- 5. what is queued or blocked, and why ---------- */
+function renderQueuePanel() {
+  const host = document.getElementById("panel-queue");
+  if (!host) return;
+  const open = state.expanded.queue;
+
+  /* Four situations needing four different responses, which one flat "queue"
+     would merge into a single undifferentiated list. Every category is derived
+     from fields that already exist - waiting_on, checks_state and the attention
+     severities - not from a new backend contract. */
+  const rows = [];
+
+  for (const pr of state.snapshot?.open_pull_requests || []) {
+    const checks = String(pr.checks_state || "").toUpperCase();
+    if (checks === "FAILURE" || checks === "ERROR") {
+      rows.push({
+        word: "BLOCKED", sev: "down",
+        title: `PR #${pr.number}`,
+        why: `${pr.title || ""} - failing CI checks, so the merge gate will not take it.`,
+        pill: pr.updated_at ? `Waiting ${formatRelativeTime(pr.updated_at).replace(/ ago$/, "")}` : "",
+        pillIcon: "clock", pillSev: "down",
+        url: pr.url
+      });
+    }
+  }
+
+  for (const item of state.snapshot?.attention?.items || []) {
+    const label = item.label || "";
+    /* A PR that fell out of the pipeline is a fault to repair, not a decision
+       to make - the engine's own detail text says so. Filing it under "your
+       decision" told the reader to choose something when nothing is on offer. */
+    const orphaned = /fell out of the pipeline|is not tracking it/i.test(`${label} ${item.detail || ""}`);
+    if (!orphaned && !/needs a decision|stopped at the merge gate|waiting on you/i.test(label)) continue;
+    rows.push({
+      word: orphaned ? "NEEDS REPAIR" : "AWAITING DECISION",
+      sev: orphaned ? "down" : "attention",
+      title: label, why: item.detail || "",
+      pill: orphaned ? "To repair" : "Your decision",
+      pillIcon: orphaned ? "refresh" : "user",
+      pillSev: orphaned ? "down" : "attention",
+      url: item.url
+    });
+  }
+
+  /* Retrying work is queued work: it is not running and it has a reason. The
+     countdown is clamped at zero so an overdue retry never reads as a future one. */
+  for (const retry of state.snapshot?.retrying || []) {
+    rows.push({
+      word: "RETRYING", sev: "attention",
+      title: retry.issue_identifier || `#${retry.issue_id ?? ""}`,
+      why: retry.reason || "The last attempt failed; the plane will try again.",
+      pill: `Next ${formatRetryCountdown(retry.due_at)}`, pillIcon: "clock", pillSev: "attention",
+      url: retry.url
+    });
+  }
+
+  for (const q of state.snapshot?.queue || []) {
+    const w = String(q.waiting_on || "");
+    const word = /pipeline/i.test(w) ? "IN PIPELINE" : /free slot/i.test(w) ? "WAITING SLOT" : "NEXT UP";
+    rows.push({
+      word, sev: "",
+      title: `${q.issue_identifier || ""}${q.repository ? ` &middot; ${escapeHtml(shortRepo(q.repository))}` : ""}`,
+      titleRaw: true,
+      why: q.title || w,
+      pill: "", url: q.url
+    });
+  }
+
+  const shown = open ? rows : rows.slice(0, 4);
+  const html = shown.map(r => `
+      <div class="wt-item sev-${r.sev || "clear"}">
+        <span class="wt-badge is-block ${r.sev ? "sev-" + r.sev : ""}">${r.word}</span>
+        <div class="wt-item-body">
+          <div class="wt-item-title">${r.titleRaw ? r.title : escapeHtml(r.title)}</div>
+          <div class="wt-item-why">${escapeHtml(r.why)}</div>
+        </div>
+        <div class="wt-item-right">
+          ${r.pill ? `<span class="wt-pill sev-${r.pillSev || ""}">${icon(r.pillIcon || "clock", 14)}${escapeHtml(r.pill)}</span>` : ""}
+          ${chevronLink(r.url, r.title)}
+        </div>
+      </div>`).join("");
+
+  host.innerHTML = `
+    ${panelHead("Queue / blocked work", "hourglass", `<span class="wt-count">${rows.length}</span>`)}
+    ${html
+      ? `<div class="wt-items">${html}</div>
+         ${rows.length > shown.length || open
+           ? `<div class="wt-foot-link"><button type="button" class="wt-link" data-action="toggle-section" data-section="queue">${
+               open ? "Show less" : `View all queue and blocked items`} ${icon("chevron", 13)}</button></div>`
+           : ""}`
+      : `<div class="wt-empty">Nothing queued or blocked. Label an issue <span class="wt-mono">symphony-ready</span> to give the plane work.</div>`}`;
+}
+
+/* ---------- 6. how are the projects progressing ---------- */
+function renderRoadmapPanel() {
+  const host = document.getElementById("panel-roadmap");
+  if (!host) return;
+  const items = state.snapshot?.roadmap || [];
+  const open = state.expanded.roadmap;
+
+  const groups = [];
+  for (const it of items) {
+    const name = it.group || "";
+    let g = groups.find(x => x.name === name);
+    if (!g) { g = { name, items: [] }; groups.push(g); }
+    g.items.push(it);
+  }
+
+  /* The per-project tallies come from work already on the page, so a project
+     line and the queue above it can never disagree. */
+  const attentionItems = state.snapshot?.attention?.items || [];
+  const failingPrs = (state.snapshot?.open_pull_requests || [])
+    .filter(p => ["FAILURE", "ERROR"].includes(String(p.checks_state || "").toUpperCase()));
+
+  const body = groups.map(g => {
+    const activeAt = g.items.findIndex(i => i.status === "active");
+    /* Collapsed shows where the work IS: the stage before, the active one, and
+       the next two. The full history is a weekly question, not a per-glance one. */
+    const slice = open
+      ? g.items
+      : activeAt >= 0
+        ? g.items.slice(Math.max(0, activeAt - 1), activeAt + 3)
+        : g.items.filter(i => i.status !== "done").slice(0, 3);
+
+    const steps = slice.map((entry, idx) => {
+      const cls = entry.status === "done" ? "is-done" : entry.status === "active" ? "is-active" : "";
+      const word = entry.status === "done" ? "Complete" : entry.status === "active" ? "In progress" : "Planned";
+      const mark = entry.status === "done"
+        ? "&#10003;"
+        : String(g.items.indexOf(entry) + 1);
+      /* Cut on a word boundary: a hard slice left labels ending in a dangling dash. */
+      const raw = entry.milestone || entry.title || "";
+      const label = raw.length <= 22 ? raw : `${raw.slice(0, 22).replace(/[\s—-]+\S*$/, "")}…`;
+      return `${idx ? `<span class="wt-step-bar" aria-hidden="true"></span>` : ""}
+        <div class="wt-step ${cls}">
+          <span class="wt-step-dot" aria-hidden="true">${mark}</span>
+          <div class="wt-step-txt"><b>${escapeHtml(label)}</b><span>${word}</span></div>
+        </div>`;
+    }).join("");
+
+    /* Attribute an item to a project only on a distinctive word from its name.
+       Splitting on the first token matched "the" against half the page. */
+    const keys = String(g.name || "").toLowerCase().split(/[^a-z0-9]+/).filter(w => w.length >= 5);
+    const mine = t => keys.length > 0 && keys.some(k => String(t).toLowerCase().includes(k));
+    const decisions = attentionItems.filter(i => mine(`${i.label} ${i.url}`)).length;
+    const reds = failingPrs.filter(p => mine(`${p.title} ${p.url}`)).length;
+
+    const tallies = [
+      decisions ? dotLabel("attention", `${decisions} ${decisions === 1 ? "issue" : "issues"} awaiting decision`) : "",
+      reds ? dotLabel("down", `${reds} ${reds === 1 ? "PR" : "PRs"} failing checks`) : ""
+    ].filter(Boolean).join("");
+
+    return `
+      <div class="wt-proj">
+        <div class="wt-proj-head">
+          <span aria-hidden="true" style="color:var(--wt-ink-3)">${icon("chevronDown", 15)}</span>
+          <span class="wt-proj-name">${escapeHtml(g.name || "Roadmap")}</span>
+          ${activeAt >= 0 ? `<span class="wt-proj-tag">Current focus</span>` : ""}
+          <span class="wt-count">${g.items.filter(i => i.status === "done").length}/${g.items.length} complete</span>
+        </div>
+        <div class="wt-steps">${steps}</div>
+        <div class="wt-proj-foot">
+          ${tallies ? `<span>Active items</span><span class="wt-tally">${tallies}</span>` : `<span>No open items on this project.</span>`}
+        </div>
+      </div>`;
+  }).join("");
+
+  host.innerHTML = `
+    ${panelHead("Projects / roadmap", "folder", `<button type="button" class="wt-link" data-action="toggle-section" data-section="roadmap">${open ? "Show less" : "View full roadmap"} ${icon("chevron", 13)}</button>`)}
+    ${body || `<div class="wt-empty">No roadmap configured.</div>`}`;
+}
+
+/* ---------- footer strip ---------- */
+function renderUtilityStrip() {
+  const host = document.getElementById("panel-utility");
+  if (!host) return;
+  const snap = state.snapshot || {};
+  const reach = snap.tracker_reachability || {};
+  const tasks = snap.watched_tasks || [];
+  const lateTasks = tasks.filter(t => !WT_HEALTHY.has(String(t.health || "").toLowerCase()));
+
+  const blind = !state.snapshot;
+  const services = [
+    blind
+      ? dotLabel("down", "GitHub API unknown")
+      : dotLabel(reach.unreachable_since ? "down" : "ok", `GitHub API ${reach.unreachable_since ? "unreachable" : "reachable"}`),
+    blind
+      ? dotLabel("down", "Windows Task Scheduler unknown")
+      : dotLabel(lateTasks.length ? "attention" : "ok",
+          `Windows Task Scheduler ${lateTasks.length ? `${lateTasks.length} late` : `${tasks.length} on schedule`}`),
+    dotLabel(state.health?.ok === true ? "ok" : "down", `Engine ${state.health?.label || "unknown"}`)
+  ].join("");
+
+  /* The mock-up put a GitHub API request budget here. The engine does not
+     report one - rate_limits is the agent vendors' quota - so this shows the
+     quota it actually has rather than a plausible number for a different thing. */
+  const byRunner = snap.rate_limits_by_runner || {};
+  const meters = Object.entries(byRunner).map(([name, limits]) => {
+    const pct = Math.round(Number(limits?.primary?.usedPercent ?? limits?.usedPercent ?? 0));
+    const cls = pct >= 90 ? "is-full" : pct >= 70 ? "is-high" : "";
+    const word = pct >= 90 ? "critical" : pct >= 70 ? "high" : "ok";
+    return `<span class="wt-svc-item">${escapeHtml(name)}
+      <span class="wt-bar ${cls}" role="img" aria-label="${pct}% used, ${word}"><i style="width:${Math.min(100, pct)}%"></i></span>
+      <span class="wt-lim-num">${pct}% used</span></span>`;
+  }).join("");
+
+  host.innerHTML = `
+    <div class="wt-strip"><span class="wt-strip-h">Services</span>${services}</div>
+    <div class="wt-strip wt-lim">
+      <span class="wt-strip-h">Agent quota</span>
+      ${meters || `<span class="wt-empty">No quota reported.</span>`}
+    </div>`;
+}
+
+/* ---------- advanced ---------- */
+function renderAdvancedPanel() {
+  const host = document.getElementById("panel-advanced");
+  if (!host) return;
+  const open = state.expanded.advanced;
+
+  host.innerHTML = `
+    ${panelHead("Advanced", "hourglass", `<button type="button" class="wt-link" data-action="toggle-section" data-section="advanced">${open ? "Hide" : "Show workflow editor"} ${icon("chevron", 13)}</button>`)}
+    ${open ? `<div class="wt-adv-body"><div id="workflow-editor"></div></div>` : ""}`;
 }
