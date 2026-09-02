@@ -107,6 +107,59 @@
 .rm-ms{font-family:ui-monospace,Consolas,monospace;font-size:12px;font-weight:600;color:#fff;min-width:34px}
 .rm-title{flex:1;min-width:0}
 .rm-done .rm-title{color:rgba(226,232,240,.62)}
+
+/* ---------------------------------------------------------------------------
+   Compact layout.
+   The page is read at a glance, several times an hour, on a machine where it
+   shares a screen with the work. It was built to be scrolled: a 42px headline, a
+   third of the fold spent on one sentence, and 24px of padding around every
+   panel. Density here is not decoration - what fits above the fold is what gets
+   read, and the answer, the team and the queue should all fit.
+   Nothing is made smaller than it can be read at. Body text stays at 13px and
+   up, every status keeps its word as well as its colour, and the hero is still
+   the largest thing on the page - just no longer the only thing on it.
+   Overrides live here rather than in dashboard.css because that file is Tailwind
+   output and hand edits to it are lost on the next build.
+   --------------------------------------------------------------------------- */
+.dashboard-shell{padding:14px 16px}
+@media (min-width:640px){.dashboard-shell{padding-left:20px;padding-right:20px}}
+@media (min-width:1024px){.dashboard-shell{padding-left:24px;padding-right:24px}}
+
+.attention{padding:18px 20px 16px;border-radius:16px;gap:8px;margin-bottom:10px}
+.att-headline{font-size:clamp(21px,2.6vw,30px);line-height:1.15}
+.att-detail{font-size:14px;line-height:1.5}
+.att-word{font-size:15px}
+.att-mark{width:24px;height:24px;font-size:13px}
+.att-list{gap:6px}
+.att-item{padding:9px 12px}
+.agent-strip{margin-top:12px;padding-top:10px}
+.agent-row{font-size:13px}
+
+.panel{border-radius:16px}
+.panel .panel-body{padding:16px}
+@media (min-width:640px){.panel .panel-body{padding:18px}}
+.section-kicker{font-size:10.5px;letter-spacing:.22em}
+.section-title{margin-top:4px;font-size:19px;line-height:1.25}
+@media (min-width:640px){.section-title{font-size:21px}}
+
+main.grid{gap:14px;margin-top:14px}
+.space-y-6>:not([hidden])~:not([hidden]){margin-top:14px}
+.dashboard-shell>#workflow-editor{margin-top:14px}
+.dashboard-shell>#dashboard-alert{margin-top:10px}
+main .grid{gap:14px}
+
+.metric-card{border-radius:16px;padding:14px}
+@media (min-width:640px){.metric-card{padding:16px}}
+.metric-value{margin-top:4px;font-size:24px;line-height:1.2}
+@media (min-width:640px){.metric-value{font-size:26px}}
+.metric-label{font-size:13px}
+.metric-detail{margin-top:4px;font-size:12.5px}
+
+.staff-row{padding:10px 12px;border-radius:11px;gap:11px}
+.staff-name{font-size:14.5px}
+.staff-activity{font-size:13px}
+.queue-list{gap:7px}
+.queue-title{font-size:13.5px}
 </style>
 </head>
 <body>
@@ -133,6 +186,7 @@
           <div class="grid gap-6 lg:grid-cols-[minmax(0,1.05fr)_minmax(0,0.95fr)]">
             <section id="activity-feed" class="panel"></section>
           </div>
+          <section id="roadmap-panel" class="panel"></section>
         </section>
 
         <aside class="dashboard-rail space-y-6">
