@@ -1672,8 +1672,28 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
                 errorsElement.ValueKind == JsonValueKind.Array &&
                 errorsElement.GetArrayLength() > 0)
             {
+                // Carry what GitHub actually said. "GitHub GraphQL returned errors"
+                // is the same empty diagnostic as the exception type alone: it sent
+                // a rate-limit exhaustion and a malformed query down one
+                // indistinguishable path, and the plane retried into the limit
+                // every tick because nothing told it which it had hit.
+                var first = errorsElement[0];
+                var type = first.TryGetProperty("type", out var typeElement)
+                    ? typeElement.GetString()
+                    : null;
+                var message = first.TryGetProperty("message", out var messageElement)
+                    ? messageElement.GetString()
+                    : null;
                 document.Dispose();
-                throw new GitHubTrackerException("github_graphql_errors", "GitHub GraphQL returned errors.");
+
+                var rateLimited = string.Equals(type, "RATE_LIMITED", StringComparison.OrdinalIgnoreCase)
+                    || (message?.Contains("rate limit", StringComparison.OrdinalIgnoreCase) ?? false);
+
+                throw new GitHubTrackerException(
+                    rateLimited ? GitHubTrackerException.RateLimitedCode : "github_graphql_errors",
+                    string.IsNullOrWhiteSpace(message)
+                        ? "GitHub GraphQL returned errors."
+                        : $"GitHub GraphQL: {message}");
             }
 
             return document;

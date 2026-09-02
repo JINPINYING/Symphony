@@ -52,6 +52,13 @@ public sealed partial class OrchestrationTickService
     // The two are separate questions and now have separate clocks, exactly as the
     // open-pull-request poll already did. The tick stays fast for everything local
     // and for advancing work already known about; only the GitHub scan is slow.
+    // A rate limit clears on a clock, not on effort. Retrying it every tick spends
+    // the request that would have succeeded later and keeps the plane blind for
+    // longer, which is what happened on 2026-09-01: the budget was exhausted and
+    // every tick went on asking, 197 times per repository, until the window reset.
+    // Ten minutes is short enough to recover well inside GitHub's hourly window and
+    // long enough to stop hammering it.
+    private static readonly TimeSpan RateLimitBackoff = TimeSpan.FromMinutes(10);
     private static readonly TimeSpan CandidateScanInterval = TimeSpan.FromSeconds(60);
     private DateTimeOffset nextCandidateScanUtc = DateTimeOffset.MinValue;
     private IReadOnlyList<NormalizedIssue> lastCandidates = [];

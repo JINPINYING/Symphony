@@ -34,6 +34,49 @@ public sealed class RuntimeStateService(
         }
     }
 
+
+    /// <summary>
+    /// Whether a cached issue carries one of the contract's execution labels.
+    /// Reads the cached label JSON rather than re-querying: the queue must reflect
+    /// what the dispatcher will see on its next pass, which is this same cache.
+    /// </summary>
+    private static bool HasExecutionLabel(string? labelsJson, IReadOnlyList<string> executionLabels)
+    {
+        if (executionLabels.Count == 0 || string.IsNullOrWhiteSpace(labelsJson))
+        {
+            return false;
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(labelsJson);
+            if (document.RootElement.ValueKind != JsonValueKind.Array)
+            {
+                return false;
+            }
+
+            foreach (var label in document.RootElement.EnumerateArray())
+            {
+                var value = label.ValueKind == JsonValueKind.String
+                    ? label.GetString()
+                    : label.TryGetProperty("name", out var name) ? name.GetString() : null;
+
+                if (value is not null &&
+                    executionLabels.Any(l => string.Equals(l, value, StringComparison.OrdinalIgnoreCase)))
+                {
+                    return true;
+                }
+            }
+        }
+        catch (JsonException)
+        {
+            // A malformed cache row must not take the page down; it simply does not
+            // appear in the queue.
+        }
+
+        return false;
+    }
+
     private static IReadOnlyList<OpenPullRequest> ReadOpenPullRequests(string? json)
     {
         if (string.IsNullOrWhiteSpace(json))
@@ -204,6 +247,20 @@ public sealed class RuntimeStateService(
         {
             // Leave the list empty; the page then simply shows no watched tasks
             // rather than claiming they are healthy.
+        }
+
+        // The labels that make an issue executable, from the contract rather than
+        // hard-coded, so the queue cannot disagree with what the dispatcher uses.
+        var executionLabels = new List<string>();
+        try
+        {
+            var labelWorkflow = await workflowDefinitionProvider.GetCurrentAsync(cancellationToken);
+            executionLabels.AddRange(labelWorkflow.Runtime.Tracker.Labels);
+        }
+        catch (Exception)
+        {
+            // Reported elsewhere; an empty list simply yields an empty queue rather
+            // than a queue built on a guess.
         }
 
         var attention = OwnerAttentionSummary.Build(
@@ -424,6 +481,38 @@ public sealed class RuntimeStateService(
                         labels = ParseJsonValue(entry.LabelsJson)
                     })
             },
+            // What the plane will pick up next, and why it has not yet.
+            //
+            // The page could say what was running and what was tracked, and nothing
+            // about the space between - so an issue labelled and waiting looked
+            // identical to one nobody had queued. Worse, an issue the plane could
+            // not claim (#115 sat on implementation_redispatch_blocked) was
+            // indistinguishable from one merely waiting its turn, which is the
+            // difference between patience and a fault.
+            queue = issueCacheEntries
+                .Where(entry => !IssueStateMatcher.IsClosedState(entry.State))
+                .Where(entry => !runningIssueIds.Contains(entry.IssueId)
+                             && !retryIssueIds.Contains(entry.IssueId))
+                .Where(entry => HasExecutionLabel(entry.LabelsJson, executionLabels))
+                .OrderBy(entry => entry.UpdatedAtUtc ?? entry.CachedAtUtc)
+                .Select(entry => new
+                {
+                    issue_identifier = entry.Identifier,
+                    title = entry.Title,
+                    url = entry.Url,
+                    repository = entry.Repository,
+                    labels = ParseJsonValue(entry.LabelsJson),
+                    // A phase ledger means the pipeline already owns this issue: it
+                    // is not waiting for a dispatch slot, it is mid-flight in
+                    // verify, review or merge, and saying "queued" would be wrong.
+                    waiting_on = phaseRows.FirstOrDefault(p =>
+                        string.Equals(p.IssueId, entry.IssueId, StringComparison.OrdinalIgnoreCase) &&
+                        p.Stage != PhaseStages.Merged && p.Stage != PhaseStages.Closed) is { } phase
+                        ? $"in the pipeline at {phase.Stage.Replace('_', ' ')}"
+                        : runningRuns.Count > 0
+                            ? "waiting for a free slot"
+                            : "next to be picked up"
+                }),
             activity_mode = includeRawEvents ? "raw" : "operational",
             activity = recentActivity.Select(entry => new
             {

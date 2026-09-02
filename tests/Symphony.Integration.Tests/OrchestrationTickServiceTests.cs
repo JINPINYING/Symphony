@@ -793,6 +793,57 @@ public sealed class OrchestrationTickServiceTests
         Assert.Empty(harness.Coordinator.StartRequests);
     }
 
+    // A pull request closed and then reopened was orphaned forever. The ledger
+    // recorded closed, and re-seeding skipped it because the pull request number
+    // matched - read as "nothing new to enter", when a settled ledger naming an
+    // OPEN pull request is a reopen. #135 lived this: closed 11:57, reopened
+    // 12:11, and nothing would have looked at it again.
+    [Fact]
+    public async Task RunTickAsync_ShouldPickUpAPullRequestThatWasClosedAndReopened()
+    {
+        var issue = BuildIssue("issue-1", "#1", "Open", null,
+            pullRequests: [new PullRequestRef("pr-5", 5, "OPEN", null, "symphony/1", "main")]);
+        var tracker = new FakeTrackerClient([issue]);
+        tracker.IssuesById["issue-1"] = issue;
+        tracker.PullRequestStatusByNumber[5] = new PullRequestStatus(5, "OPEN", false, "aaa111", "SUCCESS", "MERGEABLE");
+        tracker.OpenPullRequestNumberByHeadBranch["symphony/1"] = 5;
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await harness.InsertRunAsync("issue-1", "#1", "Open", "instance-1", RunStatusNames.Succeeded);
+        await harness.InsertWorkspaceRecordAsync("issue-1", "#1", "symphony/1");
+
+        // The ledger settled while the pull request was closed; it is open again now.
+        harness.DbContext.PhaseLedger.Add(new PhaseLedgerEntity
+        {
+            IssueId = "issue-1",
+            IssueIdentifier = "#1",
+            Stage = PhaseStages.Closed,
+            PrNumber = 5,
+            HeadSha = "old-head",
+            LastVerdict = ReviewVerdicts.ChangesRequired,
+            RejectedHeadSha = "old-head",
+            RepairCount = 1,
+            ImplementerRunner = "claude",
+            CreatedAtUtc = DateTimeOffset.UtcNow.AddHours(-1),
+            UpdatedAtUtc = DateTimeOffset.UtcNow.AddMinutes(-20),
+        });
+        await harness.DbContext.SaveChangesAsync();
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var ledger = await harness.DbContext.PhaseLedger.SingleAsync();
+        Assert.Equal(5, ledger.PrNumber);
+        Assert.NotEqual(PhaseStages.Closed, ledger.Stage);
+        // The old verdict belonged to the closed life of this pull request and must
+        // not fence the reopened one.
+        Assert.Null(ledger.LastVerdict);
+        Assert.Null(ledger.RejectedHeadSha);
+        Assert.Equal(0, ledger.RepairCount);
+    }
+
     // The same hole as the reviewing stage, in its sibling: a repair that ended
     // without failing matched none of the escalation statuses and fell through to
     // "keep waiting", so the issue parked permanently behind an unmoved fence.

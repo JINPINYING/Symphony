@@ -270,7 +270,7 @@ function render() {
   elements.alert.innerHTML = renderAlert();
   renderWorkflowEditorSection();
   elements.metricGrid.innerHTML = renderMetricCards();
-  elements.liveRuns.innerHTML = renderLiveRuns();
+  elements.liveRuns.innerHTML = renderLiveRuns() + renderQueue();
   elements.issueDistribution.innerHTML = renderIssueDistribution();
   elements.activityFeed.innerHTML = renderActivityFeed();
   elements.trackedIssues.innerHTML = renderTrackedIssues();
@@ -754,6 +754,40 @@ function renderMetricCards() {
         <div class="metric-detail">${escapeHtml(detail)}</div>
       </div>
     </article>`).join("");
+}
+
+/* What is lined up, and why it has not started.
+ *
+ * The page showed what was running and what was tracked, and nothing about the
+ * space between - so an issue labelled and waiting looked the same as one nobody
+ * had queued. The owner asked to see the queue.
+ *
+ * The reason matters as much as the list. "Waiting for a free slot" is patience;
+ * "in the pipeline at wait for repair" is progress; an issue sitting labelled
+ * while the plane refuses to claim it is a fault, and those three read
+ * identically as a bare list of titles. */
+function renderQueue() {
+  const queue = state.snapshot?.queue || [];
+
+  const body = queue.length
+    ? `<ul class="queue-list">${queue.map((q, i) => `
+        <li class="queue-row">
+          <span class="queue-pos">${i + 1}</span>
+          <div class="queue-main">
+            <div class="queue-title">${q.url
+              ? `<a href="${escapeHtml(q.url)}" target="_blank" rel="noreferrer">${escapeHtml(q.issue_identifier)}</a>`
+              : escapeHtml(q.issue_identifier)} ${escapeHtml(q.title || "")}</div>
+            <div class="queue-why">${escapeHtml(q.waiting_on || "")}</div>
+          </div>
+        </li>`).join("")}</ul>`
+    : `<div class="queue-empty">Nothing is queued. Label an issue <span class="k">symphony-ready</span> and it appears here.</div>`;
+
+  return wrapPanel(`
+    <div class="panel-body p-6">
+      <div class="section-kicker">Up next</div>
+      <h2 class="section-title">Queue${queue.length ? ` <span class="queue-count">${queue.length}</span>` : ""}</h2>
+      <div class="mt-4">${body}</div>
+    </div>`);
 }
 
 function renderLiveRuns() {
