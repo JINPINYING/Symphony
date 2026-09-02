@@ -191,6 +191,16 @@ public sealed class ApiSmokeTests
             Assert.Contains(activity, entry =>
                 string.Equals(entry.Event, "notification", StringComparison.OrdinalIgnoreCase) &&
                 string.Equals(entry.Message, "Working on tests", StringComparison.Ordinal));
+
+            // The poll heartbeat filled 9 of 24 rows - more than a third of the feed
+            // spent saying the poller ran - and what it carries is already on the
+            // page as attention items. Agent reports have their own strip at the
+            // top, so listing them here is the same fact twice. Both stay in the log
+            // and in the raw view; only the operational feed is quieter.
+            Assert.DoesNotContain(activity, entry =>
+                string.Equals(entry.Event, "open_pull_requests_updated", StringComparison.OrdinalIgnoreCase));
+            Assert.DoesNotContain(activity, entry =>
+                string.Equals(entry.Event, "agent_activity_reported", StringComparison.OrdinalIgnoreCase));
         }
         finally
         {
