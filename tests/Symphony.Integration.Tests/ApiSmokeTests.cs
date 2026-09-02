@@ -351,6 +351,14 @@ public sealed class ApiSmokeTests
                 Assert.DoesNotContain($"id=\"{removed}\"", htmlContent, StringComparison.OrdinalIgnoreCase);
             }
 
+            // The roadmap had no container of its own: it built one at runtime and
+            // anchored it after the tracked-issues panel. Removing that panel made
+            // the anchor null, the mount returned early, and the roadmap silently
+            // disappeared - caught only because the owner asked to look at the page.
+            // It is declared in the markup now, and asserted, so it cannot leave
+            // again without a test saying so.
+            Assert.Contains("id=\"roadmap-panel\"", htmlContent, StringComparison.OrdinalIgnoreCase);
+
             var issueDetailElementMatch = System.Text.RegularExpressions.Regex.Match(
                 htmlContent,
                 @"<section[^>]*id=""issue-detail""[^>]*>",

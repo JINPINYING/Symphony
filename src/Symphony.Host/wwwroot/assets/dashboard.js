@@ -398,22 +398,18 @@ function renderRoadmap() {
 
 // The roadmap panel has no slot in the original markup, so it is appended once
 // after the tracked-issues panel and re-rendered in place thereafter.
+/* The roadmap has its own container in the markup now.
+ *
+ * It used to have none: it built one at runtime and anchored it after the
+ * tracked-issues panel. When that panel was removed the anchor became null, the
+ * function returned early, and the roadmap silently vanished from the page - the
+ * exact failure this page keeps being fixed for, committed by the fix itself. A
+ * panel that depends on an unrelated panel existing has a dependency nobody can
+ * see in the markup, which is why it is now declared where it lives. */
 function mountRoadmap() {
-  const html = renderRoadmap();
-  if (!html) return;
-  let host = document.getElementById("roadmap-panel");
-  if (!host) {
-    const anchorPanel = elements.trackedIssues?.closest(".panel") || elements.trackedIssues;
-    if (!anchorPanel || !anchorPanel.parentNode) return;
-    host = document.createElement("section");
-    host.id = "roadmap-panel";
-    host.className = anchorPanel.className;
-    // The anchor sits in a grid column, so an inherited class would squeeze the
-    // roadmap into half the width and wrap every row. Span the full track.
-    host.style.gridColumn = "1 / -1";
-    anchorPanel.parentNode.insertBefore(host, anchorPanel.nextSibling);
-  }
-  host.innerHTML = html;
+  const host = document.getElementById("roadmap-panel");
+  if (!host) return;
+  host.innerHTML = renderRoadmap() || "";
 }
 
 function renderAttention() {
