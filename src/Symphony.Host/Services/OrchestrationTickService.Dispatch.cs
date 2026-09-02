@@ -36,6 +36,7 @@ public sealed partial class OrchestrationTickService
         // and everything local keep their fast cadence - the scan is the only
         // expensive part, and now the only part slowed.
         var now = timeProvider.GetUtcNow();
+        await RestoreCandidateScanPauseAsync(now, cancellationToken);
         var dueForScan = now >= nextCandidateScanUtc;
 
         var issues = new List<NormalizedIssue>();
@@ -116,6 +117,19 @@ public sealed partial class OrchestrationTickService
                 logger.LogWarning(
                     "GitHub rate limit reached; candidate scanning pauses until {ResumeAtUtc:u}.",
                     nextCandidateScanUtc);
+
+                // Record the pause durably. The field above is in-memory and starts at
+                // MinValue, so without this a restart cancels the wait and the next
+                // tick scans every repository immediately - straight back into the
+                // limit, re-arming it.
+                //
+                // That is not a rare corner. Restarting is exactly what a person does
+                // when the dashboard reports that things need them, and a rate limit
+                // is precisely when it will say so. The limit is on the token, not on
+                // the process, so restarting cannot help and the plane should not
+                // behave as though it might.
+                RecordCandidateScanPause(nextCandidateScanUtc, lastFailureCause);
+                await dbContext.SaveChangesAsync(cancellationToken);
             }
 
             return;

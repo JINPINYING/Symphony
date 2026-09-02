@@ -62,6 +62,9 @@ public sealed partial class OrchestrationTickService
     private static readonly TimeSpan CandidateScanInterval = TimeSpan.FromSeconds(60);
     private DateTimeOffset nextCandidateScanUtc = DateTimeOffset.MinValue;
     private IReadOnlyList<NormalizedIssue> lastCandidates = [];
+    // Guards the one-time read of a pause recorded by a previous process.
+    // Checked every tick, so it must cost nothing after the first.
+    private bool candidateScanPauseRestored;
 
     private static readonly TimeSpan OpenPullRequestPollInterval = TimeSpan.FromMinutes(2);
     private DateTimeOffset nextOpenPullRequestPollUtc = DateTimeOffset.MinValue;

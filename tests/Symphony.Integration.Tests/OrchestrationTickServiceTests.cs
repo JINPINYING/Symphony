@@ -2442,6 +2442,68 @@ public sealed class OrchestrationTickServiceTests
     }
 
     [Fact]
+    public async Task RunTickAsync_ShouldKeepAnActiveRateLimitPauseAcrossAProcessRestart()
+    {
+        // A rate limit is on the token, not on the process. Restarting therefore
+        // cannot clear it, and the plane must not behave as though it might: the
+        // pause used to live only in a field that starts at MinValue, so a restart
+        // made the next tick due immediately and it scanned every repository straight
+        // back into the limit, re-arming it.
+        //
+        // This is not a rare corner. Restarting is exactly what a person does when the
+        // dashboard says things need attention, and a rate limit is precisely when it
+        // will say so.
+        var now = DateTimeOffset.Parse("2026-09-01T10:00:00Z");
+        var clock = new MutableTimeProvider(now);
+        var tracker = new FakeTrackerClient([]) { RateLimitOnFetchCandidates = true };
+
+        var before = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning),
+            timeProvider: clock);
+
+        string dbPath;
+        try
+        {
+            await before.Service.RunTickAsync(CancellationToken.None);
+            Assert.Single(tracker.CandidateFetchRepositories);
+            Assert.Single(await before.DbContext.EventLog
+                .Where(e => e.EventName == "candidate_scan_paused")
+                .ToListAsync());
+            dbPath = before.DbPath;
+        }
+        finally
+        {
+            // Dispose rather than `await using`: the replacement harness has to open
+            // the same database, and a restart means the first process is gone.
+            await before.DisposeAsync();
+        }
+
+        // The restart. A minute later - far inside the ten-minute pause - a brand new
+        // service opens the same database with a fresh in-memory schedule.
+        clock.Advance(TimeSpan.FromMinutes(1));
+        var afterTracker = new FakeTrackerClient([]) { RateLimitOnFetchCandidates = true };
+        await using var after = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: afterTracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning),
+            timeProvider: clock,
+            reuseDbPath: dbPath);
+
+        await after.Service.RunTickAsync(CancellationToken.None);
+
+        // The assertion that matters: GitHub was not asked again.
+        Assert.Empty(afterTracker.CandidateFetchRepositories);
+
+        // And the pause still ends when it was always going to, rather than being
+        // extended by the restart.
+        clock.Advance(TimeSpan.FromMinutes(10));
+        await after.Service.RunTickAsync(CancellationToken.None);
+        Assert.Single(afterTracker.CandidateFetchRepositories);
+    }
+
+    [Fact]
     public async Task RunTickAsync_ShouldEscalateRetryThatStaysDueAndUndispatchedPastTheWedgeThreshold()
     {
         var now = DateTimeOffset.Parse("2026-09-01T10:00:00Z");
@@ -2640,6 +2702,8 @@ public sealed class OrchestrationTickServiceTests
             Service = service;
         }
 
+        public string DbPath => dbPath;
+
         public SymphonyDbContext DbContext { get; }
         public FakeTrackerClient Tracker { get; }
         public FakeWorkspaceManager WorkspaceManager { get; }
@@ -2650,15 +2714,20 @@ public sealed class OrchestrationTickServiceTests
             WorkflowDefinition workflowDefinition,
             FakeTrackerClient tracker,
             FakeIssueExecutionCoordinator coordinator,
-            TimeProvider? timeProvider = null)
+            TimeProvider? timeProvider = null,
+            string? reuseDbPath = null)
         {
-            var dbPath = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid():N}-orchestration.db");
+            var dbPath = reuseDbPath ?? Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid():N}-orchestration.db");
             var options = new DbContextOptionsBuilder<SymphonyDbContext>()
                 .UseSqlite($"Data Source={dbPath}")
                 .Options;
 
             var dbContext = new SymphonyDbContext(options);
-            await dbContext.Database.EnsureDeletedAsync();
+            if (reuseDbPath is null)
+            {
+                await dbContext.Database.EnsureDeletedAsync();
+            }
+
             await dbContext.Database.EnsureCreatedAsync();
 
             var workspaceManager = new FakeWorkspaceManager();
@@ -2971,10 +3040,23 @@ public sealed class OrchestrationTickServiceTests
 
         public bool FetchCandidateIssuesCalled { get; private set; }
 
+        /// <summary>Fail candidate fetch the way a real rate limit does.</summary>
+        public bool RateLimitOnFetchCandidates { get; set; }
+
         public Task<IReadOnlyList<NormalizedIssue>> FetchCandidateIssuesAsync(TrackerQuery query, CancellationToken cancellationToken = default)
         {
             var repository = $"{query.Owner}/{query.Repo}";
             CandidateFetchRepositories.Add(repository);
+
+            if (RateLimitOnFetchCandidates)
+            {
+                // The distinction under test. A generic outage retries next tick; a
+                // rate limit must pause, because the limit is on the token and asking
+                // again only spends the request that would have worked later.
+                throw new GitHubTrackerException(
+                    GitHubTrackerException.RateLimitedCode,
+                    "GitHub GraphQL: API rate limit already exceeded");
+            }
 
             if (throwOnFetchCandidates || RepositoriesThatFail.Contains(repository))
             {
