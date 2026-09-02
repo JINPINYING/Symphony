@@ -34,6 +34,7 @@ const state = {
   // Sections the reader has opened. Held in state rather than in the DOM because
   // the page re-renders every 15 seconds, which would slam a <details> shut mid-read.
   expanded: { roadmap: false, activity: false, queue: false, advanced: false },
+  expandedProjects: {},
   error: null,
   issueError: null,
   lastLoadedAt: null
@@ -66,6 +67,14 @@ document.addEventListener("click", async event => {
     // the flag is set. Deliberately NOT queueRefresh: this is a view change, not
     // a control action, and it must not poke the engine.
     await loadDashboard();
+    return;
+  }
+
+  const projectToggle = event.target.closest("[data-action='toggle-project']");
+  if (projectToggle?.dataset.project) {
+    const key = projectToggle.dataset.project;
+    state.expandedProjects[key] = !state.expandedProjects[key];
+    render();
     return;
   }
 
@@ -922,12 +931,14 @@ function renderAttentionPanel() {
   const rows = items.map(i => {
     const s = String(i.severity || "").toLowerCase() === "down" ? "down" : "attention";
     const isPr = /\bPR\b|pull request/i.test(`${i.label || ""} ${i.url || ""}`);
+    /* One line per item. The "why" is a hover tooltip here rather than a
+       paragraph: this panel exists to be counted at a glance, and the same
+       detail is printed in full in the queue panel below, so nothing is lost. */
     return `
-      <div class="wt-item sev-${s}">
+      <div class="wt-item is-tight sev-${s}" title="${escapeAttribute(i.detail || "")}">
         <span class="wt-badge sev-${s}">ATTENTION</span>
         <div class="wt-item-body">
-          <div class="wt-item-title">${escapeHtml(i.label || "")}</div>
-          <div class="wt-item-why">${escapeHtml(i.detail || "")}</div>
+          <div class="wt-item-title wt-clip">${escapeHtml(i.label || "")}</div>
         </div>
         <div class="wt-item-right">
           ${actionButton(i.url, isPr ? "Open PR" : "Open issue")}
@@ -1223,6 +1234,7 @@ function renderRoadmapPanel() {
     .filter(p => ["FAILURE", "ERROR"].includes(String(p.checks_state || "").toUpperCase()));
 
   const body = groups.map(g => {
+    const expandedProject = !!state.expandedProjects[g.name || ""];
     const activeAt = g.items.findIndex(i => i.status === "active");
     /* Collapsed shows where the work IS: the stage before, the active one, and
        the next two. The full history is a weekly question, not a per-glance one. */
@@ -1232,21 +1244,37 @@ function renderRoadmapPanel() {
         ? g.items.slice(Math.max(0, activeAt - 1), activeAt + 3)
         : g.items.filter(i => i.status !== "done").slice(0, 3);
 
+    const statusWord = e => e.status === "done" ? "Complete" : e.status === "active" ? "In progress" : "Planned";
+    const stepClass = e => e.status === "done" ? "is-done" : e.status === "active" ? "is-active" : "";
+    const stepMark = e => e.status === "done" ? "&#10003;" : String(g.items.indexOf(e) + 1);
+
     const steps = slice.map((entry, idx) => {
-      const cls = entry.status === "done" ? "is-done" : entry.status === "active" ? "is-active" : "";
-      const word = entry.status === "done" ? "Complete" : entry.status === "active" ? "In progress" : "Planned";
-      const mark = entry.status === "done"
-        ? "&#10003;"
-        : String(g.items.indexOf(entry) + 1);
       /* Cut on a word boundary: a hard slice left labels ending in a dangling dash. */
       const raw = entry.milestone || entry.title || "";
       const label = raw.length <= 22 ? raw : `${raw.slice(0, 22).replace(/[\s—-]+\S*$/, "")}…`;
+      /* The milestone is a name, not a description - "Stage 2" says nothing about
+         what stage 2 is. The description lives in title, so it goes on the hover
+         and, for the stage actually being worked, in the caption below the rail. */
       return `${idx ? `<span class="wt-step-bar" aria-hidden="true"></span>` : ""}
-        <div class="wt-step ${cls}">
-          <span class="wt-step-dot" aria-hidden="true">${mark}</span>
-          <div class="wt-step-txt"><b>${escapeHtml(label)}</b><span>${word}</span></div>
+        <div class="wt-step ${stepClass(entry)}" title="${escapeAttribute(entry.title || "")}">
+          <span class="wt-step-dot" aria-hidden="true">${stepMark(entry)}</span>
+          <div class="wt-step-txt"><b>${escapeHtml(label)}</b><span>${statusWord(entry)}</span></div>
         </div>`;
     }).join("");
+
+    /* Every stage with its description, so "what is stage 2 for" is answerable
+       without leaving the panel or hovering anything. */
+    const detail = expandedProject
+      ? `<div class="wt-stage-list">${g.items.map(entry => `
+          <div class="wt-stage ${stepClass(entry)}">
+            <span class="wt-step-dot" aria-hidden="true">${stepMark(entry)}</span>
+            <div class="wt-stage-txt">
+              <b>${escapeHtml(entry.milestone || "")}</b>
+              <span class="wt-stage-status">${statusWord(entry)}</span>
+              <div class="wt-stage-why">${escapeHtml(entry.title || "")}</div>
+            </div>
+          </div>`).join("")}</div>`
+      : "";
 
     /* Attribute an item to a project only on a distinctive word from its name.
        Splitting on the first token matched "the" against half the page. */
@@ -1260,15 +1288,26 @@ function renderRoadmapPanel() {
       reds ? dotLabel("down", `${reds} ${reds === 1 ? "PR" : "PRs"} failing checks`) : ""
     ].filter(Boolean).join("");
 
+    const activeEntry = activeAt >= 0 ? g.items[activeAt] : null;
+
     return `
       <div class="wt-proj">
         <div class="wt-proj-head">
-          <span aria-hidden="true" style="color:var(--wt-ink-3)">${icon("chevronDown", 15)}</span>
-          <span class="wt-proj-name">${escapeHtml(g.name || "Roadmap")}</span>
+          <button type="button" class="wt-disc" data-action="toggle-project"
+                  data-project="${escapeAttribute(g.name || "")}"
+                  aria-expanded="${expandedProject ? "true" : "false"}"
+                  title="${expandedProject ? "Hide every stage" : "Show every stage and what it is for"}">
+            <span class="wt-disc-ico ${expandedProject ? "is-open" : ""}" aria-hidden="true">${icon("chevron", 15)}</span>
+            <span class="wt-proj-name">${escapeHtml(g.name || "Roadmap")}</span>
+          </button>
           ${activeAt >= 0 ? `<span class="wt-proj-tag">Current focus</span>` : ""}
           <span class="wt-count">${g.items.filter(i => i.status === "done").length}/${g.items.length} complete</span>
         </div>
         <div class="wt-steps">${steps}</div>
+        ${activeEntry?.title
+          ? `<div class="wt-proj-sum"><b>${escapeHtml(activeEntry.milestone || "Now")}:</b> ${escapeHtml(activeEntry.title)}</div>`
+          : ""}
+        ${detail}
         <div class="wt-proj-foot">
           ${tallies ? `<span>Active items</span><span class="wt-tally">${tallies}</span>` : `<span>No open items on this project.</span>`}
         </div>
