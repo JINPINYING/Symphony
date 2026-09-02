@@ -2,7 +2,6 @@ const elements = {
   heroPanel: document.getElementById("hero-panel"),
   alert: document.getElementById("dashboard-alert"),
   workflowEditor: document.getElementById("workflow-editor"),
-  metricGrid: document.getElementById("metric-grid"),
   liveRuns: document.getElementById("live-runs"),
   activityFeed: document.getElementById("activity-feed"),
   instanceStatus: document.getElementById("instance-status"),
@@ -34,6 +33,9 @@ const state = {
   refreshQueued: false,
   autoRefresh: true,
   showRawEvents: false,
+  // Sections the reader has opened. Held in state rather than in the DOM because
+  // the page re-renders every 15 seconds, which would slam a <details> shut mid-read.
+  expanded: { roadmap: false, instance: false, telemetry: false },
   error: null,
   issueError: null,
   lastLoadedAt: null
@@ -66,6 +68,13 @@ document.addEventListener("click", async event => {
     // the flag is set. Deliberately NOT queueRefresh: this is a view change, not
     // a control action, and it must not poke the engine.
     await loadDashboard();
+    return;
+  }
+
+  const sectionToggle = event.target.closest("[data-action='toggle-section']");
+  if (sectionToggle?.dataset.section) {
+    state.expanded[sectionToggle.dataset.section] = !state.expanded[sectionToggle.dataset.section];
+    render();
     return;
   }
 
@@ -227,7 +236,6 @@ function render() {
   elements.heroPanel.innerHTML = renderAttention() + renderHeroPanel() + wrapPanel(renderStaff());
   elements.alert.innerHTML = renderAlert();
   renderWorkflowEditorSection();
-  elements.metricGrid.innerHTML = renderMetricCards();
   elements.liveRuns.innerHTML = renderLiveRuns() + renderQueue();
   elements.activityFeed.innerHTML = renderActivityFeed();
   mountRoadmap();
@@ -375,12 +383,25 @@ function renderRoadmap() {
 
   const groups = roadmapGroups(items);
   const grouped = groups.some(g => g.name);
+  const open = state.expanded.roadmap;
+
+  /* Collapsed, a roadmap answers "where is the work" - which is the active stage
+   * and the one that follows it. Twenty-one rows answer "what is the whole plan",
+   * a question asked once a week and worth a click, not two thirds of the page
+   * every time. Done stages are counted rather than listed: their names have
+   * stopped carrying information, only their number still does. */
+  const visible = g => {
+    if (open) return g.items;
+    const activeAt = g.items.findIndex(i => i.status === "active");
+    if (activeAt < 0) return g.items.filter(i => i.status !== "done").slice(0, 2);
+    return g.items.slice(activeAt, activeAt + 2);
+  };
 
   const body = grouped
     ? groups.map(g => `
         ${g.name ? `<div class="rm-group"><span class="rm-group-name">${escapeHtml(g.name)}</span><span class="rm-group-tally">${escapeHtml(roadmapTally(g.items))}</span></div>` : ""}
-        <ul class="rm-list">${g.items.map(roadmapRow).join("")}</ul>`).join("")
-    : `<ul class="rm-list">${items.map(roadmapRow).join("")}</ul>`;
+        <ul class="rm-list">${visible(g).map(roadmapRow).join("")}</ul>`).join("")
+    : `<ul class="rm-list">${(open ? items : items.filter(i => i.status !== "done").slice(0, 3)).map(roadmapRow).join("")}</ul>`;
 
   return `
     <div class="panel-body p-6">
@@ -389,7 +410,8 @@ function renderRoadmap() {
           <div class="section-kicker">Roadmap</div>
           <h2 class="section-title">Where this is going</h2>
         </div>
-        ${grouped ? "" : `<span class="glass-badge">${escapeHtml(roadmapTally(items))}</span>`}
+        <button type="button" class="sec-toggle" data-action="toggle-section" data-section="roadmap">${
+          open ? "Show less" : `Show all ${items.length}`}</button>
       </div>
       ${body}
     </div>`;
@@ -524,6 +546,9 @@ function renderHeroPanel() {
         <span class="ms-fact">${counts ? `${escapeHtml(formatNumber(counts.running))} active &middot; ${escapeHtml(formatNumber(counts.retrying))} retrying &middot; ${escapeHtml(formatNumber(counts.tracked))} tracked` : "waiting for telemetry"}</span>
         <span class="ms-fact">polls every ${escapeHtml(formatDurationFromMilliseconds(workflow?.polling?.intervalMs || state.runtime?.runtimeDefaults?.polling?.intervalMs || 0))}</span>
         <span class="ms-fact">updated ${escapeHtml(formatRelativeTime(state.snapshot?.generated_at || state.lastLoadedAt))}</span>
+        <!-- Spend was a metric card holding a whole band for one number. It belongs
+             beside the other facts, not above them. -->
+        <span class="ms-fact">${escapeHtml(formatNumber(state.snapshot?.codex_totals?.total_tokens || 0))} tokens</span>
       </div>
       <div class="ms-controls">
         <label class="ms-auto"><input id="auto-refresh" type="checkbox"><span>Auto refresh</span></label>
@@ -681,36 +706,6 @@ function renderWorkflowEditorFeedback(draft) {
   }
 
   return banners.length ? `<div class="space-y-4">${banners.join("")}</div>` : "";
-}
-
-function renderMetricCards() {
-  const snapshot = state.snapshot;
-  const runtime = state.runtime;
-  const maxConcurrent = runtime?.workflow?.agent?.maxConcurrentAgents || runtime?.runtimeDefaults?.agent?.maxConcurrentAgents || 0;
-  const utilization = maxConcurrent > 0 && snapshot ? Math.round((snapshot.counts.running / maxConcurrent) * 100) : 0;
-  /* Only what would change what the reader does next.
-   *
-   * Removed: "Tracked issues", a count of mostly-closed history that grows
-   * forever and can never prompt an action; "Codex runtime", cumulative seconds
-   * nobody decides anything on; and "Lease state", an internal coordination row
-   * that is diagnostic rather than status. "Running agents" and "Retry queue"
-   * both said again what the strip above already says, and a number repeated in
-   * two places is one more place for them to disagree.
-   *
-   * Token spend stays because the owner set a per-issue budget of 10M and this is
-   * the only place spend is visible at all. */
-  const metrics = [
-    ["Total tokens", formatNumber(snapshot?.codex_totals?.total_tokens || 0), `${formatNumber(snapshot?.codex_totals?.input_tokens || 0)} in / ${formatNumber(snapshot?.codex_totals?.output_tokens || 0)} out`]
-  ];
-
-  return metrics.map(([label, value, detail]) => `
-    <article class="metric-card">
-      <div class="panel-body">
-        <div class="metric-label">${escapeHtml(label)}</div>
-        <div class="metric-value">${escapeHtml(value)}</div>
-        <div class="metric-detail">${escapeHtml(detail)}</div>
-      </div>
-    </article>`).join("");
 }
 
 /* What is lined up, and why it has not started.
