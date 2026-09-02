@@ -30,12 +30,19 @@ public sealed partial class OrchestrationTickService
         // skipped rather than taking the tick down with it: with more than one
         // tracked, an outage on the plane's own backlog must not stop the product
         // queue, and vice versa.
+        // Only ask GitHub on the scan clock. Between scans the tick runs in full on
+        // the candidates it already knows about, so dispatch, phases, reconciliation
+        // and everything local keep their fast cadence - the scan is the only
+        // expensive part, and now the only part slowed.
+        var now = timeProvider.GetUtcNow();
+        var dueForScan = now >= nextCandidateScanUtc;
+
         var issues = new List<NormalizedIssue>();
         var reachedAnyRepository = false;
         string? lastFailureCause = null;
         var lastFailureTransient = false;
 
-        foreach (var repositoryQuery in queries.All)
+        foreach (var repositoryQuery in dueForScan ? queries.All : [])
         {
             try
             {
@@ -78,13 +85,24 @@ public sealed partial class OrchestrationTickService
 
         // Reachability is about GitHub, not about one repository: reaching any of
         // them proves the tracker is up, and only reaching none is an outage.
-        if (reachedAnyRepository)
+        if (!dueForScan)
+        {
+            // No scan this tick, so nothing was learned about GitHub either way -
+            // reachability must not be touched, or a quiet tick would look like a
+            // successful probe and mask a real outage.
+            issues.AddRange(lastCandidates);
+        }
+        else if (reachedAnyRepository)
         {
             trackerReachability.RecordSuccess();
+            nextCandidateScanUtc = now + CandidateScanInterval;
+            lastCandidates = issues;
         }
         else
         {
             trackerReachability.RecordFailure(lastFailureCause ?? "unknown", lastFailureTransient);
+            // Retry on the next tick rather than waiting out the interval: an
+            // outage should recover as soon as it can, not on the slow clock.
             return;
         }
 

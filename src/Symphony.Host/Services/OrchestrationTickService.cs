@@ -39,6 +39,23 @@ public sealed partial class OrchestrationTickService
     // per tick would spend rate limit on a question whose answer rarely changes.
     internal const string OpenPullRequestsEventName = "open_pull_requests_updated";
     private const int OpenPullRequestLimit = 25;
+    // The candidate scan asks GitHub "is there new work?", and it is the expensive
+    // question: one GraphQL query per tracked repository, every time.
+    //
+    // Multi-repository tracking turned that from one query a tick into three, and
+    // on a 15-second tick that is 720 an hour before anything else - which
+    // exhausted the 5000-point GraphQL budget twice on 2026-09-01 and left the
+    // plane blind until the window reset. Raising the whole tick to 60s fixed the
+    // spend and cost something that was not the problem: phase transitions advance
+    // on the tick, so every verify, review and merge step also waited a minute.
+    //
+    // The two are separate questions and now have separate clocks, exactly as the
+    // open-pull-request poll already did. The tick stays fast for everything local
+    // and for advancing work already known about; only the GitHub scan is slow.
+    private static readonly TimeSpan CandidateScanInterval = TimeSpan.FromSeconds(60);
+    private DateTimeOffset nextCandidateScanUtc = DateTimeOffset.MinValue;
+    private IReadOnlyList<NormalizedIssue> lastCandidates = [];
+
     private static readonly TimeSpan OpenPullRequestPollInterval = TimeSpan.FromMinutes(2);
     private DateTimeOffset nextOpenPullRequestPollUtc = DateTimeOffset.MinValue;
 
