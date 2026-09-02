@@ -1,3 +1,4 @@
+using Symphony.Infrastructure.Tracker.GitHub;
 using Microsoft.EntityFrameworkCore;
 using Symphony.Core.Models;
 using Symphony.Infrastructure.Persistence.Sqlite.Entities;
@@ -41,6 +42,7 @@ public sealed partial class OrchestrationTickService
         var reachedAnyRepository = false;
         string? lastFailureCause = null;
         var lastFailureTransient = false;
+        var rateLimited = false;
 
         foreach (var repositoryQuery in dueForScan ? queries.All : [])
         {
@@ -61,6 +63,7 @@ public sealed partial class OrchestrationTickService
                 // nobody glancing at the page would ever find it. Record the cause.
                 lastFailureTransient = TrackerReachability.IsTransientConnectivity(ex);
                 lastFailureCause = TrackerReachability.DescribeCause(ex);
+                rateLimited |= GitHubTrackerException.IsRateLimit(ex);
 
                 // Connectivity blips recover within a tick or two and cost nothing;
                 // logging each at Error teaches the reader that red means nothing.
@@ -101,8 +104,20 @@ public sealed partial class OrchestrationTickService
         else
         {
             trackerReachability.RecordFailure(lastFailureCause ?? "unknown", lastFailureTransient);
-            // Retry on the next tick rather than waiting out the interval: an
-            // outage should recover as soon as it can, not on the slow clock.
+
+            // An outage should recover as soon as it can, so the default is to
+            // retry on the next tick rather than wait out the interval. A rate
+            // limit is the exception: it clears on a clock and no amount of asking
+            // brings that forward, so asking again only spends the request that
+            // would have worked later.
+            if (rateLimited)
+            {
+                nextCandidateScanUtc = now + RateLimitBackoff;
+                logger.LogWarning(
+                    "GitHub rate limit reached; candidate scanning pauses until {ResumeAtUtc:u}.",
+                    nextCandidateScanUtc);
+            }
+
             return;
         }
 

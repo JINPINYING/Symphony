@@ -144,11 +144,20 @@ public sealed class PhaseOrchestrator(
                 continue;
             }
 
-            // Nothing new to enter: the settled ledger already describes this PR.
-            if (existingLedger is not null && existingLedger.PrNumber == prNumber.Value)
-            {
-                continue;
-            }
+            // No guard on the pull request number here, and the absence is the
+            // point.
+            //
+            // Reaching this line means two things at once: the ledger is terminal
+            // (a working one returned above) and ResolvePullRequestNumberAsync
+            // found an OPEN pull request, which is the only kind it looks for. A
+            // settled ledger naming a pull request that is open again is a reopen,
+            // not a duplicate.
+            //
+            // Skipping when the numbers matched read as "nothing new to enter" and
+            // was wrong for exactly that case: PR #135 was closed at 11:57, the
+            // ledger recorded closed, the pull request was reopened at 12:11, and
+            // nothing would ever have looked at it again. The panel said it had
+            // fallen out of the pipeline, which was true and had no way to recover.
 
             var nowUtc = timeProvider.GetUtcNow();
             var runner = AgentRunnerNames.IsKnown(latestRun.Runner) ? latestRun.Runner : AgentRunnerNames.Codex;
