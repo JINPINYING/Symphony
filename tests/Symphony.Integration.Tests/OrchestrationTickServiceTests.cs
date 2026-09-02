@@ -2726,9 +2726,14 @@ public sealed class OrchestrationTickServiceTests
             if (reuseDbPath is null)
             {
                 await dbContext.Database.EnsureDeletedAsync();
+                await dbContext.Database.EnsureCreatedAsync();
             }
 
-            await dbContext.Database.EnsureCreatedAsync();
+            // Reusing a path means the schema is already there - this models a process
+            // restart against an existing database, not a new install. Calling
+            // EnsureCreated again is not harmless: on Linux it threw
+            // `table "directive_log" already exists`, while on Windows it happened to
+            // no-op, so the mistake passed locally and failed only in CI.
 
             var workspaceManager = new FakeWorkspaceManager();
             coordinator.Attach(dbContext, dbPath);
