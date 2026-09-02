@@ -273,6 +273,11 @@ public sealed partial class OrchestrationTickService
                 continue;
             }
 
+            if (await TryBlockUnresumablePhaseRetryAsync(retryEntry, instanceId, cancellationToken))
+            {
+                continue;
+            }
+
             // The retry already holds a reservation, so it must not be counted against
             // itself; it is resuming its own slot, not asking for a second one.
             var otherReservations = CountReservationsByState(reservedStateByIssueId, excludeIssueId: retryIssue.Id);
@@ -696,6 +701,113 @@ public sealed partial class OrchestrationTickService
                string.Equals(phase, RunPhaseNames.Implementation, StringComparison.OrdinalIgnoreCase);
     }
 
+    // What this dispatch actually runs: the phase, and the context that makes that
+    // phase mean something.
+    private readonly record struct ResolvedDispatch(
+        string Phase,
+        string? DirectiveAction,
+        string? DirectiveInstructions,
+        string? PhasePrompt,
+        string? PhaseRunner);
+
+    // A retry passes neither a directive nor a phase dispatch — it is asking for the
+    // run that just failed to be run again. Every field below therefore falls back to
+    // what the run row already records rather than to a fresh implementation.
+    //
+    // The old expression stopped at `?? RunPhaseNames.Implementation`, so a retry of
+    // a directive-dispatched review silently became attempt 2 of an implementation and
+    // rewrote Phase to say so. The acknowledgement had already told the owner `review`
+    // was dispatched, which made the record read as "review ran and produced nothing"
+    // rather than "review never ran" — indistinguishable from outside, and the reason
+    // the command center caps review dispatches at one per head.
+    //
+    // Resuming the phase name alone would only move the lie: the worker would still be
+    // handed the implementation prompt, now under a `review` label. So the prompt, the
+    // directive and the forced runner resume with it. A row that has the phase and
+    // none of the context cannot be resumed at all and never reaches here — see
+    // TryBlockUnresumablePhaseRetryAsync.
+    private static ResolvedDispatch ResolveDispatchContext(
+        RunEntity? existingRun,
+        DirectiveDispatchContext? directive,
+        PhaseDispatchRequest? phaseDispatch)
+    {
+        // A directive or phase dispatch is a new instruction and replaces whatever the
+        // reused row was carrying; only a bare re-dispatch resumes.
+        var resumed = directive is null && phaseDispatch is null ? existingRun : null;
+
+        var phase = phaseDispatch?.Phase
+            ?? directive?.Phase
+            ?? (string.IsNullOrWhiteSpace(resumed?.Phase) ? null : resumed!.Phase)
+            ?? RunPhaseNames.Implementation;
+
+        return new ResolvedDispatch(
+            phase,
+            directive?.Action ?? resumed?.DirectiveAction,
+            directive?.Instructions ?? resumed?.DirectiveInstructions,
+            phaseDispatch?.Prompt ?? resumed?.PhasePrompt,
+            phaseDispatch?.RunnerName ?? resumed?.PhaseRunner);
+    }
+
+    private static bool HasResumableDispatchContext(RunEntity run)
+    {
+        return !string.IsNullOrWhiteSpace(run.PhasePrompt) ||
+               !string.IsNullOrWhiteSpace(run.DirectiveAction) ||
+               !string.IsNullOrWhiteSpace(run.DirectiveInstructions);
+    }
+
+    // Fail closed on a phase that cannot be resumed. Rows written before the dispatch
+    // context was durable carry a phase and nothing behind it, and the ordinary retry
+    // path has no way to rebuild a review prompt: running one would either reimplement
+    // under a `review` label or, before this, relabel itself `implementation` and
+    // reimplement openly. Both spend a run and mislead the reader, so the retry stops
+    // here and asks for a person instead.
+    //
+    // Phase-orchestrated runs do not normally arrive here at all — an issue with a
+    // live ledger is skipped by the retry loop, and its owner re-dispatches it from
+    // the ledger. This covers the case where ownership has already ended.
+    private async Task<bool> TryBlockUnresumablePhaseRetryAsync(
+        RetryQueueEntity retryEntry,
+        string instanceId,
+        CancellationToken cancellationToken)
+    {
+        var retryingRun = await FindLatestRunWithStatusAsync(
+            retryEntry.IssueId,
+            RunStatusNames.Retrying,
+            cancellationToken);
+        if (retryingRun is null ||
+            IsImplementationPhase(retryingRun.Phase) ||
+            HasResumableDispatchContext(retryingRun))
+        {
+            return false;
+        }
+
+        var blockReason =
+            $"Issue {retryEntry.IssueIdentifier} has a pending retry of a '{retryingRun.Phase}' run, but nothing " +
+            "durable records what that phase was asked to do. Retrying it would run the ordinary implementation " +
+            "prompt while the run still reported the earlier phase, so the retry is blocked; the Commander must " +
+            "dispatch the phase explicitly.";
+
+        dbContext.EventLog.Add(new EventLogEntity
+        {
+            IssueId = retryEntry.IssueId,
+            IssueIdentifier = retryEntry.IssueIdentifier,
+            RunId = retryingRun.Id,
+            EventName = "phase_retry_unresumable",
+            Level = LogLevel.Warning.ToString(),
+            Message = blockReason,
+            OccurredAtUtc = timeProvider.GetUtcNow()
+        });
+
+        await EscalateRunToCommandCenterAsync(
+            retryingRun,
+            retryEntry.IssueId,
+            retryEntry.IssueIdentifier,
+            instanceId,
+            blockReason,
+            cancellationToken);
+        return true;
+    }
+
     private static bool HasOpenPullRequest(NormalizedIssue issue)
     {
         return issue.PullRequests.Any(pullRequest =>
@@ -807,7 +919,7 @@ public sealed partial class OrchestrationTickService
                 (runEntity.Status == RunStatusNames.Running || runEntity.Status == RunStatusNames.Retrying))
             .SingleOrDefaultAsync(cancellationToken);
 
-        var dispatchPhase = phaseDispatch?.Phase ?? directive?.Phase ?? RunPhaseNames.Implementation;
+        var dispatch = ResolveDispatchContext(run, directive, phaseDispatch);
         if (run is null)
         {
             run = new RunEntity
@@ -819,7 +931,11 @@ public sealed partial class OrchestrationTickService
                 Status = RunStatusNames.Running,
                 State = issue.State,
                 Repository = issue.Repository,
-                Phase = dispatchPhase,
+                Phase = dispatch.Phase,
+                DirectiveAction = dispatch.DirectiveAction,
+                DirectiveInstructions = dispatch.DirectiveInstructions,
+                PhasePrompt = dispatch.PhasePrompt,
+                PhaseRunner = dispatch.PhaseRunner,
                 CurrentRetryAttempt = attempt,
                 StartedAtUtc = nowUtc
             };
@@ -831,7 +947,11 @@ public sealed partial class OrchestrationTickService
             run.Status = RunStatusNames.Running;
             run.State = issue.State;
             run.Repository = issue.Repository;
-            run.Phase = dispatchPhase;
+            run.Phase = dispatch.Phase;
+            run.DirectiveAction = dispatch.DirectiveAction;
+            run.DirectiveInstructions = dispatch.DirectiveInstructions;
+            run.PhasePrompt = dispatch.PhasePrompt;
+            run.PhaseRunner = dispatch.PhaseRunner;
             run.CurrentRetryAttempt = attempt;
             run.CompletedAtUtc = null;
             run.RequestedStopReason = null;
@@ -873,7 +993,11 @@ public sealed partial class OrchestrationTickService
             RunAttemptId = runAttempt.Id,
             EventName = "issue_dispatched",
             Level = LogLevel.Information.ToString(),
-            Message = $"Issue {issue.Identifier} dispatched with attempt {(attempt.HasValue ? attempt.Value.ToString() : "initial")}.",
+            // The phase belongs in the message. Reading back the incident in Symphony#50
+            // meant inferring which phase each dispatch ran at from the run row it had
+            // already overwritten; the log said only "attempt 2".
+            Message = $"Issue {issue.Identifier} dispatched at phase '{dispatch.Phase}' with attempt " +
+                      $"{(attempt.HasValue ? attempt.Value.ToString() : "initial")}.",
             OccurredAtUtc = nowUtc
         });
         AddIssueEvent(
@@ -896,11 +1020,16 @@ public sealed partial class OrchestrationTickService
                 attempt,
                 issue,
                 workflowDefinition,
-                DirectiveInstructions: directive?.Instructions,
-                DirectiveAction: directive?.Action,
-                DirectivePhase: directive?.Phase,
-                PromptOverride: phaseDispatch?.Prompt,
-                RunnerOverride: phaseDispatch?.RunnerName ?? runnerOverride),
+                DirectiveInstructions: dispatch.DirectiveInstructions,
+                DirectiveAction: dispatch.DirectiveAction,
+                DirectivePhase: dispatch.Phase,
+                PromptOverride: dispatch.PhasePrompt,
+                // A resumed phase runner beats the quota fallback. The fallback is
+                // "not the vendor that just ran out", which for a review is the
+                // vendor that implemented — the one runner ADR-006 forbids. Retrying
+                // into the same limit until the attempt budget escalates is the
+                // honest failure; reviewing your own work is not.
+                RunnerOverride: dispatch.PhaseRunner ?? runnerOverride),
             cancellationToken);
 
         if (!started)
