@@ -265,7 +265,8 @@ public sealed class RuntimeStateService(
             configuredRunners, runningRuns, recentRuns, generatedAt,
             schedulers: watchedTasks,
             sessions: agentActivity,
-            decisionsWaitingOnOwner: attention.Items.Count);
+            decisionsWaitingOnOwner: attention.Items.Count,
+            implementerRunner: configuredRunners.FirstOrDefault());
 
         return new
         {
