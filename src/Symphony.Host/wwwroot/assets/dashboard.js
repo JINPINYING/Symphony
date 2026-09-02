@@ -4,10 +4,7 @@ const elements = {
   workflowEditor: document.getElementById("workflow-editor"),
   metricGrid: document.getElementById("metric-grid"),
   liveRuns: document.getElementById("live-runs"),
-  issueDistribution: document.getElementById("issue-distribution"),
   activityFeed: document.getElementById("activity-feed"),
-  trackedIssues: document.getElementById("tracked-issues"),
-  issueDetail: document.getElementById("issue-detail"),
   instanceStatus: document.getElementById("instance-status"),
   rateLimits: document.getElementById("rate-limits")
 };
@@ -47,12 +44,6 @@ let refreshHandle = null;
 const baseDocumentTitle = document.title;
 
 document.addEventListener("click", async event => {
-  const issueButton = event.target.closest("[data-issue-identifier]");
-  if (issueButton?.dataset.issueIdentifier) {
-    await selectIssue(issueButton.dataset.issueIdentifier);
-    return;
-  }
-
   if (event.target.closest("[data-action='reload-workflow']")) {
     await reloadWorkflowEditor();
     return;
@@ -94,13 +85,6 @@ document.addEventListener("input", event => {
   state.workflowNotice = null;
   state.workflowError = null;
   syncWorkflowEditorChrome();
-});
-
-window.addEventListener("hashchange", () => {
-  const issueIdentifier = getIssueFromHash();
-  if (issueIdentifier && issueIdentifier !== state.selectedIssue) {
-    void selectIssue(issueIdentifier);
-  }
 });
 
 void loadDashboard();
@@ -227,14 +211,8 @@ async function loadDashboard({ queueRefresh = false } = {}) {
         : "Workflow editor could not be loaded.";
     }
 
-    const preferredIssue = getIssueFromHash() || state.selectedIssue || collectIssueIdentifiers(state.snapshot)[0] || null;
-    if (preferredIssue) {
-      await selectIssue(preferredIssue, false);
-    } else {
-      state.selectedIssue = null;
-      state.issueDetail = null;
-      state.issueError = null;
-    }
+    // The issue-detail panel is gone, and with it a per-poll /api/v1/{issue} call
+    // that existed only to fill it.
   } catch (error) {
     state.error = error instanceof Error ? error.message : "Dashboard data could not be loaded.";
   } finally {
@@ -244,26 +222,6 @@ async function loadDashboard({ queueRefresh = false } = {}) {
   }
 }
 
-async function selectIssue(issueIdentifier, updateHash = true) {
-  state.selectedIssue = issueIdentifier;
-  state.issueError = null;
-
-  if (updateHash) {
-    history.replaceState(null, "", `#issue/${encodeURIComponent(issueIdentifier)}`);
-  }
-
-  render();
-
-  try {
-    state.issueDetail = await fetchJson(`/api/v1/${encodeURIComponent(issueIdentifier)}`);
-  } catch (error) {
-    state.issueDetail = null;
-    state.issueError = error instanceof Error ? error.message : `Issue ${issueIdentifier} could not be loaded.`;
-  }
-
-  render();
-}
-
 function render() {
   updateDocumentTitle();
   elements.heroPanel.innerHTML = renderAttention() + renderHeroPanel() + wrapPanel(renderStaff());
@@ -271,11 +229,8 @@ function render() {
   renderWorkflowEditorSection();
   elements.metricGrid.innerHTML = renderMetricCards();
   elements.liveRuns.innerHTML = renderLiveRuns() + renderQueue();
-  elements.issueDistribution.innerHTML = renderIssueDistribution();
   elements.activityFeed.innerHTML = renderActivityFeed();
-  elements.trackedIssues.innerHTML = renderTrackedIssues();
   mountRoadmap();
-  elements.issueDetail.innerHTML = renderIssueDetail();
   elements.instanceStatus.innerHTML = renderInstanceStatus();
   elements.rateLimits.innerHTML = renderRateLimits();
   renderStalenessBanner();
@@ -737,13 +692,19 @@ function renderMetricCards() {
   const runtime = state.runtime;
   const maxConcurrent = runtime?.workflow?.agent?.maxConcurrentAgents || runtime?.runtimeDefaults?.agent?.maxConcurrentAgents || 0;
   const utilization = maxConcurrent > 0 && snapshot ? Math.round((snapshot.counts.running / maxConcurrent) * 100) : 0;
+  /* Only what would change what the reader does next.
+   *
+   * Removed: "Tracked issues", a count of mostly-closed history that grows
+   * forever and can never prompt an action; "Codex runtime", cumulative seconds
+   * nobody decides anything on; and "Lease state", an internal coordination row
+   * that is diagnostic rather than status. "Running agents" and "Retry queue"
+   * both said again what the strip above already says, and a number repeated in
+   * two places is one more place for them to disagree.
+   *
+   * Token spend stays because the owner set a per-issue budget of 10M and this is
+   * the only place spend is visible at all. */
   const metrics = [
-    ["Running agents", formatNumber(snapshot?.counts.running || 0), maxConcurrent ? `${utilization}% of ${maxConcurrent} slots occupied` : "No capacity configured"],
-    ["Retry queue", formatNumber(snapshot?.counts.retrying || 0), snapshot?.retrying?.length ? `Next retry ${formatRetryCountdown(snapshot.retrying[0].due_at)}` : "No delayed work scheduled"],
-    ["Tracked issues", formatNumber(snapshot?.counts.tracked || 0), snapshot?.tracked?.by_state?.length ? `${snapshot.tracked.by_state.length} state buckets` : "No cached issue state yet"],
-    ["Total tokens", formatNumber(snapshot?.codex_totals?.total_tokens || 0), `${formatNumber(snapshot?.codex_totals?.input_tokens || 0)} in / ${formatNumber(snapshot?.codex_totals?.output_tokens || 0)} out`],
-    ["Codex runtime", formatSeconds(snapshot?.codex_totals?.seconds_running || 0), state.health?.detail || "No health detail available"],
-    ["Lease state", formatNumber(activeLeaseCount(snapshot)), activeLeaseCount(snapshot) ? "Coordination lease rows are present" : "No active lease rows were found"]
+    ["Total tokens", formatNumber(snapshot?.codex_totals?.total_tokens || 0), `${formatNumber(snapshot?.codex_totals?.input_tokens || 0)} in / ${formatNumber(snapshot?.codex_totals?.output_tokens || 0)} out`]
   ];
 
   return metrics.map(([label, value, detail]) => `
@@ -881,32 +842,6 @@ function renderRetryRow(retry) {
     </button>`;
 }
 
-function renderIssueDistribution() {
-  const groups = state.snapshot?.tracked?.by_state || [];
-  const total = groups.reduce((sum, group) => sum + group.count, 0);
-
-  return `
-    <div class="panel-body p-6">
-      <div class="section-kicker">Issue portfolio</div>
-      <h2 class="section-title">State distribution</h2>
-      <p class="mt-3 text-sm leading-6 text-slate-300">Cached issue state is summarized directly from the durable tracker cache, so the portfolio view survives host restarts.</p>
-      <div class="mt-6 space-y-4">
-        ${groups.length
-          ? groups.map(group => `
-              <div class="rounded-3xl border border-white/8 bg-white/[0.035] p-4">
-                <div class="flex items-center justify-between gap-3">
-                  <div class="text-sm font-medium text-white">${escapeHtml(group.state)}</div>
-                  <div class="text-sm text-slate-300">${escapeHtml(formatNumber(group.count))}</div>
-                </div>
-                <div class="mt-3 h-2.5 overflow-hidden rounded-full bg-white/8">
-                  <div class="h-full rounded-full bg-gradient-to-r from-cyan-300 via-emerald-300 to-orange-300" style="width: ${Math.max(total ? (group.count / total) * 100 : 0, 6)}%"></div>
-                </div>
-              </div>`).join("")
-          : renderEmptyState("No tracked issues yet.", "Once the GitHub tracker is polled, issue counts by state will appear here.")}
-      </div>
-    </div>`;
-}
-
 function renderActivityFeed() {
   const activity = state.snapshot?.activity || [];
   return `
@@ -948,29 +883,6 @@ function renderActivityEntry(entry) {
     </div>`;
 }
 
-function renderTrackedIssues() {
-  // Open work first. The list is ordered by last update, which buried the three
-  // open issues under twenty-seven closed ones from previous days - the opposite
-  // of what a "what is in flight" panel is for. Recency still orders within each
-  // group, so the closed history is intact underneath.
-  const isOpen = issue => !/^(closed|merged|done)$/i.test(issue.state || "");
-  const issues = [...(state.snapshot?.tracked?.recently_updated || [])]
-    .sort((a, b) => (isOpen(b) ? 1 : 0) - (isOpen(a) ? 1 : 0));
-  return `
-    <div class="panel-body p-6">
-      <div class="flex items-center justify-between gap-4">
-        <div>
-          <div class="section-kicker">Tracked issues</div>
-          <h2 class="section-title">Recently updated</h2>
-        </div>
-        <span class="glass-badge">${escapeHtml(formatNumber(state.snapshot?.tracked?.total || 0))} total</span>
-      </div>
-      <div class="mt-6 space-y-3">
-        ${issues.length ? issues.map(renderTrackedIssue).join("") : renderEmptyState("No tracked issues available.", "This section fills from the durable issue cache once the first tracker sync succeeds.")}
-      </div>
-    </div>`;
-}
-
 function renderTrackedIssue(issue) {
   const trackedState = issue.state || "Unknown state";
   return `
@@ -989,75 +901,6 @@ function renderTrackedIssue(issue) {
       </div>
       <div class="shrink-0 self-center text-xs uppercase tracking-[0.22em] text-slate-400">${escapeHtml(trackedState)}</div>
     </button>`;
-}
-
-function renderIssueDetail() {
-  if (!state.selectedIssue) {
-    return `
-      <div class="panel-body p-6">
-        <div class="section-kicker">Issue detail</div>
-        <h2 class="section-title">Select an issue</h2>
-        <p class="mt-4 text-sm leading-6 text-slate-300">Pick any running, retrying, or recently updated issue to inspect its workspace, retries, tokens, and latest events.</p>
-      </div>`;
-  }
-
-  const detail = state.issueDetail;
-  const tracked = detail?.tracked;
-  const running = detail?.running;
-  const retry = detail?.retry;
-  const recentEvents = detail?.recent_events || [];
-
-  return `
-    <div class="panel-body p-6">
-      <div class="flex items-start justify-between gap-4">
-        <div>
-          <div class="section-kicker">Issue detail</div>
-          <h2 class="section-title">${escapeHtml(state.selectedIssue)}</h2>
-        </div>
-        <span class="status-chip ${getIssueStatusTone(detail?.status || "tracked")}">${escapeHtml(detail?.status || "tracked")}</span>
-      </div>
-      ${state.issueError ? `<div class="mt-4 rounded-2xl border border-rose-400/20 bg-rose-500/10 p-4 text-sm text-rose-100">${escapeHtml(state.issueError)}</div>` : ""}
-      <div class="mt-5 rounded-3xl border border-white/10 bg-white/[0.035] p-5">
-        <div class="text-sm font-semibold text-white">${escapeHtml(tracked?.title || "Tracked issue")}</div>
-        <div class="mt-3 grid gap-3 text-sm text-slate-300 sm:grid-cols-2">
-          <div><div class="text-xs uppercase tracking-[0.22em] text-slate-400">Tracker state</div><div class="mt-1">${escapeHtml(tracked?.cache_state || "Unknown")}</div></div>
-          <div><div class="text-xs uppercase tracking-[0.22em] text-slate-400">Milestone</div><div class="mt-1">${escapeHtml(tracked?.milestone || "None")}</div></div>
-          <div><div class="text-xs uppercase tracking-[0.22em] text-slate-400">Workspace</div><div class="mt-1 break-all">${escapeHtml(detail?.workspace?.path || "Not prepared")}</div></div>
-          <div><div class="text-xs uppercase tracking-[0.22em] text-slate-400">Updated</div><div class="mt-1">${escapeHtml(formatRelativeTime(tracked?.updated_at))}</div></div>
-        </div>
-        ${tracked?.url ? `<a href="${escapeAttribute(tracked.url)}" target="_blank" rel="noreferrer" class="mt-4 inline-flex text-sm font-medium text-cyan-100 hover:text-cyan-50">Open issue in GitHub</a>` : ""}
-      </div>
-
-      <div class="mt-5 grid gap-4 sm:grid-cols-2">
-        <div class="rounded-3xl border border-white/10 bg-slate-950/55 p-4">
-          <div class="text-xs uppercase tracking-[0.22em] text-slate-400">Live run</div>
-          <div class="mt-2 text-sm text-slate-200">${escapeHtml(running?.last_event || retry?.error || "No active run")}</div>
-          <div class="mt-3 text-xs text-slate-400">${escapeHtml(running ? `${running.turn_count} turns, ${formatNumber(running.tokens?.total_tokens || 0)} tokens` : "Waiting for dispatch")}</div>
-        </div>
-        <div class="rounded-3xl border border-white/10 bg-slate-950/55 p-4">
-          <div class="text-xs uppercase tracking-[0.22em] text-slate-400">Retry state</div>
-          <div class="mt-2 text-sm text-slate-200">${escapeHtml(retry ? `Attempt ${retry.attempt}` : "No retry scheduled")}</div>
-          <div class="mt-3 text-xs text-slate-400">${escapeHtml(retry ? `Next retry ${formatRetryCountdown(retry.due_at)}` : "Queue is clear")}</div>
-        </div>
-      </div>
-
-      <div class="mt-6">
-        <div class="flex items-center justify-between gap-4">
-          <h3 class="text-sm font-semibold uppercase tracking-[0.24em] text-slate-300">Recent issue events</h3>
-          <span class="text-xs text-slate-400">${escapeHtml(formatNumber(recentEvents.length))} rows</span>
-        </div>
-        <div class="mt-4 space-y-3">
-          ${recentEvents.length ? recentEvents.map(entry => `
-              <div class="rounded-2xl border border-white/8 bg-white/[0.035] p-4">
-                <div class="flex flex-wrap items-center gap-2">
-                  <span class="status-chip ${getEventTone(entry)}">${escapeHtml(entry.event)}</span>
-                  <span class="text-xs uppercase tracking-[0.22em] text-slate-400">${escapeHtml(formatRelativeTime(entry.at))}</span>
-                </div>
-                <div class="mt-3 text-sm text-slate-300">${escapeHtml(entry.message || "No message")}</div>
-              </div>`).join("") : renderCompactEmpty("No issue events captured yet")}
-        </div>
-      </div>
-    </div>`;
 }
 
 /* The schedulers that wake this plane.
@@ -1222,19 +1065,6 @@ function updateDocumentTitle() {
 
 function activeLeaseCount(snapshot) {
   return (snapshot?.coordination?.leases || []).filter(entry => !entry.is_expired).length;
-}
-
-function collectIssueIdentifiers(snapshot) {
-  const identifiers = new Set();
-  for (const run of snapshot?.running || []) identifiers.add(run.issue_identifier);
-  for (const retry of snapshot?.retrying || []) identifiers.add(retry.issue_identifier);
-  for (const issue of snapshot?.tracked?.recently_updated || []) identifiers.add(issue.issue_identifier);
-  return [...identifiers];
-}
-
-function getIssueFromHash() {
-  const hash = window.location.hash || "";
-  return hash.startsWith("#issue/") ? decodeURIComponent(hash.slice(7)) : null;
 }
 
 async function fetchJson(url, options = {}) {

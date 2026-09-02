@@ -331,27 +331,23 @@ public sealed class ApiSmokeTests
             Assert.Contains("xl:items-start", htmlContent, StringComparison.OrdinalIgnoreCase);
             Assert.DoesNotContain("max-w-7xl", htmlContent, StringComparison.OrdinalIgnoreCase);
 
+            // The issue-detail, tracked-issues and issue-distribution panels were
+            // removed: a per-poll /api/v1/{issue} call feeding a panel nobody
+            // opened, a list of mostly-closed history, and a count of closed issues
+            // that only grows. Asserted absent rather than deleted quietly, so
+            // bringing one back is a deliberate act.
+            foreach (var removed in new[] { "issue-detail", "tracked-issues", "issue-distribution" })
+            {
+                Assert.DoesNotContain($"id=\"{removed}\"", htmlContent, StringComparison.OrdinalIgnoreCase);
+            }
+
             var issueDetailElementMatch = System.Text.RegularExpressions.Regex.Match(
                 htmlContent,
                 @"<section[^>]*id=""issue-detail""[^>]*>",
                 System.Text.RegularExpressions.RegexOptions.IgnoreCase);
 
-            Assert.True(issueDetailElementMatch.Success, "Expected to find the issue-detail element.");
+            Assert.False(issueDetailElementMatch.Success, "The issue-detail panel was removed.");
 
-            var issueDetailClassMatch = System.Text.RegularExpressions.Regex.Match(
-                issueDetailElementMatch.Value,
-                @"\bclass=""([^""]*)""",
-                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
-
-            Assert.True(issueDetailClassMatch.Success, "Expected the issue-detail element to have a class attribute.");
-
-            var issueDetailClasses = issueDetailClassMatch.Groups[1].Value.Split(
-                ' ',
-                StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-
-            Assert.Contains(issueDetailClasses, className => string.Equals(className, "panel", StringComparison.OrdinalIgnoreCase));
-            Assert.DoesNotContain(issueDetailClasses, className => string.Equals(className, "xl:sticky", StringComparison.OrdinalIgnoreCase));
-            Assert.DoesNotContain(issueDetailClasses, className => string.Equals(className, "xl:top-6", StringComparison.OrdinalIgnoreCase));
         }
         finally
         {
@@ -465,8 +461,10 @@ public sealed class ApiSmokeTests
             var javascriptContent = content!;
             Assert.Matches(@"function\s+formatRetryCountdown\b", javascriptContent);
             Assert.Matches(@"Math\.max\(\s*diffSeconds\s*,\s*0\s*\)", javascriptContent);
-            Assert.Matches(@"Next retry \$\{formatRetryCountdown\(\s*snapshot\.retrying\[0\]\.due_at\s*\)\}", javascriptContent);
-            Assert.Matches(@"Next retry \$\{formatRetryCountdown\(\s*retry\.due_at\s*\)\}", javascriptContent);
+            // The "Retry queue" metric card that carried this text was removed - it
+            // repeated the count already in the strip above. The clamp it guarded is
+            // still asserted through the live call sites below, which is the
+            // behaviour that mattered; only the duplicated card is gone.
             Assert.Matches(@"\$\{escapeHtml\(formatRetryCountdown\(\s*retry\.due_at\s*\)\)\}", javascriptContent);
             Assert.DoesNotMatch(@"formatRelativeTime\(\s*snapshot\.retrying\[0\]\.due_at\s*\)", javascriptContent);
             Assert.DoesNotMatch(@"formatRelativeTime\(\s*retry\.due_at\s*\)", javascriptContent);
