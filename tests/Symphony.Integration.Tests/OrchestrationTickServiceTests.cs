@@ -901,6 +901,51 @@ public sealed class OrchestrationTickServiceTests
         Assert.Equal(PhaseStages.AwaitingVerify, (await harness.DbContext.PhaseLedger.SingleAsync()).Stage);
     }
 
+    // The tick advances phases and reconciles runs, all of it local and cheap, so
+    // it has to stay fast. The candidate scan asks GitHub and is the expensive
+    // part - three GraphQL queries a tick once multi-repository tracking landed,
+    // which exhausted the hourly budget and blinded the plane. Slowing the whole
+    // tick fixed the spend and slowed every phase transition with it. Separate
+    // clocks: the tick keeps running, the scan does not repeat.
+    [Fact]
+    public async Task RunTickAsync_ShouldNotRescanGitHubOnEveryTick()
+    {
+        var tracker = new FakeTrackerClient([]);
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        var afterFirst = tracker.CandidateFetchRepositories.Count;
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.True(afterFirst > 0, "the first tick should scan");
+        Assert.Equal(afterFirst, tracker.CandidateFetchRepositories.Count);
+    }
+
+    // An outage must retry on the next tick rather than wait out the slow clock -
+    // recovering as soon as it can is the whole point of a fast tick.
+    [Fact]
+    public async Task RunTickAsync_ShouldRetryTheScanImmediatelyAfterAnOutage()
+    {
+        var tracker = new FakeTrackerClient([], throwOnFetchCandidates: true);
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        var afterFirst = tracker.CandidateFetchRepositories.Count;
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.True(tracker.CandidateFetchRepositories.Count > afterFirst,
+            "a failed scan should be retried on the next tick, not held off on the slow clock");
+    }
+
     // The reviewing stage waited forever on any terminal status it did not name.
     // #128 sat at `reviewing` with a canceled_by_reconciliation review run - the
     // pipeline claimed Codex was reviewing while the staff panel correctly showed
