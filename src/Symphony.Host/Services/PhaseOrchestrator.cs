@@ -66,6 +66,14 @@ public sealed class PhaseOrchestrator(
     public static string ReviewVerdictMarker(int prNumber, string headSha) =>
         $"<!-- symphony:review-verdict:{prNumber}:{headSha} -->";
 
+    // The implementation counterpart of the verdict marker. An implementation may
+    // legitimately conclude that nothing needed changing, but "I looked and there
+    // was nothing to do" and "I meant to write code and did not" are the same
+    // silence, and both used to read as success. This is how the first one says so
+    // in durable tracker truth rather than being inferred from an absence.
+    public static string NoChangeNeededMarker(string issueId) =>
+        $"<!-- symphony:no-change-needed:{issueId} -->";
+
     public async Task ProcessPhasesAsync(
         WorkflowDefinition workflowDefinition,
         TrackerQuerySet queries,
@@ -138,9 +146,45 @@ public sealed class PhaseOrchestrator(
             var prNumber = await ResolvePullRequestNumberAsync(query, issue, cancellationToken);
             if (prNumber is null)
             {
-                // Implementation finished without an open PR; nothing to verify or
-                // review. Not an error — e.g. the agent determined no change was
-                // needed. Leave the issue to ordinary triage.
+                // POSTCONDITION. A phase that reports success has to have produced
+                // the thing the next phase consumes; for implementation that is an
+                // open pull request.
+                //
+                // This used to `continue`, on the reasoning that the agent may have
+                // decided no change was needed. That reasoning is sound and the
+                // silence was not: it made "nothing needed doing" and "the run
+                // produced nothing" the same observation. Both left a run reading
+                // `succeeded`, no ledger, no event and no escalation - and then the
+                // redispatch guard refused to try again, because a pull request was
+                // not the thing missing. Work vanished while the plane reported it
+                // finished. Three stalls in one hour on 2 September were this.
+                //
+                // So the benign case now has to say so. An implementation that
+                // concludes nothing was needed posts the no-change marker, exactly
+                // as a review posts its verdict, and that is a reported outcome.
+                // Anything else is a contract violation and is escalated with a
+                // reason a person can act on.
+                var comments = await trackerClient.FetchIssueCommentsAsync(query, issue.Id, cancellationToken);
+                var noChangeMarker = NoChangeNeededMarker(issue.Id);
+                var declaredNoChange = comments.Any(
+                    comment => comment.Body.Contains(noChangeMarker, StringComparison.Ordinal));
+
+                if (declaredNoChange)
+                {
+                    AddPhaseEvent(issue.Id, issue.Identifier, "phase_implementation_no_change",
+                        "Implementation reported that no change was needed and said so on the issue; " +
+                        "there is nothing to verify or review.");
+                    await dbContext.SaveChangesAsync(cancellationToken);
+                    continue;
+                }
+
+                await EscalateRunAsync(
+                    issue.Id,
+                    issue.Identifier,
+                    $"The implementation run for {issue.Identifier} reported success but produced no pull request, " +
+                    "and did not state that no change was needed. Nothing downstream can act on this: there is no " +
+                    "head to verify and nothing to review.",
+                    cancellationToken);
                 continue;
             }
 
@@ -546,7 +590,7 @@ public sealed class PhaseOrchestrator(
                 await HandleReviewVerdictAsync(workflowDefinition, query, ledger, pullRequest, dispatchAsync, cancellationToken);
                 break;
             case PhaseStages.WaitForRepair:
-                await HandleWaitForRepairAsync(ledger, pullRequest, cancellationToken);
+                await HandleWaitForRepairAsync(query, ledger, pullRequest, cancellationToken);
                 break;
             case PhaseStages.Ready:
                 await HandleReadyAsync(workflowDefinition, query, ledger, pullRequest, cancellationToken);
@@ -910,6 +954,7 @@ public sealed class PhaseOrchestrator(
     }
 
     private async Task HandleWaitForRepairAsync(
+        TrackerQuery query,
         PhaseLedgerEntity ledger,
         PullRequestStatus pullRequest,
         CancellationToken cancellationToken)
@@ -951,11 +996,53 @@ public sealed class PhaseOrchestrator(
             return;
         }
 
+        // A fence that cannot be evaluated does not pass.
+        //
+        // The comparison below is string.Equals, and string.Equals(head, null) is
+        // false - so a ledger carrying no rejected head read as "the head moved"
+        // and waved the repair straight through onto unchanged rejected code, which
+        // is the one thing this fence exists to prevent. The row is cleared on
+        // reseed and can legitimately be null, so this is reachable without anyone
+        // doing anything wrong.
+        if (string.IsNullOrWhiteSpace(ledger.RejectedHeadSha))
+        {
+            await EscalateAsync(ledger,
+                $"PR #{ledger.PrNumber} is waiting on a repair but the ledger records no rejected head, " +
+                "so there is nothing to check the new head against. Refusing to assume the repair landed.",
+                cancellationToken);
+            return;
+        }
+
         if (string.Equals(pullRequest.HeadSha, ledger.RejectedHeadSha, StringComparison.OrdinalIgnoreCase))
         {
             // Fence holds: the head has not moved past the rejected commit yet.
             if (latestRepair is not null && latestRepair.Status == RunStatusNames.Succeeded)
             {
+                // #28: the plane escalated a pull request for not moving past a
+                // commit it had already moved past - rejected 1b1db81, actual head
+                // 0d99f83. One read decided it, and a read taken moments after a
+                // push can still be serving the old head.
+                //
+                // The costs are not symmetric. Waiting another tick on a repair
+                // that really did nothing delays a report; escalating a repair that
+                // worked parks live work for a person and is not self-correcting.
+                // So the last read before saying so is taken fresh, and if it
+                // disagrees with the one this tick opened with, the head moved.
+                var confirmed = await trackerClient.FetchPullRequestStatusAsync(
+                    query, ledger.PrNumber, cancellationToken);
+
+                if (confirmed is not null &&
+                    !string.Equals(confirmed.HeadSha, ledger.RejectedHeadSha, StringComparison.OrdinalIgnoreCase))
+                {
+                    ledger.Stage = PhaseStages.AwaitingVerify;
+                    ledger.UpdatedAtUtc = timeProvider.GetUtcNow();
+                    AddPhaseEvent(ledger.IssueId, ledger.IssueIdentifier, "phase_repair_head_moved",
+                        $"Repair moved PR #{ledger.PrNumber} head to {Short(confirmed.HeadSha)} " +
+                        "(seen on a confirming read, after a stale one); re-verifying before the final review.");
+                    await dbContext.SaveChangesAsync(cancellationToken);
+                    return;
+                }
+
                 await EscalateAsync(ledger,
                     $"The repair run for PR #{ledger.PrNumber} succeeded but the PR head never moved past the rejected commit {Short(ledger.RejectedHeadSha)} — refusing to re-review unchanged rejected code.",
                     cancellationToken);
@@ -996,6 +1083,37 @@ public sealed class PhaseOrchestrator(
         AddPhaseEvent(ledger.IssueId, ledger.IssueIdentifier, "needs_command_center", $"Phase orchestration: {reason}");
         await dbContext.SaveChangesAsync(cancellationToken);
         logger.LogError("Phase escalation for {IssueIdentifier}: {Reason}", ledger.IssueIdentifier, reason);
+    }
+
+    // EscalateAsync parks a ledger. A postcondition can fail before any ledger
+    // exists - an implementation that produced no pull request never gets one - so
+    // this reports through the run lane alone. Flipping the run off `succeeded` is
+    // also what makes it fire once: the scan that found it only looks at succeeded
+    // implementation runs.
+    private async Task EscalateRunAsync(
+        string issueId,
+        string issueIdentifier,
+        string reason,
+        CancellationToken cancellationToken)
+    {
+        var nowUtc = timeProvider.GetUtcNow();
+        var runs = await dbContext.Runs
+            .Where(run => run.IssueId == issueId)
+            .ToListAsync(cancellationToken);
+        var latestRun = runs.OrderByDescending(run => run.StartedAtUtc).FirstOrDefault();
+        if (latestRun is not null)
+        {
+            latestRun.Status = RunStatusNames.NeedsCommandCenter;
+            latestRun.CompletedAtUtc ??= nowUtc;
+            latestRun.LastEvent = "needs_command_center";
+            latestRun.LastMessage = $"Phase orchestration: {reason}";
+            latestRun.LastEventAtUtc = nowUtc;
+            latestRun.EscalationPostedAtUtc = null;
+        }
+
+        AddPhaseEvent(issueId, issueIdentifier, "needs_command_center", $"Phase orchestration: {reason}");
+        await dbContext.SaveChangesAsync(cancellationToken);
+        logger.LogError("Phase escalation for {IssueIdentifier}: {Reason}", issueIdentifier, reason);
     }
 
     private void AddPhaseEvent(string issueId, string issueIdentifier, string eventName, string message)

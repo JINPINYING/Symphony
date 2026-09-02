@@ -774,8 +774,14 @@ public sealed class OrchestrationTickServiceTests
         await harness.DbContext.SaveChangesAsync();
     }
 
+    // An implementation that reports success and produces no pull request used to
+    // vanish here: no ledger, no event, no escalation, and on the next scan the
+    // redispatch guard refused to try again. The run said "succeeded" and the work
+    // did not exist. This asserts the postcondition instead - no pull request and
+    // no statement that none was needed is a contract violation, and it is said
+    // out loud.
     [Fact]
-    public async Task RunTickAsync_ShouldNotSeedLedgerWhenNoOpenPullRequestExists()
+    public async Task RunTickAsync_ShouldEscalateWhenImplementationSucceedsWithoutAPullRequest()
     {
         var tracker = new FakeTrackerClient([]);
         tracker.IssuesById["issue-1"] = BuildIssue("issue-1", "#1", "Open", null, pullRequests: []);
@@ -789,8 +795,81 @@ public sealed class OrchestrationTickServiceTests
 
         await harness.Service.RunTickAsync(CancellationToken.None);
 
+        // Still no ledger - there is no pull request to track. The difference is
+        // that the run no longer reads as successful work.
         Assert.Empty(await harness.DbContext.PhaseLedger.ToListAsync());
-        Assert.Empty(harness.Coordinator.StartRequests);
+
+        var run = Assert.Single(await harness.DbContext.Runs.ToListAsync());
+        Assert.Equal(RunStatusNames.NeedsCommandCenter, run.Status);
+        Assert.Contains("no pull request", run.LastMessage ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+
+        var escalation = Assert.Single(
+            (await harness.DbContext.EventLog.ToListAsync())
+                .Where(entry => entry.EventName == "needs_command_center"));
+        Assert.Contains("#1", escalation.IssueIdentifier ?? string.Empty, StringComparison.Ordinal);
+    }
+
+    // The escape hatch. An implementation may legitimately conclude that nothing
+    // needed changing - but it has to say so, in durable tracker truth, the same
+    // way a review has to post its verdict. Then it is a reported outcome rather
+    // than an absence indistinguishable from failure.
+    [Fact]
+    public async Task RunTickAsync_ShouldAcceptAnExplicitNoChangeStatementInsteadOfAPullRequest()
+    {
+        var tracker = new FakeTrackerClient([]);
+        tracker.IssuesById["issue-1"] = BuildIssue("issue-1", "#1", "Open", null, pullRequests: []);
+        tracker.CommentsByIssueId["issue-1"] =
+        [
+            new NormalizedIssueComment(
+                "impl-1",
+                PhaseOrchestrator.NoChangeNeededMarker("issue-1") + "\nNothing to change: the guard already exists.",
+                "claude", "OWNER", DateTimeOffset.UtcNow)
+        ];
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success));
+
+        await harness.InsertRunAsync("issue-1", "#1", "Open", "instance-1", RunStatusNames.Succeeded);
+        await harness.InsertWorkspaceRecordAsync("issue-1", "#1", "symphony/1");
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Empty(await harness.DbContext.PhaseLedger.ToListAsync());
+
+        var run = Assert.Single(await harness.DbContext.Runs.ToListAsync());
+        Assert.Equal(RunStatusNames.Succeeded, run.Status);
+        Assert.DoesNotContain(
+            await harness.DbContext.EventLog.ToListAsync(),
+            entry => entry.EventName == "needs_command_center");
+        Assert.Contains(
+            await harness.DbContext.EventLog.ToListAsync(),
+            entry => entry.EventName == "phase_implementation_no_change");
+    }
+
+    // Escalating must happen once. The scan runs every tick over every succeeded
+    // implementation, so an escalation that left the run succeeded would re-fire
+    // for as long as the issue stayed open.
+    [Fact]
+    public async Task RunTickAsync_ShouldEscalateAMissingPullRequestOnlyOnce()
+    {
+        var tracker = new FakeTrackerClient([]);
+        tracker.IssuesById["issue-1"] = BuildIssue("issue-1", "#1", "Open", null, pullRequests: []);
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success));
+
+        await harness.InsertRunAsync("issue-1", "#1", "Open", "instance-1", RunStatusNames.Succeeded);
+        await harness.InsertWorkspaceRecordAsync("issue-1", "#1", "symphony/1");
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Single(
+            (await harness.DbContext.EventLog.ToListAsync())
+                .Where(entry => entry.EventName == "needs_command_center"));
     }
 
     // A pull request closed and then reopened was orphaned forever. The ledger
@@ -1201,6 +1280,98 @@ public sealed class OrchestrationTickServiceTests
         await harness.Service.RunTickAsync(CancellationToken.None);
         ledger = Assert.Single(await harness.DbContext.PhaseLedger.ToListAsync());
         Assert.Equal(PhaseStages.Escalated, ledger.Stage);
+    }
+
+    // The fence compared the live head against the rejected one with
+    // string.Equals, and string.Equals(head, null) is false - so a ledger with no
+    // rejected head recorded read as "the head moved" and waved the repair
+    // through onto unchanged rejected code. A fence that cannot be evaluated is
+    // not a fence that passes.
+    [Fact]
+    public async Task RunTickAsync_ShouldNotPassTheRepairFenceWhenNoRejectedHeadWasRecorded()
+    {
+        var tracker = new FakeTrackerClient([]);
+        var issue = BuildIssue("issue-1", "#1", "Open", null,
+            pullRequests: [new PullRequestRef("pr-5", 5, "OPEN", null, "symphony/1", "main")]);
+        tracker.IssuesById["issue-1"] = issue;
+        tracker.PullRequestStatusByNumber[5] = new PullRequestStatus(5, "OPEN", false, "aaa111", "SUCCESS", "MERGEABLE");
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success));
+
+        await harness.InsertRunAsync("issue-1", "#1", "Open", "instance-1", RunStatusNames.Succeeded);
+        await harness.InsertWorkspaceRecordAsync("issue-1", "#1", "symphony/1");
+
+        harness.DbContext.PhaseLedger.Add(new PhaseLedgerEntity
+        {
+            IssueId = "issue-1",
+            IssueIdentifier = "#1",
+            Stage = PhaseStages.WaitForRepair,
+            PrNumber = 5,
+            HeadSha = "aaa111",
+            ImplementerRunner = "claude",
+            RepairCount = 1,
+            RejectedHeadSha = null,
+            CreatedAtUtc = DateTimeOffset.UtcNow,
+            UpdatedAtUtc = DateTimeOffset.UtcNow,
+        });
+        await harness.DbContext.SaveChangesAsync();
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var ledger = Assert.Single(await harness.DbContext.PhaseLedger.ToListAsync());
+        Assert.NotEqual(PhaseStages.AwaitingVerify, ledger.Stage);
+        Assert.Equal(PhaseStages.Escalated, ledger.Stage);
+    }
+
+    // #28: the plane escalated a pull request for not moving past a commit it had
+    // already moved past. One read of the head decided it, and a read taken just
+    // after a push can lag. Escalating is not recoverable on its own, so the last
+    // read before saying so is taken fresh - if it disagrees, the head moved.
+    [Fact]
+    public async Task RunTickAsync_ShouldConfirmTheHeadBeforeEscalatingARepairThatDidMoveIt()
+    {
+        var tracker = new FakeTrackerClient([]);
+        var issue = BuildIssue("issue-1", "#1", "Open", null,
+            pullRequests: [new PullRequestRef("pr-5", 5, "OPEN", null, "symphony/1", "main")]);
+        tracker.IssuesById["issue-1"] = issue;
+        tracker.PullRequestStatusByNumber[5] = new PullRequestStatus(5, "OPEN", false, "aaa111", "SUCCESS", "MERGEABLE");
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success));
+
+        await harness.InsertRunAsync("issue-1", "#1", "Open", "instance-1", RunStatusNames.Succeeded);
+        await harness.InsertWorkspaceRecordAsync("issue-1", "#1", "symphony/1");
+
+        harness.DbContext.PhaseLedger.Add(new PhaseLedgerEntity
+        {
+            IssueId = "issue-1",
+            IssueIdentifier = "#1",
+            Stage = PhaseStages.WaitForRepair,
+            PrNumber = 5,
+            HeadSha = "aaa111",
+            ImplementerRunner = "claude",
+            RepairCount = 1,
+            RejectedHeadSha = "aaa111",
+            CreatedAtUtc = DateTimeOffset.UtcNow,
+            UpdatedAtUtc = DateTimeOffset.UtcNow,
+        });
+        await harness.DbContext.SaveChangesAsync();
+
+        // The first read of the tick still shows the rejected head; by the time the
+        // fence is about to escalate, the push has landed. That is the lag #28 saw.
+        tracker.PullRequestStatusOverridesAfterFirstRead[5] =
+            new PullRequestStatus(5, "OPEN", false, "bbb222", "SUCCESS", "MERGEABLE");
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var ledger = Assert.Single(await harness.DbContext.PhaseLedger.ToListAsync());
+        Assert.Equal(PhaseStages.AwaitingVerify, ledger.Stage);
+        Assert.DoesNotContain(
+            await harness.DbContext.EventLog.ToListAsync(),
+            entry => entry.EventName == "needs_command_center");
     }
 
     [Fact]
@@ -3273,12 +3444,27 @@ public sealed class OrchestrationTickServiceTests
         }
 
 
+        // Models a tracker read that lags a push: the first read of a pull request
+        // returns what PullRequestStatusByNumber holds, and every read after it
+        // returns the override. Real GitHub does this for a second or two after a
+        // force-push, which is exactly when the repair fence looks.
+        public Dictionary<int, PullRequestStatus> PullRequestStatusOverridesAfterFirstRead { get; } = [];
+
+        private readonly HashSet<int> readPullRequests = [];
+
         public Task<PullRequestStatus?> FetchPullRequestStatusAsync(
             TrackerQuery query,
             int pullRequestNumber,
             CancellationToken cancellationToken = default)
         {
             PullRequestStatusRequests.Add(($"{query.Owner}/{query.Repo}", pullRequestNumber));
+
+            if (!readPullRequests.Add(pullRequestNumber) &&
+                PullRequestStatusOverridesAfterFirstRead.TryGetValue(pullRequestNumber, out var later))
+            {
+                return Task.FromResult<PullRequestStatus?>(later);
+            }
+
             return Task.FromResult(
                 PullRequestStatusByNumber.TryGetValue(pullRequestNumber, out var status) ? status : null);
         }
