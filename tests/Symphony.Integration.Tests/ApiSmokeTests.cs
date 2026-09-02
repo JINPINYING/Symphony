@@ -335,11 +335,30 @@ public sealed class ApiSmokeTests
             Assert.NotNull(content);
             var htmlContent = content!;
             Assert.Contains("Symphony Watchtower", htmlContent, StringComparison.OrdinalIgnoreCase);
-            Assert.Contains("dashboard-shell", htmlContent, StringComparison.OrdinalIgnoreCase);
-            Assert.Contains("dashboard-rail", htmlContent, StringComparison.OrdinalIgnoreCase);
-            Assert.Contains("workflow-editor", htmlContent, StringComparison.OrdinalIgnoreCase);
-            Assert.Contains("xl:items-start", htmlContent, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("wt-shell", htmlContent, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("wt-grid", htmlContent, StringComparison.OrdinalIgnoreCase);
             Assert.DoesNotContain("max-w-7xl", htmlContent, StringComparison.OrdinalIgnoreCase);
+
+            // Every panel the reader needs is declared in the markup. The roadmap
+            // once had no container of its own - it built one at runtime, anchored
+            // to a panel that was later removed, and vanished silently. Declaring
+            // them all here means a panel cannot leave without a test saying so.
+            foreach (var panel in new[]
+                     {
+                         "panel-attention",
+                         "panel-health",
+                         "panel-team",
+                         "panel-activity",
+                         "panel-queue",
+                         "panel-roadmap",
+                         "panel-utility",
+                         "panel-advanced",
+                         "staleness-banner",
+                         "live-badge"
+                     })
+            {
+                Assert.Contains($"id=\"{panel}\"", htmlContent, StringComparison.OrdinalIgnoreCase);
+            }
 
             // The issue-detail, tracked-issues and issue-distribution panels were
             // removed: a per-poll /api/v1/{issue} call feeding a panel nobody
@@ -350,14 +369,6 @@ public sealed class ApiSmokeTests
             {
                 Assert.DoesNotContain($"id=\"{removed}\"", htmlContent, StringComparison.OrdinalIgnoreCase);
             }
-
-            // The roadmap had no container of its own: it built one at runtime and
-            // anchored it after the tracked-issues panel. Removing that panel made
-            // the anchor null, the mount returned early, and the roadmap silently
-            // disappeared - caught only because the owner asked to look at the page.
-            // It is declared in the markup now, and asserted, so it cannot leave
-            // again without a test saying so.
-            Assert.Contains("id=\"roadmap-panel\"", htmlContent, StringComparison.OrdinalIgnoreCase);
 
             var issueDetailElementMatch = System.Text.RegularExpressions.Regex.Match(
                 htmlContent,
@@ -479,11 +490,12 @@ public sealed class ApiSmokeTests
             var javascriptContent = content!;
             Assert.Matches(@"function\s+formatRetryCountdown\b", javascriptContent);
             Assert.Matches(@"Math\.max\(\s*diffSeconds\s*,\s*0\s*\)", javascriptContent);
-            // The "Retry queue" metric card that carried this text was removed - it
-            // repeated the count already in the strip above. The clamp it guarded is
-            // still asserted through the live call sites below, which is the
-            // behaviour that mattered; only the duplicated card is gone.
-            Assert.Matches(@"\$\{escapeHtml\(formatRetryCountdown\(\s*retry\.due_at\s*\)\)\}", javascriptContent);
+            // The card that once carried this text is gone; retrying work now shows
+            // in the queue panel, which is where "why has this not started" belongs.
+            // What mattered was never the card - it was that the countdown goes
+            // through formatRetryCountdown, whose clamp keeps an overdue retry from
+            // reading as a future one. That call site is what is asserted here.
+            Assert.Matches(@"formatRetryCountdown\(\s*retry\.due_at\s*\)", javascriptContent);
             Assert.DoesNotMatch(@"formatRelativeTime\(\s*snapshot\.retrying\[0\]\.due_at\s*\)", javascriptContent);
             Assert.DoesNotMatch(@"formatRelativeTime\(\s*retry\.due_at\s*\)", javascriptContent);
         }
@@ -495,9 +507,21 @@ public sealed class ApiSmokeTests
         }
     }
 
+    // DashboardJavaScriptAsset_ShouldRenderTrackedIssueStateLabelsFromCache was
+    // deleted here. It asserted the state label inside renderTrackedIssue, and the
+    // tracked-issues panel it belonged to was removed - a list of mostly-closed
+    // history nobody read. ApiSmokeTests still asserts that panel stays absent, so
+    // bringing it back is a deliberate act rather than an accident.
+
     [Fact]
-    public async Task DashboardJavaScriptAsset_ShouldRenderTrackedIssueStateLabelsFromCache()
+    public async Task DashboardJavaScriptAsset_ShouldNotReportHealthBeforeASnapshotLoads()
     {
+        // The page once rendered "All systems operational" and "Nothing is
+        // waiting on you" while it held no snapshot at all - every field was
+        // empty, and the absence of bad news read as a clean bill of health.
+        // That is the failure this dashboard exists to prevent, so both panels
+        // must derive their calm from a snapshot being present, and the engine
+        // must be positively healthy rather than merely not-known-to-be-broken.
         var workflowPath = CreateValidWorkflowPath();
         var dbPath = Path.Combine(Path.GetTempPath(), $"symphony-int-{Guid.NewGuid():N}.db");
         var stderr = new StringWriter();
@@ -520,11 +544,16 @@ public sealed class ApiSmokeTests
 
             Assert.True(exitCode == 0, stderr.ToString());
             Assert.NotNull(content);
-
             var javascriptContent = content!;
-            Assert.Matches(@"const\s+trackedState\s*=\s*issue\.state\s*\|\|\s*""Unknown state"";", javascriptContent);
-            Assert.Matches(@"<div class=""shrink-0 self-center text-xs uppercase tracking-\[0\.22em\] text-slate-400"">\$\{escapeHtml\(trackedState\)\}</div>", javascriptContent);
-            Assert.DoesNotContain("text-slate-400\">Open</div>", javascriptContent, StringComparison.Ordinal);
+
+            Assert.Matches(@"const\s+blind\s*=\s*!state\.snapshot;", javascriptContent);
+            Assert.Contains("Cannot reach the engine", javascriptContent, StringComparison.Ordinal);
+            Assert.Contains("Cannot read the plane", javascriptContent, StringComparison.Ordinal);
+
+            // "not false" would let an unknown engine pass as healthy.
+            Assert.Matches(@"const\s+engineOk\s*=\s*state\.health\?\.ok\s*===\s*true;", javascriptContent);
+            Assert.Matches(@"const\s+allOk\s*=\s*!blind\s*&&", javascriptContent);
+            Assert.DoesNotMatch(@"const\s+engineOk\s*=\s*state\.health\?\.ok\s*!==\s*false;", javascriptContent);
         }
         finally
         {

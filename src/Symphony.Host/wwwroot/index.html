@@ -1,248 +1,292 @@
-﻿<!doctype html>
+<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#041319">
+  <meta name="theme-color" content="#04121A">
   <title>Symphony Watchtower</title>
   <link rel="stylesheet" href="/assets/dashboard.css">
 <style>
-/* ---------------------------------------------------------------------------
-   The answer, first and largest.
-   Rule this follows: the status must be readable as a WORD before any colour
-   registers, because colour alone is not a signal every reader can use. Hence a
-   large label and a glyph, with colour as reinforcement rather than the message.
-   --------------------------------------------------------------------------- */
-.attention{border-radius:22px;padding:30px 32px 28px;margin-bottom:14px;border:1px solid;display:flex;flex-direction:column;gap:12px}
-.attention.att-clear{border-color:rgba(94,234,190,.34);background:linear-gradient(180deg,rgba(16,86,70,.34),rgba(10,40,34,.22))}
-.attention.att-warn{border-color:rgba(242,186,96,.42);background:linear-gradient(180deg,rgba(96,68,16,.36),rgba(52,36,10,.22))}
-.attention.att-down{border-color:rgba(242,146,146,.46);background:linear-gradient(180deg,rgba(102,30,30,.38),rgba(56,16,16,.24))}
+/* ===========================================================================
+   Watchtower - operations dashboard.
 
-.att-status{display:flex;align-items:center;gap:11px}
-.att-mark{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:50%;
-  font-size:15px;font-weight:700;line-height:1;border:2px solid currentColor}
-.att-word{font-size:19px;font-weight:700;letter-spacing:.04em;text-transform:uppercase}
-.attention.att-clear .att-status{color:#8FEDD0}
-.attention.att-warn .att-status{color:#FFCE86}
-.attention.att-down .att-status{color:#FFAFAF}
+   One rule above the rest: the page answers "does this need me?" before
+   anything else is read, and everything below that is ordered by how likely it
+   is to change what the reader does next.
 
-.att-headline{font-size:clamp(28px,4.4vw,42px);line-height:1.1;font-weight:700;letter-spacing:-.025em;margin:0;color:#fff;text-wrap:balance}
-.att-detail{margin:0;font-size:16px;line-height:1.65;color:rgba(233,240,248,.86);max-width:68ch}
+   ACCESSIBILITY, NON-NEGOTIABLE. The reader is colour-weak. No state is ever
+   carried by colour alone: every badge contains a word, every status dot sits
+   beside its label, and severity also changes a glyph. Colour is reinforcement,
+   never the message.
 
-.att-list{list-style:none;margin:8px 0 0;padding:0;display:flex;flex-direction:column;gap:8px}
-.att-item{display:flex;gap:13px;align-items:flex-start;background:rgba(255,255,255,.06);border-radius:12px;padding:13px 15px}
-.att-sev{font-family:ui-monospace,Consolas,monospace;font-size:10.5px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;padding:4px 8px;border-radius:5px;white-space:nowrap;margin-top:1px}
-.att-sev.att-warn{color:#FFCE86;background:rgba(242,186,96,.16)}
-.att-sev.att-down{color:#FFAFAF;background:rgba(242,146,146,.18)}
-.att-item-label{font-weight:600;color:#fff;font-size:15.5px}
-.att-item-detail{font-size:13.5px;color:rgba(233,240,248,.74);margin-top:3px;line-height:1.55}
+   Density is deliberate. This is read many times an hour, for seconds, beside
+   the work it describes - so the whole picture fits in roughly two screens
+   rather than seven, and prose is capped near 72 characters so a line ends
+   where the eye expects.
+   =========================================================================== */
 
-/* Metadata and controls: present, but never competing with the answer above. */
-.metastrip{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px;
-  padding:13px 18px;border-radius:14px;border:1px solid rgba(255,255,255,.09);background:rgba(255,255,255,.028)}
-.ms-line{display:flex;flex-wrap:wrap;align-items:center;gap:10px;min-width:0;font-size:13px;color:rgba(203,213,225,.78)}
-.ms-name{font-weight:700;color:#fff;font-size:14px;letter-spacing:-.01em}
-.ms-sep{width:1px;height:14px;background:rgba(255,255,255,.14)}
-.ms-fact{white-space:nowrap}
-.ms-fact b{color:rgba(233,240,248,.95);font-weight:600}
-.ms-controls{display:flex;align-items:center;gap:12px}
-.ms-auto{display:inline-flex;align-items:center;gap:7px;font-size:12.5px;color:rgba(203,213,225,.8);cursor:pointer}
-.ms-auto input{width:15px;height:15px;accent-color:#5EEABE;cursor:pointer}
-.ms-refresh{font-size:12.5px;font-weight:500;color:#BEF0E4;padding:6px 13px;border-radius:999px;
-  border:1px solid rgba(94,234,190,.28);background:rgba(94,234,190,.1);cursor:pointer;white-space:nowrap}
-.ms-refresh:hover:not(:disabled){border-color:rgba(94,234,190,.5);background:rgba(94,234,190,.16)}
-.ms-refresh:disabled{opacity:.55;cursor:not-allowed}
-.ms-refresh:focus-visible,.ms-auto input:focus-visible{outline:2px solid rgba(94,234,190,.6);outline-offset:2px}
+:root{
+  --wt-bg:#04121A;
+  --wt-panel:#08202B;
+  --wt-panel-2:rgba(255,255,255,.032);
+  --wt-line:rgba(126,166,182,.20);
+  --wt-line-soft:rgba(126,166,182,.12);
+  --wt-ink:#EAF2F5;
+  --wt-ink-2:rgba(206,224,231,.80);
+  --wt-ink-3:rgba(150,176,187,.85);
+  --wt-attn:#F0B94F;
+  --wt-attn-bg:rgba(240,185,79,.12);
+  --wt-attn-line:rgba(240,185,79,.55);
+  --wt-bad:#F08A8A;
+  --wt-bad-bg:rgba(240,138,138,.12);
+  --wt-ok:#43D9A3;
+  --wt-ok-bg:rgba(67,217,163,.12);
+  --wt-accent:#6FD3E0;
+  --wt-mono:ui-monospace,Consolas,"SF Mono",monospace;
+  --wt-radius:14px;
+}
 
-.staff-list{list-style:none;margin:18px 0 0;padding:0;display:flex;flex-direction:column;gap:8px}
-.staff-row{display:flex;gap:14px;align-items:flex-start;padding:14px 16px;border-radius:14px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.032)}
-.staff-working{border-color:rgba(94,234,190,.3);background:rgba(16,86,70,.2)}
-.staff-state{font-family:ui-monospace,Consolas,monospace;font-size:10.5px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;
-  padding:4px 9px;border-radius:5px;white-space:nowrap;margin-top:2px;min-width:74px;text-align:center}
-.staff-working .staff-state{color:#8FEDD0;background:rgba(94,234,190,.16)}
-.staff-idle .staff-state{color:rgba(148,163,184,.9);background:rgba(148,163,184,.12)}
-.staff-main{flex:1;min-width:0}
-.staff-name{font-size:16px;font-weight:700;color:#fff;text-transform:capitalize;letter-spacing:-.01em}
-.staff-activity{font-size:14px;color:rgba(226,232,240,.82);margin-top:2px}
-.staff-msg{font-size:13px;color:rgba(203,213,225,.62);margin-top:5px;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
-.staff-facts{display:flex;flex-direction:column;align-items:flex-end;gap:3px;font-family:ui-monospace,Consolas,monospace;
-  font-size:12px;color:rgba(203,213,225,.7);white-space:nowrap;font-variant-numeric:tabular-nums}
-@media (max-width:640px){.staff-row{flex-wrap:wrap}.staff-facts{flex-direction:row;gap:10px;width:100%;justify-content:flex-start}}
-.agent-strip{margin-top:18px;padding-top:14px;border-top:1px solid rgba(255,255,255,.12)}
-.agent-kicker{font-family:ui-monospace,Consolas,monospace;font-size:10px;font-weight:700;letter-spacing:.11em;text-transform:uppercase;color:rgba(148,163,184,.85);margin-bottom:8px}
-.agent-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px}
-.agent-row{display:flex;gap:10px;align-items:baseline;font-size:13.5px;color:rgba(226,232,240,.82)}
-.agent-when{font-family:ui-monospace,Consolas,monospace;font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;min-width:96px;color:rgba(148,163,184,.9)}
-.stale-view{display:flex;flex-wrap:wrap;align-items:center;gap:10px 14px;margin-bottom:14px;padding:13px 18px;border-radius:14px;font-size:14px;line-height:1.5;border:1px solid rgba(242,146,146,.5);background:rgba(102,30,30,.34);color:#FFD9D9}
-.stale-refresh{margin-left:auto;padding:5px 13px;border-radius:999px;cursor:pointer;font-size:12.5px;font-weight:600;border:1px solid rgba(255,217,217,.5);background:transparent;color:#FFD9D9}
-.stale-refresh:hover{background:rgba(255,217,217,.12)}
-.queue-list{display:flex;flex-direction:column;gap:10px}
-.queue-row{display:flex;gap:12px;align-items:baseline}
-.queue-pos{font-family:ui-monospace,Consolas,monospace;font-size:11px;font-weight:700;color:rgba(148,163,184,.9);min-width:20px;text-align:right}
-.queue-title{font-size:14.5px;color:#E2E8F0}
-.queue-title a{color:#8FEDD0;text-decoration:none}
-.queue-title a:hover{text-decoration:underline}
-.queue-why{font-size:12.5px;color:rgba(148,163,184,.95);margin-top:2px}
-.queue-count{font-family:ui-monospace,Consolas,monospace;font-size:13px;color:rgba(148,163,184,.9)}
-.queue-empty{font-size:14px;color:rgba(148,163,184,.95)}
-.staff-role{margin-left:8px;font-family:ui-monospace,Consolas,monospace;font-size:9.5px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:rgba(148,163,184,.9);border:1px solid rgba(148,163,184,.3);border-radius:4px;padding:1px 5px;vertical-align:middle}
-.staff-row.staff-attention .staff-state{color:#FFCE86;border-color:rgba(242,186,96,.45);background:rgba(242,186,96,.12)}
-.agent-live{display:inline-block;width:6px;height:6px;border-radius:50%;background:#5EEABE;margin-right:6px;vertical-align:middle;box-shadow:0 0 0 2px rgba(94,234,190,.22)}
-.agent-stale{margin-top:10px;font-size:12.5px;line-height:1.5;color:#FFCE86;border-left:2px solid rgba(242,186,96,.55);padding-left:10px}
-.agent-actor{font-weight:650;color:#fff;white-space:nowrap}
-.agent-summary{flex:1;min-width:0}.att-item-link{color:inherit;text-decoration:underline;text-underline-offset:3px;text-decoration-color:rgba(255,255,255,.35)}
-.att-item-link:hover{text-decoration-color:currentColor}
-.rm-group{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin:26px 0 0;padding-bottom:6px;border-bottom:1px solid rgba(255,255,255,.12)}
-.rm-group:first-of-type{margin-top:18px}
-.rm-group-name{font-size:13px;font-weight:700;letter-spacing:.04em;color:#fff}
-.rm-group-tally{font-family:ui-monospace,Consolas,monospace;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:rgba(148,163,184,.9);white-space:nowrap}
-.rm-group + .rm-list{margin-top:6px}
-.rm-list{list-style:none;margin:18px 0 0;padding:0;display:flex;flex-direction:column;gap:2px}
-.rm-row{display:flex;gap:12px;align-items:baseline;padding:8px 0;border-top:1px solid rgba(255,255,255,.07);font-size:14.5px;color:rgba(226,232,240,.85)}
-.rm-row:first-child{border-top:0}
-.rm-status{font-family:ui-monospace,Consolas,monospace;font-size:10px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;padding:2px 7px;border-radius:4px;min-width:62px;text-align:center;white-space:nowrap}
-.rm-done .rm-status{color:#7ee0c0;background:rgba(94,234,190,.13)}
-.rm-active .rm-status{color:#f2c274;background:rgba(240,180,88,.15)}
-.rm-planned .rm-status{color:rgba(148,163,184,.9);background:rgba(148,163,184,.12)}
-.rm-ms{font-family:ui-monospace,Consolas,monospace;font-size:12px;font-weight:600;color:#fff;min-width:34px}
-.rm-title{flex:1;min-width:0}
-.rm-done .rm-title{color:rgba(226,232,240,.62)}
+body{background:var(--wt-bg);color:var(--wt-ink);
+  font-family:Aptos,"Segoe UI",system-ui,sans-serif;font-size:14px;line-height:1.45;background-image:none}
 
-/* ---------------------------------------------------------------------------
-   Compact layout.
-   The page is read at a glance, several times an hour, on a machine where it
-   shares a screen with the work. It was built to be scrolled: a 42px headline, a
-   third of the fold spent on one sentence, and 24px of padding around every
-   panel. Density here is not decoration - what fits above the fold is what gets
-   read, and the answer, the team and the queue should all fit.
-   Nothing is made smaller than it can be read at. Body text stays at 13px and
-   up, every status keeps its word as well as its colour, and the hero is still
-   the largest thing on the page - just no longer the only thing on it.
-   Overrides live here rather than in dashboard.css because that file is Tailwind
-   output and hand edits to it are lost on the next build.
-   --------------------------------------------------------------------------- */
-.dashboard-shell{padding:14px 16px}
-@media (min-width:640px){.dashboard-shell{padding-left:20px;padding-right:20px}}
-@media (min-width:1024px){.dashboard-shell{padding-left:24px;padding-right:24px}}
+.wt-shell{max-width:1720px;margin:0 auto;padding:16px 20px 24px;display:flex;flex-direction:column;gap:14px}
+.wt-ico{flex:none;display:inline-block;vertical-align:-2px}
 
-.attention{padding:18px 20px 16px;border-radius:16px;gap:8px;margin-bottom:10px}
-.att-headline{font-size:clamp(21px,2.6vw,30px);line-height:1.15}
-.att-detail{font-size:14px;line-height:1.5}
-.att-word{font-size:15px}
-.att-mark{width:24px;height:24px;font-size:13px}
-.att-list{gap:6px}
-.att-item{padding:9px 12px}
-.agent-strip{margin-top:12px;padding-top:10px}
-.agent-row{font-size:13px}
+/* ---------- header ---------- */
+.wt-header{display:flex;align-items:center;justify-content:space-between;gap:20px;flex-wrap:wrap}
+.wt-brand{display:flex;align-items:center;gap:12px;min-width:0}
+.wt-mark{width:38px;height:38px;border-radius:11px;display:flex;align-items:center;justify-content:center;
+  border:1px solid rgba(67,217,163,.38);background:rgba(67,217,163,.12);color:var(--wt-ok);flex:none}
+.wt-title{font-size:26px;font-weight:700;letter-spacing:-.02em;white-space:nowrap}
+.wt-live{font-size:12px;font-weight:700;letter-spacing:.10em;padding:5px 12px;border-radius:8px;
+  border:1px solid rgba(67,217,163,.5);background:var(--wt-ok-bg);color:var(--wt-ok)}
+.wt-live.is-stale{border-color:rgba(240,138,138,.55);background:var(--wt-bad-bg);color:var(--wt-bad)}
+.wt-head-right{display:flex;align-items:center;gap:18px;flex-wrap:wrap;font-size:13px;color:var(--wt-ink-2)}
 
-.panel{border-radius:16px}
-.panel .panel-body{padding:16px}
-@media (min-width:640px){.panel .panel-body{padding:18px}}
-.section-kicker{font-size:10.5px;letter-spacing:.22em}
-.section-title{margin-top:4px;font-size:19px;line-height:1.25}
-@media (min-width:640px){.section-title{font-size:21px}}
+/* A real switch, not a checkbox: the header reads as a control panel, and the
+   knob position says on/off without relying on the fill colour. */
+.wt-switch{display:inline-flex;align-items:center;gap:10px;cursor:pointer;white-space:nowrap}
+.wt-switch input{position:absolute;opacity:0;width:0;height:0}
+.wt-track{width:42px;height:23px;border-radius:999px;background:rgba(255,255,255,.10);
+  border:1px solid var(--wt-line);position:relative;transition:background .15s,border-color .15s;flex:none}
+.wt-track::after{content:"";position:absolute;top:2px;left:2px;width:17px;height:17px;border-radius:50%;
+  background:#CFE0E6;transition:transform .15s}
+.wt-switch input:checked + .wt-track{background:#28B98C;border-color:#28B98C}
+.wt-switch input:checked + .wt-track::after{transform:translateX(19px);background:#062018}
+.wt-switch input:focus-visible + .wt-track{outline:2px solid var(--wt-accent);outline-offset:2px}
 
-main.grid{gap:14px;margin-top:14px}
-.space-y-6>:not([hidden])~:not([hidden]){margin-top:14px}
-.dashboard-shell>#workflow-editor{margin-top:14px}
-.dashboard-shell>#dashboard-alert{margin-top:10px}
-main .grid{gap:14px}
+.wt-btn{display:inline-flex;align-items:center;gap:8px;font-size:13px;font-weight:600;padding:8px 15px;
+  border-radius:10px;border:1px solid var(--wt-line);background:rgba(255,255,255,.05);color:var(--wt-ink);cursor:pointer}
+.wt-btn:hover{border-color:rgba(67,217,163,.45);background:rgba(67,217,163,.10)}
+.wt-btn:focus-visible,a:focus-visible,button:focus-visible{outline:2px solid var(--wt-accent);outline-offset:2px}
+.wt-stamp{text-align:right;line-height:1.35}
+.wt-stamp b{display:block;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--wt-ink-3);font-weight:600}
+.wt-stamp span{font-size:13px;color:var(--wt-ink-2)}
 
-.metric-card{border-radius:16px;padding:14px}
-@media (min-width:640px){.metric-card{padding:16px}}
-.metric-value{margin-top:4px;font-size:24px;line-height:1.2}
-@media (min-width:640px){.metric-value{font-size:26px}}
-.metric-label{font-size:13px}
-.metric-detail{margin-top:4px;font-size:12.5px}
+/* ---------- grid ---------- */
+.wt-grid{display:grid;gap:14px;grid-template-columns:1fr}
+@media (min-width:1180px){
+  .wt-grid{grid-template-columns:minmax(0,1.05fr) minmax(0,1fr)}
+}
 
-.staff-row{padding:10px 12px;border-radius:11px;gap:11px}
-.staff-name{font-size:14.5px}
-.staff-activity{font-size:13px}
-.queue-list{gap:7px}
-.queue-title{font-size:13.5px}
+.wt-panel{border:1px solid var(--wt-line);border-radius:var(--wt-radius);background:var(--wt-panel);
+  padding:16px 18px;min-width:0;display:flex;flex-direction:column;gap:12px}
+.wt-panel.is-attn{border-color:var(--wt-attn-line);
+  background:linear-gradient(180deg,rgba(240,185,79,.06),transparent 55%),var(--wt-panel)}
+.wt-panel.is-bad{border-color:rgba(240,138,138,.55);
+  background:linear-gradient(180deg,rgba(240,138,138,.06),transparent 55%),var(--wt-panel)}
 
-.sec-toggle{font-size:11.5px;font-weight:600;letter-spacing:.04em;padding:4px 11px;border-radius:999px;
-  border:1px solid rgba(148,163,184,.32);background:transparent;color:rgba(203,213,225,.95);cursor:pointer;white-space:nowrap}
-.sec-toggle:hover{border-color:rgba(165,243,252,.45);color:#CFFAFE}
-.rm-list{gap:5px}
-.rm-group{margin-top:10px}
+.wt-head{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap}
+.wt-h{display:flex;align-items:center;gap:10px;font-size:12.5px;font-weight:700;letter-spacing:.13em;
+  text-transform:uppercase;color:var(--wt-ink-2)}
+.wt-h .wt-ico{color:var(--wt-ink-3)}
+.wt-count{font-size:12px;padding:3px 10px;border-radius:999px;border:1px solid var(--wt-line);color:var(--wt-ink-2)}
+.wt-headmeta{display:flex;align-items:center;gap:18px;font-size:12.5px;color:var(--wt-ink-3);flex-wrap:wrap}
+.wt-headmeta b{font-weight:600;color:var(--wt-ink-2)}
 
-/* ---------------------------------------------------------------------------
-   Reading structure.
-   Measured on a 1280px window: the hero paragraph ran at 73 characters a line
-   because someone capped it at 513px, and everything else ran at 125-156 because
-   nothing else was capped at all. Comfortable measure is 45-75; the page was at
-   roughly double it, and worse on a wider monitor, which is why it read as a wall
-   rather than as lines. Tailwind is not the cause - w-full is easy to write and
-   nothing in it asks about measure.
-   The layout stays wide, because the columns use that width. Only the PROSE is
-   capped, so a line ends where the eye expects it to.
-   Hierarchy is the other half: a row now has a fixed leading column to scan down,
-   one thing at title weight, and anything supporting it visibly lighter. Where
-   everything is the same weight, nothing is a heading.
-   --------------------------------------------------------------------------- */
-.att-item-detail,
-.agent-summary,
-.staff-activity,
-.staff-msg,
-.queue-why,
-.metric-detail{max-width:72ch}
-.att-detail{max-width:72ch}
-.rm-row-title{max-width:72ch}
+/* A dot is decoration; the word beside it is the signal. Never one without the
+   other - the reader cannot tell these three colours apart. */
+.wt-dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex:none;background:var(--wt-ink-3)}
+.wt-dot.is-ok{background:var(--wt-ok)}
+.wt-dot.is-attn{background:var(--wt-attn)}
+.wt-dot.is-bad{background:var(--wt-bad)}
 
-/* One thing at title weight per row, everything else demoted. */
-.staff-name{font-weight:600;color:#F1F5F9;letter-spacing:-.01em}
-.staff-activity{color:rgba(203,213,225,.82)}
-.staff-msg{color:rgba(148,163,184,.85);font-size:12.5px}
-.att-item-title{font-weight:600;color:#fff}
-.att-item-detail{color:rgba(226,232,240,.78);line-height:1.5}
-.queue-title{font-weight:500}
-.queue-why{color:rgba(148,163,184,.9)}
+/* ---------- attention ---------- */
+.wt-attn-top{display:flex;gap:18px;align-items:flex-start}
+.wt-attn-glyph{flex:none;width:58px;height:58px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+  border:3px solid currentColor}
+.wt-attn-eyebrow{font-size:12.5px;font-weight:700;letter-spacing:.13em;text-transform:uppercase;color:var(--wt-attn)}
+.wt-panel.is-ok .wt-attn-eyebrow{color:var(--wt-ok)}
+.wt-attn-headline{font-size:32px;font-weight:700;letter-spacing:-.025em;line-height:1.12;margin:5px 0 6px;text-wrap:balance}
+.wt-attn-sub{font-size:13.5px;color:var(--wt-ink-2);max-width:72ch}
 
-/* A fixed leading column so the eye scans one edge instead of a ragged one. */
-.agent-when{min-width:104px}
-.staff-state{min-width:74px;text-align:center}
-.queue-pos{min-width:22px}
+/* ---------- rows shared by attention and queue ---------- */
+.wt-items{display:flex;flex-direction:column;gap:8px}
+.wt-item{display:flex;gap:14px;align-items:center;padding:11px 13px;border-radius:11px;
+  border:1px solid var(--wt-line-soft);background:var(--wt-panel-2)}
+.wt-item.sev-attention{background:linear-gradient(90deg,rgba(240,185,79,.07),transparent 40%),var(--wt-panel-2)}
+.wt-item.sev-down{background:linear-gradient(90deg,rgba(240,138,138,.07),transparent 40%),var(--wt-panel-2)}
+.wt-badge{flex:none;display:inline-flex;align-items:center;justify-content:center;text-align:center;
+  font-size:10.5px;font-weight:700;letter-spacing:.09em;padding:6px 9px;border-radius:7px;
+  border:1px solid var(--wt-line);color:var(--wt-ink-3);background:rgba(255,255,255,.03)}
+.wt-badge.is-block{width:94px;line-height:1.25}
+.wt-badge.sev-attention{border-color:var(--wt-attn-line);background:var(--wt-attn-bg);color:var(--wt-attn)}
+.wt-badge.sev-down{border-color:rgba(240,138,138,.5);background:var(--wt-bad-bg);color:var(--wt-bad)}
+.wt-badge.sev-ok{border-color:rgba(67,217,163,.5);background:var(--wt-ok-bg);color:var(--wt-ok)}
+.wt-item-body{min-width:0;flex:1}
+.wt-item-title{font-size:14px;font-weight:600;color:var(--wt-ink)}
+.wt-item-why{font-size:13px;color:var(--wt-ink-2);margin-top:2px;max-width:72ch}
+.wt-item-right{flex:none;display:flex;align-items:center;gap:10px}
+.wt-pill{display:inline-flex;align-items:center;gap:7px;font-size:12px;font-weight:600;padding:6px 11px;
+  border-radius:999px;border:1px solid var(--wt-line);color:var(--wt-ink-2);white-space:nowrap}
+.wt-pill.sev-attention{border-color:var(--wt-attn-line);background:var(--wt-attn-bg);color:var(--wt-attn)}
+.wt-pill.sev-down{border-color:rgba(240,138,138,.5);background:var(--wt-bad-bg);color:var(--wt-bad)}
+.wt-pill.sev-ok{border-color:rgba(67,217,163,.5);background:var(--wt-ok-bg);color:var(--wt-ok)}
+.wt-chev{color:var(--wt-ink-3);text-decoration:none;display:inline-flex;align-items:center}
+.wt-chev:hover{color:var(--wt-ink)}
+.wt-empty{font-size:13px;color:var(--wt-ink-3)}
+
+/* ---------- health ---------- */
+.wt-health-line{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.wt-health-state{display:flex;align-items:center;gap:10px;font-size:16px;font-weight:600}
+.wt-health-sub{font-size:12.5px;color:var(--wt-ink-3)}
+.wt-sub-h{font-size:12.5px;font-weight:700;color:var(--wt-ink-2)}
+.wt-sub-h span{font-weight:400;color:var(--wt-ink-3)}
+.wt-sched{display:flex;flex-direction:column;gap:8px}
+.wt-sched-row{display:flex;align-items:center;gap:12px;padding:10px 12px;border-radius:11px;
+  border:1px solid var(--wt-line-soft);background:var(--wt-panel-2)}
+.wt-sched-ico{flex:none;width:30px;height:30px;border-radius:9px;display:flex;align-items:center;justify-content:center;
+  border:1px solid var(--wt-line);background:rgba(255,255,255,.03);color:var(--wt-ink-3)}
+.wt-sched-main{flex:1;min-width:0}
+.wt-sched-name{font-size:13.5px;font-weight:600}
+.wt-sched-why{font-size:12px;color:var(--wt-ink-3);margin-top:1px;max-width:72ch}
+.wt-sched-right{text-align:right;flex:none;line-height:1.35}
+.wt-sched-state{font-size:13px;font-weight:600}
+.wt-sched-state.is-ok{color:var(--wt-ok)}
+.wt-sched-state.is-run{color:var(--wt-accent)}
+.wt-sched-state.is-bad{color:var(--wt-bad)}
+.wt-sched-every{font-size:11.5px;color:var(--wt-ink-3)}
+
+/* ---------- team table ---------- */
+.wt-table{width:100%;border-collapse:collapse;font-size:13.5px}
+.wt-table th{text-align:left;font-size:11px;font-weight:600;color:var(--wt-ink-3);
+  padding:0 10px 8px;border-bottom:1px solid var(--wt-line-soft)}
+.wt-table td{padding:9px 10px;border-bottom:1px solid var(--wt-line-soft);vertical-align:middle}
+.wt-table tr:last-child td{border-bottom:0}
+.wt-table td.wt-num{font-size:12.5px;color:var(--wt-ink-3);text-align:right;white-space:nowrap;
+  font-variant-numeric:tabular-nums}
+.wt-agent{display:flex;align-items:center;gap:10px;min-width:0}
+.wt-who{display:flex;flex-direction:column;min-width:0}
+.wt-who b{font-weight:600;font-size:13.5px}
+.wt-who span{font-size:11.5px;color:var(--wt-ink-3);text-transform:capitalize}
+.wt-act{color:var(--wt-ink-2);max-width:72ch}
+.wt-avatar{flex:none;width:26px;height:26px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+  font-size:9.5px;font-weight:700;letter-spacing:.02em;border:1px solid var(--wt-line);background:rgba(255,255,255,.05);color:var(--wt-ink-2)}
+.wt-avatar.is-claude{border-color:rgba(150,130,235,.55);background:rgba(150,130,235,.16);color:#C6B8FF}
+.wt-avatar.is-codex{border-color:rgba(111,211,224,.5);background:rgba(111,211,224,.14);color:#9FE3EC}
+.wt-avatar.is-owner{border-color:rgba(240,185,79,.5);background:var(--wt-attn-bg);color:var(--wt-attn)}
+
+/* ---------- activity ---------- */
+.wt-feed{display:flex;flex-direction:column;gap:2px}
+.wt-frow{display:flex;gap:12px;align-items:center;padding:8px 0;border-bottom:1px solid var(--wt-line-soft)}
+.wt-frow:last-child{border-bottom:0}
+.wt-fbody{flex:1;min-width:0}
+.wt-fsum{font-size:13px;color:var(--wt-ink-2);max-width:72ch}
+.wt-ftime{flex:none;text-align:right;line-height:1.3;font-variant-numeric:tabular-nums}
+.wt-ftime b{display:block;font-size:12.5px;font-weight:600;color:var(--wt-ink-2)}
+.wt-ftime span{font-size:11.5px;color:var(--wt-ink-3)}
+.wt-fopen{flex:none;color:var(--wt-ink-3);display:inline-flex;align-items:center}
+.wt-fopen:hover{color:var(--wt-ink)}
+
+/* ---------- roadmap ---------- */
+.wt-proj{display:flex;flex-direction:column;gap:12px;padding-bottom:12px;border-bottom:1px solid var(--wt-line-soft)}
+.wt-proj:last-child{border-bottom:0;padding-bottom:0}
+.wt-proj-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.wt-proj-name{font-size:14.5px;font-weight:600}
+.wt-proj-tag{font-size:11.5px;font-weight:600;padding:3px 9px;border-radius:6px;
+  border:1px solid rgba(111,211,224,.4);background:rgba(111,211,224,.12);color:var(--wt-accent)}
+.wt-steps{display:flex;align-items:flex-start;gap:0;flex-wrap:wrap;row-gap:12px}
+.wt-step{display:flex;align-items:center;gap:10px;min-width:0}
+.wt-step-dot{flex:none;width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+  font-size:12px;font-weight:700;border:1.5px solid var(--wt-line);color:var(--wt-ink-3);background:rgba(255,255,255,.03)}
+.wt-step.is-done .wt-step-dot{border-color:rgba(67,217,163,.6);background:var(--wt-ok-bg);color:var(--wt-ok)}
+.wt-step.is-active .wt-step-dot{border-color:var(--wt-attn-line);background:var(--wt-attn-bg);color:var(--wt-attn)}
+.wt-step-txt{display:flex;flex-direction:column;min-width:0}
+.wt-step-txt b{font-size:12.5px;font-weight:600;white-space:nowrap}
+.wt-step-txt span{font-size:11.5px;color:var(--wt-ink-3);white-space:nowrap}
+.wt-step.is-done .wt-step-txt span{color:var(--wt-ok)}
+.wt-step.is-active .wt-step-txt span{color:var(--wt-attn)}
+.wt-step-bar{flex:none;width:32px;height:1.5px;background:var(--wt-line);margin:0 10px}
+.wt-proj-foot{display:flex;align-items:center;gap:16px;flex-wrap:wrap;font-size:12.5px;color:var(--wt-ink-3)}
+.wt-tally{display:inline-flex;align-items:center;gap:7px;color:var(--wt-ink-2)}
+
+/* ---------- footer strip ---------- */
+.wt-utility{display:grid;gap:12px;grid-template-columns:1fr;border:1px solid var(--wt-line-soft);
+  border-radius:var(--wt-radius);background:rgba(255,255,255,.022);padding:12px 18px;font-size:12.5px}
+@media (min-width:900px){.wt-utility{grid-template-columns:minmax(0,1fr) auto;align-items:center}}
+.wt-strip{display:flex;align-items:center;gap:18px;flex-wrap:wrap}
+.wt-strip-h{font-size:11.5px;font-weight:700;letter-spacing:.13em;text-transform:uppercase;color:var(--wt-ink-3)}
+.wt-svc-item{display:inline-flex;align-items:center;gap:7px;color:var(--wt-ink-2)}
+.wt-lim{justify-content:flex-end}
+.wt-bar{width:130px;height:7px;border-radius:999px;background:rgba(255,255,255,.10);overflow:hidden;flex:none}
+.wt-bar i{display:block;height:100%;background:#43D9A3}
+.wt-bar.is-high i{background:#F0B94F}
+.wt-bar.is-full i{background:#F08A8A}
+.wt-lim-num{font-variant-numeric:tabular-nums;color:var(--wt-ink-2)}
+
+/* ---------- advanced ---------- */
+.wt-adv{border:1px solid var(--wt-line-soft);border-radius:var(--wt-radius);background:rgba(255,255,255,.015);padding:12px 18px}
+.wt-adv-body{margin-top:12px;display:flex;flex-direction:column;gap:14px}
+
+.wt-link{display:inline-flex;align-items:center;gap:6px;font-size:12.5px;font-weight:600;
+  color:var(--wt-accent);text-decoration:none;background:none;border:0;padding:0;cursor:pointer}
+.wt-link:hover{text-decoration:underline}
+.wt-foot-link{padding-top:4px;display:flex;justify-content:center}
+.wt-mono{font-family:var(--wt-mono)}
+
+/* ---------- stale banner ---------- */
+.stale-view{display:flex;flex-wrap:wrap;align-items:center;gap:10px 14px;padding:12px 16px;border-radius:var(--wt-radius);
+  font-size:13.5px;border:1px solid rgba(240,138,138,.55);background:var(--wt-bad-bg);color:#FFDCDC}
+.stale-refresh{margin-left:auto;padding:6px 14px;border-radius:999px;cursor:pointer;font-size:12.5px;font-weight:600;
+  border:1px solid rgba(255,220,220,.5);background:transparent;color:#FFDCDC}
+.stale-refresh:hover{background:rgba(255,220,220,.12)}
 </style>
 </head>
 <body>
-  <div class="pointer-events-none fixed inset-0 overflow-hidden">
-    <div class="absolute inset-0 mesh-overlay opacity-30"></div>
-    <div class="absolute -left-20 top-24 h-72 w-72 rounded-full bg-cyan-400/10 blur-3xl animate-drift"></div>
-    <div class="absolute right-0 top-10 h-80 w-80 rounded-full bg-emerald-400/10 blur-3xl animate-drift"></div>
-    <div class="absolute bottom-0 left-1/2 h-96 w-96 -translate-x-1/2 rounded-full bg-orange-400/10 blur-3xl animate-drift"></div>
-  </div>
+  <div class="wt-shell">
 
-  <div class="relative min-h-screen">
-    <div class="dashboard-shell">
-      <div id="staleness-banner"></div>
-      <header id="hero-panel" class="panel animate-lift"></header>
-      <div id="dashboard-alert" class="mt-4"></div>
-      <section id="workflow-editor" class="panel mt-6"></section>
+    <header class="wt-header">
+      <div class="wt-brand">
+        <span class="wt-mark" aria-hidden="true">
+          <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+               stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+        </span>
+        <span class="wt-title">Symphony Watchtower</span>
+        <span id="live-badge" class="wt-live">LIVE</span>
+      </div>
+      <div id="header-right" class="wt-head-right"></div>
+    </header>
 
-      <!-- Panels sit side by side rather than stacked. The two grids here used to
-           declare two columns and hold one child each, left over from panels that
-           were removed, so every band ran the full width and the page was four
-           screens taller than its content. -->
-      <main class="mt-6 grid gap-6 xl:grid-cols-[minmax(0,1.35fr)_420px] xl:items-start">
-        <section class="space-y-6">
-          <div class="grid gap-6 lg:grid-cols-2 lg:items-start">
-            <section id="live-runs" class="panel"></section>
-            <section id="activity-feed" class="panel"></section>
-          </div>
-          <section id="roadmap-panel" class="panel"></section>
-        </section>
+    <div id="staleness-banner"></div>
 
-        <aside class="dashboard-rail space-y-6">
-          <section id="instance-status" class="panel"></section>
-          <section id="rate-limits" class="panel"></section>
-        </aside>
-      </main>
-    </div>
+    <main class="wt-grid">
+      <section id="panel-attention" class="wt-panel"></section>
+      <section id="panel-health" class="wt-panel"></section>
+      <section id="panel-team" class="wt-panel"></section>
+      <section id="panel-activity" class="wt-panel"></section>
+      <section id="panel-queue" class="wt-panel"></section>
+      <section id="panel-roadmap" class="wt-panel"></section>
+    </main>
+
+    <footer id="panel-utility" class="wt-utility"></footer>
+
+    <section id="panel-advanced" class="wt-adv"></section>
+
+    <div id="dashboard-alert"></div>
   </div>
 
   <noscript>
-    <div class="mx-auto max-w-3xl px-4 py-10 text-sm text-slate-200">
+    <div style="max-width:48rem;margin:0 auto;padding:2.5rem 1rem;font-size:.875rem;color:#e2e8f0">
       Symphony Watchtower requires JavaScript to render live runtime state.
     </div>
   </noscript>
