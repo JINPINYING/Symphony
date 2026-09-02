@@ -167,7 +167,7 @@ public sealed class RuntimeStateService(
             .ToList();
         var recentActivity = await GetRecentActivityAsync(
             dbContext.EventLog.AsNoTracking(),
-            limit: 24,
+            limit: 10,
             includeRawEvents,
             cancellationToken);
         var leases = (await dbContext.InstanceLeases
@@ -690,6 +690,27 @@ public sealed class RuntimeStateService(
         return document.RootElement.Clone();
     }
 
+    /// <summary>
+    /// Operational events that are nonetheless noise on a page a person reads.
+    ///
+    /// Deliberately separate from DashboardEventPresentation.Classify, which
+    /// decides protocol-versus-operational and therefore also decides RETENTION -
+    /// reclassifying these would silently shorten how long they are kept, which is
+    /// a data decision and not a display one. This list only hides them from the
+    /// operational view; they stay in the log and in the raw view.
+    ///
+    /// open_pull_requests_updated is a poll heartbeat that fired for 9 of the 24
+    /// rows on the page - more than a third of the feed spent saying the poller
+    /// ran - and the answer it carries is already on the page as the attention
+    /// items. agent_activity_reported is rendered in its own strip at the top, so
+    /// listing it again is the same fact twice.
+    /// </summary>
+    private static readonly string[] NoiseEventNames =
+    [
+        OrchestrationTickService.OpenPullRequestsEventName,
+        AgentActivity.EventName
+    ];
+
     private static async Task<IReadOnlyList<DashboardActivityEntry>> GetRecentActivityAsync(
         IQueryable<EventLogEntity> query,
         int limit,
@@ -705,6 +726,7 @@ public sealed class RuntimeStateService(
             var protocolNames = DashboardEventPresentation.ProtocolEventNames.ToArray();
             query = query.Where(entry =>
                 !protocolNames.Contains(entry.EventName) &&
+                !NoiseEventNames.Contains(entry.EventName) &&
                 entry.Message != entry.EventName &&
                 entry.Message != "");
         }
