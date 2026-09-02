@@ -452,6 +452,98 @@ public sealed partial class OrchestrationTickService
         });
     }
 
+    // The event name a candidate-scan pause is recorded under. Read back on startup,
+    // so it is a persisted value and not just a log string - renaming it silently
+    // makes every pause survive nothing.
+    private const string CandidateScanPausedEvent = "candidate_scan_paused";
+
+    /// <summary>Record a rate-limit pause so it outlives this process.</summary>
+    private void RecordCandidateScanPause(DateTimeOffset resumeAtUtc, string? cause)
+    {
+        AddIssueEvent(
+            null,
+            null,
+            null,
+            null,
+            CandidateScanPausedEvent,
+            LogLevel.Warning,
+            $"Candidate scanning paused until {resumeAtUtc:u} after a GitHub rate limit"
+                + (string.IsNullOrWhiteSpace(cause) ? "." : $": {cause}"));
+
+        // The resume time goes in DataJson rather than being parsed back out of the
+        // message. A timestamp recovered by reading prose is a timestamp that breaks
+        // the next time somebody improves the wording.
+        var entry = dbContext.ChangeTracker.Entries<EventLogEntity>()
+            .Where(e => e.State == EntityState.Added)
+            .Select(e => e.Entity)
+            .LastOrDefault(e => e.EventName == CandidateScanPausedEvent);
+        if (entry is not null)
+        {
+            entry.DataJson = JsonSerializer.Serialize(new CandidateScanPauseState(resumeAtUtc));
+        }
+    }
+
+    /// <summary>
+    /// Re-adopt a pause recorded before this process started.
+    /// </summary>
+    /// <remarks>
+    /// Only ever moves the resume time later, never earlier. A stale row must not be
+    /// able to shorten a pause the running process has already decided on, and this
+    /// runs on every tick rather than only the first - so it has to be idempotent
+    /// and monotonic to be safe.
+    /// </remarks>
+    private async Task RestoreCandidateScanPauseAsync(
+        DateTimeOffset now,
+        CancellationToken cancellationToken)
+    {
+        if (candidateScanPauseRestored)
+        {
+            return;
+        }
+
+        candidateScanPauseRestored = true;
+
+        // Ordered by Id, not by OccurredAtUtc. SQLite cannot ORDER BY a DateTimeOffset
+        // at all, and the identity column is monotonic per insert - so it answers
+        // "the row written last" more exactly than a timestamp would, without pulling
+        // the table into memory to sort it.
+        var latest = await dbContext.EventLog
+            .Where(e => e.EventName == CandidateScanPausedEvent)
+            .OrderByDescending(e => e.Id)
+            .Select(e => e.DataJson)
+            .FirstOrDefaultAsync(cancellationToken);
+
+        if (string.IsNullOrWhiteSpace(latest))
+        {
+            return;
+        }
+
+        CandidateScanPauseState? state;
+        try
+        {
+            state = JsonSerializer.Deserialize<CandidateScanPauseState>(latest);
+        }
+        catch (JsonException)
+        {
+            // A row this cannot read is a row from a different shape of the world.
+            // Scanning now is the safe failure: worst case the limit is still on and
+            // the pause is recorded again.
+            return;
+        }
+
+        if (state is null || state.ResumeAtUtc <= now || state.ResumeAtUtc <= nextCandidateScanUtc)
+        {
+            return;
+        }
+
+        nextCandidateScanUtc = state.ResumeAtUtc;
+        logger.LogWarning(
+            "Resuming a candidate-scan pause recorded before this process started; scanning stays paused until {ResumeAtUtc:u}.",
+            nextCandidateScanUtc);
+    }
+
+    private sealed record CandidateScanPauseState(DateTimeOffset ResumeAtUtc);
+
     // Falls back to the primary repository, which is what an empty repository key
     // has always meant: every row written before multi-repository tracking, and
     // every row in a single-repository install.
