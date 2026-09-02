@@ -161,7 +161,27 @@ public static class OwnerAttentionSummary
 
         // A PR that reached ready and stayed there means the merge gate refused it
         // for a reason a person has to resolve.
-        foreach (var phase in phases.Where(p => string.Equals(p.Stage, PhaseStages.Escalated, StringComparison.Ordinal)))
+        // Only when the run lane is not already reporting this issue.
+        //
+        // A phase escalation marks BOTH records: EscalateAsync sets the ledger to
+        // escalated and flags the newest run needs_command_center, so every phase
+        // escalation raised two items for one fact - "#126 needs a decision" and
+        // "#126 stopped at the merge gate" - and the headline counted six things
+        // waiting when four were. Inflating the only number on the page the reader
+        // is asked to trust is worse than the redundancy looks.
+        //
+        // The run item is the one kept, because it carries the actual reason the
+        // phase recorded ("Phase orchestration: ..."), where this one can only
+        // describe the general case. A ledger escalated with no run behind it still
+        // reports here, so nothing stops being covered.
+        var issuesAlreadyReported = escalatedRuns
+            .Where(run => !settledIssues.Contains(run.IssueId))
+            .Select(run => run.IssueId)
+            .ToHashSet(StringComparer.Ordinal);
+
+        foreach (var phase in phases.Where(p =>
+                     string.Equals(p.Stage, PhaseStages.Escalated, StringComparison.Ordinal) &&
+                     !issuesAlreadyReported.Contains(p.IssueId)))
         {
             items.Add(new AttentionItem(
                 $"{Qualify(primaryRepository, phase.Repository, phase.IssueIdentifier)} stopped at the merge gate",
