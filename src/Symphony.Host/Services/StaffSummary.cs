@@ -55,6 +55,40 @@ public static class StaffSummary
     /// not still listed as a colleague.</summary>
     public static readonly TimeSpan SessionMemory = TimeSpan.FromHours(2);
 
+    /// <summary>
+    /// A name that says which "Claude" this is.
+    ///
+    /// The panel listed two rows both called Claude - the vendor agent the plane
+    /// dispatches to, and an interactive chat driving the same vendor by hand -
+    /// distinguished only by a role chip and, accidentally, by casing, because
+    /// runner names come from config in lower case and the session name is
+    /// whatever the reporter typed. The owner asked twice which was which, which
+    /// is the answer: the chip was not doing the job the name should do.
+    ///
+    /// The vendor name alone is not an identity here. What it is doing is.
+    /// </summary>
+    private static string RunnerName(string runner, string? implementerRunner)
+    {
+        var display = char.ToUpperInvariant(runner[0]) + runner[1..];
+        if (string.IsNullOrWhiteSpace(implementerRunner))
+        {
+            return display;
+        }
+
+        // Review is always a cross-vendor dispatch, so whichever vendor is not the
+        // implementer is the reviewer. Saying so also answers the other question
+        // this panel kept raising - why Codex looked idle while reviewing.
+        return string.Equals(runner, implementerRunner, StringComparison.OrdinalIgnoreCase)
+            ? $"{display} - implements"
+            : $"{display} - reviews";
+    }
+
+    private static string SessionName(string actor)
+    {
+        var display = string.IsNullOrWhiteSpace(actor) ? "agent" : actor.Trim();
+        return $"{display} - chat session";
+    }
+
     public static IReadOnlyList<StaffMember> Build(
         IReadOnlyList<string> configuredRunners,
         IReadOnlyList<RunEntity> activeRuns,
@@ -62,7 +96,8 @@ public static class StaffSummary
         DateTimeOffset now,
         IReadOnlyList<WatchedTaskReport>? schedulers = null,
         IReadOnlyList<AgentActivityReport>? sessions = null,
-        int decisionsWaitingOnOwner = 0)
+        int decisionsWaitingOnOwner = 0,
+        string? implementerRunner = null)
     {
         var members = new List<StaffMember>();
 
@@ -74,7 +109,7 @@ public static class StaffSummary
             if (active is not null)
             {
                 members.Add(new StaffMember(
-                    Runner: runner,
+                    Runner: RunnerName(runner, implementerRunner),
                     Role: RoleRunner,
                     State: StateWorking,
                     IssueIdentifier: active.IssueIdentifier,
@@ -94,7 +129,7 @@ public static class StaffSummary
                 .FirstOrDefault();
 
             members.Add(new StaffMember(
-                Runner: runner,
+                Runner: RunnerName(runner, implementerRunner),
                 Role: RoleRunner,
                 State: StateIdle,
                 IssueIdentifier: last?.IssueIdentifier,
@@ -160,7 +195,7 @@ public static class StaffSummary
             .Select(group => group.OrderByDescending(report => report.AtUtc).First())
             .OrderBy(report => report.Actor, StringComparer.OrdinalIgnoreCase)
             .Select(report => new StaffMember(
-                Runner: report.Actor,
+                Runner: SessionName(report.Actor),
                 Role: RoleSession,
                 State: now - report.AtUtc <= SessionLiveWindow ? StateWorking : StateIdle,
                 IssueIdentifier: null,

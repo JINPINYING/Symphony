@@ -32,7 +32,7 @@ public sealed class StaffSummaryTests
             recentRuns: [],
             Now);
 
-        Assert.Equal(["claude", "codex"], staff.Where(m => m.Role == StaffSummary.RoleRunner).Select(m => m.Runner));
+        Assert.Equal(["Claude", "Codex"], staff.Where(m => m.Role == StaffSummary.RoleRunner).Select(m => m.Runner));
     }
 
     // The one that was wrong on the page: with runner_by_label emptied and both
@@ -48,8 +48,8 @@ public sealed class StaffSummaryTests
             Now);
 
         Assert.Equal(2, staff.Count(m => m.Role == StaffSummary.RoleRunner));
-        Assert.Equal(StaffSummary.StateWorking, staff.Single(m => m.Runner == "claude").State);
-        Assert.Equal(StaffSummary.StateIdle, staff.Single(m => m.Runner == "codex").State);
+        Assert.Equal(StaffSummary.StateWorking, staff.Single(m => m.Runner == "Claude").State);
+        Assert.Equal(StaffSummary.StateIdle, staff.Single(m => m.Runner == "Codex").State);
     }
 
     // "Idle" alone is indistinguishable from "broken and never started", so an
@@ -102,7 +102,7 @@ public sealed class StaffSummaryTests
             sessions: [new AgentActivityReport("Claude", "Rebasing the evidence lane.", null, null, Now.AddMinutes(-2))],
             decisionsWaitingOnOwner: 2);
 
-        Assert.Contains(staff, m => m.Role == StaffSummary.RoleRunner && m.Runner == "claude");
+        Assert.Contains(staff, m => m.Role == StaffSummary.RoleRunner && m.Runner == "Claude");
         Assert.Contains(staff, m => m.Role == StaffSummary.RoleScheduler && m.Runner == "ADCP Commander");
         Assert.Contains(staff, m => m.Role == StaffSummary.RoleSession && m.State == StaffSummary.StateWorking);
         Assert.Contains(staff, m => m.Role == StaffSummary.RoleOwner && m.State == StaffSummary.StateWaiting);
@@ -134,6 +134,42 @@ public sealed class StaffSummaryTests
                 "Currently running, started less than a minute ago.")]);
 
         Assert.Equal(StaffSummary.StateWorking, Assert.Single(staff, m => m.Role == StaffSummary.RoleScheduler).State);
+    }
+
+    // Two rows both called "Claude" - the vendor agent the plane dispatches to and
+    // an interactive chat driving the same vendor by hand - told apart only by a
+    // role chip and, accidentally, by casing. The owner asked twice which was
+    // which. The vendor name alone is not an identity here; what it is doing is.
+    [Fact]
+    public void TheTwoClaudesAreTellableApartByName()
+    {
+        var staff = StaffSummary.Build(
+            ["claude", "codex"],
+            activeRuns: [],
+            recentRuns: [],
+            Now,
+            sessions: [new AgentActivityReport("Claude", "Fixing the panel.", null, null, Now.AddMinutes(-1))],
+            implementerRunner: "claude");
+
+        var names = staff.Select(m => m.Runner).ToList();
+        Assert.Contains("Claude - implements", names);
+        Assert.Contains("Codex - reviews", names);
+        Assert.Contains("Claude - chat session", names);
+        // No two rows share a name.
+        Assert.Equal(names.Count, names.Distinct().Count());
+    }
+
+    // Review is always a cross-vendor dispatch, so flipping the implementer flips
+    // who is described as the reviewer.
+    [Fact]
+    public void FlippingTheImplementerFlipsTheReviewer()
+    {
+        var staff = StaffSummary.Build(
+            ["claude", "codex"], activeRuns: [], recentRuns: [], Now, implementerRunner: "codex");
+
+        var names = staff.Select(m => m.Runner).ToList();
+        Assert.Contains("Codex - implements", names);
+        Assert.Contains("Claude - reviews", names);
     }
 
     // Yesterday's session is not a colleague today.
