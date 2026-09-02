@@ -415,6 +415,34 @@ public sealed class OwnerAttentionSummaryTests
         Assert.Null(Assert.Single(result.Items).Url);
     }
 
+    // EscalateAsync marks BOTH records - the ledger goes to escalated and the
+    // newest run goes to needs_command_center - so every phase escalation raised
+    // two items for one fact and the headline counted six things waiting when
+    // four were. Inflating the only number the reader is asked to trust is worse
+    // than the redundancy looks.
+    [Fact]
+    public void OnePhaseEscalationIsOneThingWaiting()
+    {
+        var result = Build(
+            escalated: [Escalated("#126", posted: true, lastMessage: "Phase orchestration: merge gate refused.")],
+            phases: [Ledger("#126", PhaseStages.Escalated, pr: 131)]);
+
+        var item = Assert.Single(result.Items);
+        Assert.Contains("needs a decision", item.Label);
+        // The kept item is the one carrying the reason the phase recorded.
+        Assert.Contains("merge gate refused", item.Detail);
+    }
+
+    // A ledger escalated with no run behind it must still be reported, or
+    // deduplicating quietly drops a real alarm.
+    [Fact]
+    public void APhaseEscalationWithNoRunBehindItStillReports()
+    {
+        var result = Build(phases: [Ledger("#126", PhaseStages.Escalated, pr: 131)]);
+
+        Assert.Contains("stopped at the merge gate", Assert.Single(result.Items).Label);
+    }
+
     // The owner asked whether "waiting on you" really meant them. For PR #127 it
     // did not: the plane had opened it, then dropped it - the ledger still pointed
     // at the previous, closed pull request, so no review or merge would ever run.
