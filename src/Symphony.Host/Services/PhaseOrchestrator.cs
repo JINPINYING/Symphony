@@ -138,8 +138,32 @@ public sealed class PhaseOrchestrator(
             var query = queries.For(latestRun.Repository);
             var issues = await trackerClient.FetchIssuesByIdsAsync(query, [issueRuns.Key], cancellationToken);
             var issue = issues.FirstOrDefault();
-            if (issue is null || IssueStateMatcher.IsClosedState(issue.State))
+
+            // A closed issue is a finished one; there is nothing to seed and nothing
+            // to say. That branch is silent on purpose.
+            if (issue is not null && IssueStateMatcher.IsClosedState(issue.State))
             {
+                continue;
+            }
+
+            // Not being able to read the issue is different, and it used to share
+            // the same silent `continue` as the line above. It is the sibling of the
+            // no-pull-request hole: an implementation that finished, a pull request
+            // that may well be open, and a ledger that is never seeded - so no
+            // verify, no review, no merge, and nothing said.
+            //
+            // It is recorded rather than escalated because the usual cause is
+            // transient (a rate-limited or flaky read that the next tick fixes), and
+            // parking work for a person over a blip trains them to ignore parking.
+            // The stuck-stage backstop still catches it if it persists. What matters
+            // is that it is no longer invisible.
+            if (issue is null)
+            {
+                AddPhaseEvent(issueRuns.Key, latestRun.IssueIdentifier, "phase_seed_issue_unreadable",
+                    $"Implementation for {latestRun.IssueIdentifier} succeeded, but the issue could not be read back " +
+                    $"from {latestRun.Repository ?? "the primary repository"} to enter it into the phase pipeline. " +
+                    "Nothing is tracking its pull request until this read succeeds.");
+                await dbContext.SaveChangesAsync(cancellationToken);
                 continue;
             }
 
