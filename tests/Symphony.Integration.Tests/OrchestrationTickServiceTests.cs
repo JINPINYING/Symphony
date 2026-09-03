@@ -1,4 +1,5 @@
 using System.Text.Json;
+using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -3029,10 +3030,18 @@ public sealed class OrchestrationTickServiceTests
         }
         finally
         {
-            // Dispose rather than `await using`: the replacement harness has to open
-            // the same database, and a restart means the first process is gone.
-            await before.DisposeAsync();
+            // End the process, not the database. Disposing outright would delete the
+            // file the replacement harness is about to open; on Linux that delete
+            // succeeds while a pooled connection still holds the unlinked file open,
+            // so the schema survived only for as long as that pooled handle did, and
+            // any concurrent `ClearAllPools()` from another test class turned this
+            // test red with `no such table: instance_leases`.
+            await before.SimulateProcessExitAsync();
         }
+
+        // A restart is not a reinstall: what the next process reads has to come off
+        // disk, so the database has to still be there to read.
+        Assert.True(File.Exists(dbPath), $"the database should outlive the process: {dbPath}");
 
         // The restart. A minute later - far inside the ten-minute pause - a brand new
         // service opens the same database with a fresh in-memory schedule.
@@ -3239,6 +3248,7 @@ public sealed class OrchestrationTickServiceTests
     private sealed class TestHarness : IAsyncDisposable
     {
         private readonly string dbPath;
+        private bool deleteDatabaseFilesOnDispose = true;
 
         private TestHarness(
             string dbPath,
@@ -3549,12 +3559,45 @@ public sealed class OrchestrationTickServiceTests
             await DbContext.SaveChangesAsync();
         }
 
+        /// <summary>
+        /// Models the process going away while its database outlives it, which is what
+        /// a restart is. The pool is cleared as well as the context disposed, so a
+        /// replacement harness on the same path reads the file rather than inheriting a
+        /// connection this "process" left open.
+        /// </summary>
+        public async Task SimulateProcessExitAsync()
+        {
+            // Whoever opens the path next owns these files.
+            deleteDatabaseFilesOnDispose = false;
+            await DbContext.DisposeAsync();
+            ClearConnectionPool();
+        }
+
         public async ValueTask DisposeAsync()
         {
             await DbContext.DisposeAsync();
+            if (!deleteDatabaseFilesOnDispose)
+            {
+                return;
+            }
+
+            // Disposing the context returns its connection to the pool instead of
+            // closing the file, so the pool has to go first: otherwise the delete
+            // quietly fails on Windows, and on Linux it quietly unlinks a file that
+            // is still open, which reads as success and is not.
+            ClearConnectionPool();
             TryDeleteFile(dbPath);
             TryDeleteFile($"{dbPath}-wal");
             TryDeleteFile($"{dbPath}-shm");
+        }
+
+        private void ClearConnectionPool()
+        {
+            // Pools are keyed by connection string, so an unopened connection names the
+            // right one; unlike ClearAllPools this leaves classes running in parallel
+            // with this one alone.
+            using var connection = new SqliteConnection($"Data Source={dbPath}");
+            SqliteConnection.ClearPool(connection);
         }
 
         private static void TryDeleteFile(string path)
