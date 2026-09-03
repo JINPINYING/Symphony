@@ -8,7 +8,42 @@ namespace Symphony.Host.Services;
 /// and do it, when there is such a place - an item that names a decision but
 /// makes the reader hunt for it is only half an answer.
 /// </summary>
-public sealed record AttentionItem(string Label, string Detail, string Severity, string? Url = null);
+/// <summary>
+/// What the reader can actually do about an item, where that is anything more
+/// than "go and look". A null action means the item is informational, and an
+/// informational item does not belong under "needs your attention" at all.
+/// </summary>
+/// <param name="Kind">open | merge | directive | command - what shape the action takes.</param>
+/// <param name="Label">The button text. Says what happens, not where it goes.</param>
+/// <param name="Url">Where to act, for the kinds that resolve on the tracker.</param>
+/// <param name="Command">The exact command to run, for actions that need a terminal. Never a description of one.</param>
+public sealed record AttentionAction(string Kind, string Label, string? Url = null, string? Command = null);
+
+/// <summary>
+/// Who can clear this. The panel is titled "needs your attention", so anything
+/// the owner cannot act on is a claim it should not be making.
+/// </summary>
+public static class AttentionActors
+{
+    /// The owner: a judgement only they can make.
+    public const string Owner = "owner";
+
+    /// The plane: it is already handling this, or will on its next tick.
+    public const string Plane = "plane";
+
+    /// Someone at this machine: a fault needing a terminal, not a decision.
+    public const string Operator = "operator";
+}
+
+public sealed record AttentionItem(
+    string Label,
+    string Detail,
+    string Severity,
+    string? Url = null,
+    // Owner by default so a new item is loud rather than silently swallowed; every
+    // site that is NOT the owner's says so explicitly.
+    string Actor = AttentionActors.Owner,
+    AttentionAction? Action = null);
 
 /// <summary>
 /// The answer to "does this need me?", computed by the engine rather than
@@ -97,9 +132,16 @@ public static class OwnerAttentionSummary
         // multi-repository tracking carry no repository, and they all belong to the
         // repository that was the only one at the time - so they can be labelled
         // correctly instead of being the one line on the panel that stays ambiguous.
-        string? primaryRepository = null)
+        string? primaryRepository = null,
+        // The issues the plane is holding right now. "Waiting on you" is a claim
+        // about the plane as much as about the owner - if the plane is mid-run on
+        // the issue, or has it queued, then it is not waiting on anyone.
+        IReadOnlyCollection<string>? activeIssueIds = null)
     {
         var items = new List<AttentionItem>();
+        var active = activeIssueIds is null
+            ? new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            : new HashSet<string>(activeIssueIds, StringComparer.OrdinalIgnoreCase);
 
         // A tracker the engine cannot reach is a blind plane: no work is found,
         // none is dispatched, and every internal signal is indistinguishable from
@@ -113,15 +155,21 @@ public static class OwnerAttentionSummary
             items.Add(new AttentionItem(
                 "The issue tracker cannot be reached",
                 $"No candidate scan has succeeded for {Humanise(now - blindSince)}, so nothing new will be picked up. Last cause: {tracker.LastFailureReason}",
-                LevelDown));
+                LevelDown,
+                Actor: AttentionActors.Operator,
+                Action: new AttentionAction("command", "Check connectivity",
+                    Command: "curl -s -o /dev/null -w \"%{http_code}\" https://api.github.com")));
         }
 
         if (!engineHealthy)
         {
             items.Add(new AttentionItem(
                 "The engine is not answering",
-                "Nothing will be picked up until it is back. Check the service and its logs.",
-                LevelDown));
+                "Nothing will be picked up until it is back.",
+                LevelDown,
+                Actor: AttentionActors.Operator,
+                Action: new AttentionAction("command", "Restart the service",
+                    Command: "Get-Service Symphony | Restart-Service")));
         }
 
         // Issues whose phase has already reached a terminal stage. The reconciler
@@ -238,19 +286,110 @@ public static class OwnerAttentionSummary
             var droppedByPipeline = planeOpened && !trackedPullRequestNumbers.Contains(pr.Number);
             var tracked = !droppedByPipeline;
 
+            var prUrl = string.IsNullOrWhiteSpace(pr.Url) ? null : pr.Url;
+
+            if (failing)
+            {
+                // Red CI is the author's to fix, and the author is usually the
+                // plane. It is listed so the owner can see why nothing is moving,
+                // not because they are expected to do anything about it.
+                items.Add(new AttentionItem(
+                    $"{prLabel} has failing checks",
+                    $"{pr.Title} - CI is red, so the merge gate will not take it.{waited}",
+                    LevelAttention,
+                    prUrl,
+                    Actor: AttentionActors.Plane,
+                    Action: new AttentionAction("open", "See the failing checks", Url: prUrl)));
+                continue;
+            }
+
+            if (!tracked)
+            {
+                // A branch the plane opened that the plane is no longer tracking.
+                // Its own text has always said "a fault to repair, not a decision
+                // to make", while the panel filed it under the owner's decisions
+                // anyway.
+                items.Add(new AttentionItem(
+                    $"{prLabel} fell out of the pipeline",
+                    $"{pr.Title} - open and green, but the plane is not tracking it, so no review or merge will ever run. This is a fault to repair, not a decision to make.{waited}",
+                    LevelAttention,
+                    prUrl,
+                    Actor: AttentionActors.Operator,
+                    Action: new AttentionAction("command", "Re-enter it into the pipeline",
+                        Command: $"python scripts/command-center.py --readmit {pr.Number}")));
+                continue;
+            }
+
+            // WAITING ON YOU IS A CLAIM, AND IT HAS TO BE CHECKED.
+            //
+            // The rule used to be "open + CI not failing", which is true of every
+            // pull request in flight - so the count grew during healthy activity,
+            // exactly when the owner should be left alone. Three claims were
+            // checked against the same payload that produced them and all three
+            // were false: one said a PR "was approved" that had never been
+            // reviewed, one named a PR whose issue was in the plane's own queue,
+            // and one named a PR that was mid-repair and carried CHANGES_REQUIRED.
+            //
+            // So the same payload is consulted before the claim is made. A pull
+            // request is the owner's only when the plane is demonstrably not going
+            // to move it: nothing running or queued on its issue, and - where the
+            // phase machine has an opinion - a verdict of APPROVED recorded at
+            // THIS head, not an earlier one.
+            var ledger = phases.FirstOrDefault(entry =>
+                entry.PrNumber == pr.Number &&
+                (pr.Repository is null || string.IsNullOrEmpty(entry.Repository) ||
+                 string.Equals(entry.Repository, pr.Repository, StringComparison.OrdinalIgnoreCase)));
+
+            if (ledger is not null && active.Contains(ledger.IssueId))
+            {
+                continue;
+            }
+
+            if (ledger is not null)
+            {
+                // The stage is the pipeline's own statement of who is holding it.
+                // awaiting_verify, awaiting_review, reviewing and wait_for_repair
+                // are all "the plane is going to move this next" - saying "nothing
+                // will merge it without you" over one of those is the claim that
+                // grows the owner's list during healthy activity.
+                //
+                // `ready` is the merge gate: verified, reviewed, and deliberately
+                // handed over because the gate escalates rather than merging on a
+                // protected path. That one really is theirs.
+                var pipelineStillHoldsIt =
+                    ledger.Stage is PhaseStages.AwaitingVerify or PhaseStages.AwaitingReview
+                        or PhaseStages.Reviewing or PhaseStages.WaitForRepair;
+
+                if (pipelineStillHoldsIt)
+                {
+                    continue;
+                }
+
+                // And where a verdict exists it has to be about the code that would
+                // actually be merged. "PR #147 was approved but not merged" was said
+                // of a pull request that had never been reviewed at its head at all;
+                // a verdict recorded against an earlier commit is not a verdict
+                // about this one.
+                var verdictIsStale =
+                    !string.IsNullOrWhiteSpace(ledger.LastVerdictHeadSha) &&
+                    !string.IsNullOrWhiteSpace(pr.HeadSha) &&
+                    !string.Equals(ledger.LastVerdictHeadSha, pr.HeadSha, StringComparison.OrdinalIgnoreCase);
+
+                if (verdictIsStale)
+                {
+                    continue;
+                }
+            }
+
             items.Add(new AttentionItem(
-                failing
-                    ? $"{prLabel} has failing checks"
-                    : tracked
-                        ? $"{prLabel} is waiting on you"
-                        : $"{prLabel} fell out of the pipeline",
-                failing
-                    ? $"{pr.Title} - CI is red, so the merge gate will not take it.{waited}"
-                    : tracked
-                        ? $"{pr.Title} - open and not blocked by CI. Nothing will merge it without you.{waited}"
-                        : $"{pr.Title} - open and green, but the plane is not tracking it, so no review or merge will ever run. This is a fault to repair, not a decision to make.{waited}",
+                $"{prLabel} is waiting on you",
+                ledger is not null
+                    ? $"{pr.Title} - through the pipeline and stopped at the merge gate. Nothing will merge it without you.{waited}"
+                    : $"{pr.Title} - open and not blocked by CI. Nothing will merge it without you.{waited}",
                 LevelAttention,
-                string.IsNullOrWhiteSpace(pr.Url) ? null : pr.Url));
+                prUrl,
+                Actor: AttentionActors.Owner,
+                Action: new AttentionAction("merge", "Merge it", Url: prUrl)));
         }
 
         // A scheduler that has stopped firing is the one fault this summary used
@@ -276,14 +415,37 @@ public static class OwnerAttentionSummary
             // its own. Late and unknown are reported at attention level, because a
             // busy host can legitimately delay a run and a page that escalates
             // ordinary jitter to "down" is one that gets ignored.
-            var severity = task.Health is WatchedTaskReport.HealthDisabled or WatchedTaskReport.HealthFailing
-                ? LevelDown
-                : LevelAttention;
+            // A task that is still scheduled has not stopped - it is due again.
+            //
+            // 2026-09-02: a deploy killed the Commander mid-run. The task recorded
+            // ERROR_PROCESS_ABORTED, the panel said "Something is wrong and it will
+            // not clear itself" and "nothing new will be picked up", and the owner
+            // came to ask what to do. It ran clean six minutes later while the
+            // plane had been dispatching the whole time. Every part of the claim
+            // was false, and the part that made it worst was the certainty.
+            //
+            // So a failure with a future run booked is reported as what it is: one
+            // failure, and another attempt coming. Only a task with no next run -
+            // disabled, or unscheduled - cannot recover without a person.
+            var willRunAgain = task.NextRunUtc is { } next && next > now;
+            var stopped = task.Health == WatchedTaskReport.HealthDisabled || !willRunAgain;
+
+            var severity = stopped ? LevelDown : LevelAttention;
+            var taskDetail = stopped
+                ? task.Explanation
+                : $"{task.Explanation} It is still scheduled and due again {Humanise(task.NextRunUtc!.Value - now)} from now, so this may clear on its own.";
 
             items.Add(new AttentionItem(
-                $"{task.Name} is not running as scheduled",
-                task.Explanation,
-                severity));
+                stopped
+                    ? $"{task.Name} is not running as scheduled"
+                    : $"{task.Name} failed its last run",
+                taskDetail,
+                severity,
+                // Nobody merges or decides a scheduled task. Someone at this machine
+                // runs it, and the exact command beats an exit code every time.
+                Actor: AttentionActors.Operator,
+                Action: new AttentionAction("command", "Run it now",
+                    Command: $"schtasks /run /tn \"{task.Name}\"")));
         }
 
         if (retryQueueCount > 0)
@@ -309,15 +471,44 @@ public static class OwnerAttentionSummary
         string headline;
         string detail;
 
+        // THE HEADLINE IS DERIVED, NOT ASSERTED.
+        //
+        // It used to be a function of severity alone, so anything `down` produced
+        // "Something is wrong and it will not clear itself" and "nothing new will
+        // be picked up" - both stated as fact, neither measured. A killed-and-
+        // rescheduled task triggered exactly that while the plane went on
+        // dispatching, and the owner had to come and ask.
+        //
+        // A headline addressed to the owner has to count the owner's items. The
+        // rest are shown so they can see why things are moving or not, and they
+        // say whose they are.
+        var ownerItems = items.Count(item => item.Actor == AttentionActors.Owner);
+        var othersItems = items.Count - ownerItems;
+        var blocking = runningCount == 0 && retryQueueCount == 0;
+        var others = othersItems == 1 ? "1 other thing is being handled" : $"{othersItems} other things are being handled";
+
         if (level == LevelDown)
         {
-            headline = "Something is wrong and it will not clear itself";
-            detail = "The items below are blocking work. Nothing new will be picked up until they are resolved.";
+            headline = ownerItems > 0
+                ? (ownerItems == 1 ? "One thing needs you, and something has stopped" : $"{ownerItems} things need you, and something has stopped")
+                : "Something has stopped, and it is not yours to fix";
+            detail = blocking
+                ? "Nothing is running. The items marked below will not clear on their own."
+                : "The plane is still working. The items marked below will not clear on their own.";
+        }
+        else if (level == LevelAttention && ownerItems == 0)
+        {
+            // Every item belongs to the plane or to an operator. Saying "N things
+            // are waiting on you" here is the exact claim the owner objected to.
+            headline = "Nothing needs you";
+            detail = $"{others}, listed below so you can see what the plane is doing.";
         }
         else if (level == LevelAttention)
         {
-            headline = items.Count == 1 ? "One thing is waiting on you" : $"{items.Count} things are waiting on you";
-            detail = "The plane is running normally. These are decisions it will not make on its own.";
+            headline = ownerItems == 1 ? "One thing is waiting on you" : $"{ownerItems} things are waiting on you";
+            detail = othersItems == 0
+                ? "The plane is running normally. These are decisions it will not make on its own."
+                : $"These are decisions the plane will not make on its own. {others}.";
         }
         else if (runningCount > 0)
         {
@@ -344,6 +535,9 @@ public static class OwnerAttentionSummary
 
         return (level, headline, detail, items);
     }
+
+    private static string Short(string? sha) =>
+        string.IsNullOrWhiteSpace(sha) ? "unknown" : sha.Length > 8 ? sha[..8] : sha;
 
     private static string Humanise(TimeSpan span)
     {

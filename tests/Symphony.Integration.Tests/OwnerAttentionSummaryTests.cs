@@ -22,8 +22,9 @@ public sealed class OwnerAttentionSummaryTests
         IReadOnlyList<WatchedTaskReport>? watchedTasks = null,
         TrackerReachabilitySnapshot? tracker = null,
         DateTimeOffset? lastEvent = null,
-        string? primaryRepository = null) =>
-        OwnerAttentionSummary.Build(healthy, escalated ?? [], running, retrying, phases ?? [], openPullRequests ?? [], agentActivity ?? [], watchedTasks ?? [], tracker, lastEvent, Now, primaryRepository);
+        string? primaryRepository = null,
+        IReadOnlyCollection<string>? activeIssueIds = null) =>
+        OwnerAttentionSummary.Build(healthy, escalated ?? [], running, retrying, phases ?? [], openPullRequests ?? [], agentActivity ?? [], watchedTasks ?? [], tracker, lastEvent, Now, primaryRepository, activeIssueIds);
 
     // Once the plane watches more than one repository, "#115" stops being an answer:
     // both can have one, and a panel that names it without saying which is telling
@@ -71,14 +72,15 @@ public sealed class OwnerAttentionSummaryTests
         Assert.Contains(result.Items, item => item.Label.Contains("Symphony PR #122", StringComparison.Ordinal));
     }
 
-    private static WatchedTaskReport Task(string name, string health) =>
-        new(name, "\\" + name, "Enabled", "Ready", Now.AddMinutes(-5), 0, Now.AddMinutes(10), 15, health, $"{name} is {health}.");
+    private static WatchedTaskReport Task(string name, string health, bool scheduledAgain = true) =>
+        new(name, "\\" + name, "Enabled", "Ready", Now.AddMinutes(-5), 0,
+            scheduledAgain ? Now.AddMinutes(10) : null, 15, health, $"{name} is {health}.");
 
     private static AgentActivityReport Activity(string summary, TimeSpan ago) =>
         new("Claude", summary, null, null, Now - ago);
 
-    private static OpenPullRequest Pr(int number, string? checks, bool draft = false, string? branch = null) =>
-        new(number, $"Change {number}", $"https://example.invalid/pull/{number}", "someone", draft, checks, "MERGEABLE", Now.AddHours(-6), "", branch);
+    private static OpenPullRequest Pr(int number, string? checks, bool draft = false, string? branch = null, string? headSha = null) =>
+        new(number, $"Change {number}", $"https://example.invalid/pull/{number}", "someone", draft, checks, "MERGEABLE", Now.AddHours(-6), "", branch, headSha);
 
     private static RunEntity Escalated(
         string issue,
@@ -253,8 +255,14 @@ public sealed class OwnerAttentionSummaryTests
         var result = Build(healthy: false, escalated: [Escalated("#63", posted: true)]);
 
         Assert.Equal(OwnerAttentionSummary.LevelDown, result.Level);
-        Assert.Contains("will not clear itself", result.Headline);
         Assert.Equal("The engine is not answering", result.Items[0].Label);
+
+        // The headline no longer promises persistence for everything that is `down`;
+        // it says what stopped and counts only what is actually the owner's. The
+        // "will not clear on their own" claim moved to the detail, where it is made
+        // about the listed items rather than about the whole page.
+        Assert.Contains("stopped", result.Headline);
+        Assert.Contains("will not clear on their own", result.Detail);
     }
 
     [Fact]
@@ -307,22 +315,27 @@ public sealed class OwnerAttentionSummaryTests
     [Fact]
     public void AScheduleThatStoppedFiringIsNotAQuietPlane()
     {
-        var result = Build(watchedTasks: [Task("ADCP Commander", WatchedTaskReport.HealthLate)]);
+        var result = Build(watchedTasks:
+            [Task("ADCP Commander", WatchedTaskReport.HealthLate, scheduledAgain: false)]);
 
-        Assert.Equal(OwnerAttentionSummary.LevelAttention, result.Level);
+        Assert.Equal(OwnerAttentionSummary.LevelDown, result.Level);
         var item = Assert.Single(result.Items);
         Assert.Equal("ADCP Commander is not running as scheduled", item.Label);
+
+        // Nobody decides a scheduled task. Someone runs it, and the panel says how.
+        Assert.Equal(AttentionActors.Operator, item.Actor);
+        Assert.Equal("schtasks /run /tn \"ADCP Commander\"", item.Action?.Command);
     }
 
-    // Disabled and failing will not recover on their own, so they outrank a run
-    // that is merely late - which a busy host can cause without anything at all
-    // being wrong.
+    // "Cannot recover on its own" is about whether another run is booked, not about
+    // the last exit code. A disabled task has nothing coming; so does one whose
+    // schedule has no next run. Those are the two that need a person.
     [Theory]
-    [InlineData(WatchedTaskReport.HealthDisabled)]
-    [InlineData(WatchedTaskReport.HealthFailing)]
-    public void ATaskThatCannotRecoverOnItsOwnReadsAsDown(string health)
+    [InlineData(WatchedTaskReport.HealthDisabled, true)]
+    [InlineData(WatchedTaskReport.HealthFailing, false)]
+    public void ATaskThatCannotRecoverOnItsOwnReadsAsDown(string health, bool scheduledAgain)
     {
-        var result = Build(watchedTasks: [Task("ADCP Event Watcher", health)]);
+        var result = Build(watchedTasks: [Task("ADCP Event Watcher", health, scheduledAgain)]);
 
         Assert.Equal(OwnerAttentionSummary.LevelDown, result.Level);
     }
@@ -470,6 +483,123 @@ public sealed class OwnerAttentionSummaryTests
         var item = Assert.Single(result.Items);
         Assert.Contains("is waiting on you", item.Label);
         Assert.Contains("Nothing will merge it without you", item.Detail);
+    }
+
+    // TRUE. "Waiting on you" was open + CI not failing, which is true of every pull
+    // request in flight - so the owner's list grew during healthy activity, exactly
+    // when they should be left alone. The stage is the pipeline's own statement of
+    // who is holding it, and four of them mean "the plane moves this next".
+    [Theory]
+    [InlineData(PhaseStages.AwaitingVerify)]
+    [InlineData(PhaseStages.AwaitingReview)]
+    [InlineData(PhaseStages.Reviewing)]
+    [InlineData(PhaseStages.WaitForRepair)]
+    public void APullRequestThePipelineIsStillMovingIsNotYours(string stage)
+    {
+        var result = Build(
+            openPullRequests: [Pr(147, "SUCCESS", branch: "symphony/146")],
+            phases: [Ledger("#146", stage, pr: 147)]);
+
+        Assert.DoesNotContain(result.Items, i => i.Label.Contains("waiting on you"));
+    }
+
+    // The dangerous one. "PR #147 was approved but not merged" was said of a pull
+    // request that had never been reviewed at its head at all. A verdict recorded
+    // against an earlier commit is not a verdict about the code that would merge,
+    // and stating otherwise invites merging unreviewed work on the panel's word.
+    [Fact]
+    public void AVerdictAtAnEarlierHeadIsNotAnApprovalOfThisOne()
+    {
+        var ledger = Ledger("#146", PhaseStages.Ready, pr: 147);
+        ledger.LastVerdict = ReviewVerdicts.Approved;
+        ledger.LastVerdictHeadSha = "old00000";
+
+        var result = Build(
+            openPullRequests: [Pr(147, "SUCCESS", branch: "symphony/146", headSha: "new11111")],
+            phases: [ledger]);
+
+        Assert.DoesNotContain(result.Items, i => i.Label.Contains("waiting on you"));
+    }
+
+    [Fact]
+    public void AVerdictAtThisExactHeadIsYours()
+    {
+        var ledger = Ledger("#146", PhaseStages.Ready, pr: 147);
+        ledger.LastVerdict = ReviewVerdicts.Approved;
+        ledger.LastVerdictHeadSha = "same2222";
+
+        var result = Build(
+            openPullRequests: [Pr(147, "SUCCESS", branch: "symphony/146", headSha: "same2222")],
+            phases: [ledger]);
+
+        var item = Assert.Single(result.Items);
+        Assert.Contains("waiting on you", item.Label);
+        Assert.Equal(AttentionActors.Owner, item.Actor);
+        Assert.Equal("merge", item.Action?.Kind);
+    }
+
+    // An issue the plane is mid-run on is not waiting on anyone.
+    [Fact]
+    public void APullRequestWhoseIssueIsRunningIsNotWaitingOnYou()
+    {
+        var result = Build(
+            openPullRequests: [Pr(147, "SUCCESS", branch: "symphony/146")],
+            phases: [Ledger("#146", PhaseStages.Ready, pr: 147)],
+            activeIssueIds: ["issue-#146"]);
+
+        Assert.DoesNotContain(result.Items, i => i.Label.Contains("waiting on you"));
+    }
+
+    // NOT YOURS, NOT SAID TO BE YOURS. A pull request the plane dropped is a fault
+    // to repair - its own detail text always said so while the panel filed it under
+    // the owner's decisions anyway.
+    [Fact]
+    public void AFaultToRepairIsNotFiledAsTheOwnersDecision()
+    {
+        var result = Build(
+            openPullRequests: [Pr(127, "SUCCESS", branch: "symphony/115")],
+            phases: [Ledger("#115", PhaseStages.Closed, pr: 122)]);
+
+        var item = Assert.Single(result.Items);
+        Assert.Equal(AttentionActors.Operator, item.Actor);
+        Assert.NotNull(item.Action?.Command);
+    }
+
+    // And when nothing on the list is the owner's, the headline must not claim
+    // otherwise. This is the exact sentence the owner objected to.
+    [Fact]
+    public void AListWithNothingOfYoursDoesNotSayThingsAreWaitingOnYou()
+    {
+        var result = Build(
+            openPullRequests: [Pr(127, "SUCCESS", branch: "symphony/115")],
+            phases: [Ledger("#115", PhaseStages.Closed, pr: 122)]);
+
+        Assert.Equal("Nothing needs you", result.Headline);
+        Assert.DoesNotContain("waiting on you", result.Headline);
+    }
+
+    // ACTIONABLE. Every item the owner is shown carries something they can do.
+    [Fact]
+    public void EveryOwnerItemCarriesAnAction()
+    {
+        var ledger = Ledger("#146", PhaseStages.Ready, pr: 147);
+        ledger.LastVerdict = ReviewVerdicts.Approved;
+        ledger.LastVerdictHeadSha = "same2222";
+
+        var result = Build(
+            openPullRequests: [Pr(147, "SUCCESS", branch: "symphony/146", headSha: "same2222")],
+            phases: [ledger],
+            watchedTasks: [Task("ADCP Commander", WatchedTaskReport.HealthFailing, scheduledAgain: false)]);
+
+        Assert.NotEmpty(result.Items);
+        Assert.All(result.Items, item =>
+        {
+            Assert.NotNull(item.Action);
+            Assert.False(string.IsNullOrWhiteSpace(item.Action!.Label));
+            Assert.True(
+                item.Action.Url is not null || item.Action.Command is not null,
+                $"'{item.Label}' offers no way to act on it.");
+        });
     }
 
     // Red CI outranks both: the gate will not take it whoever it belongs to.

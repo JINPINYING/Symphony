@@ -70,6 +70,25 @@ document.addEventListener("click", async event => {
     return;
   }
 
+  const copyCommand = event.target.closest("[data-action='copy-command']");
+  if (copyCommand?.dataset.command) {
+    const command = copyCommand.dataset.command;
+    const say = text => {
+      const original = copyCommand.dataset.originalLabel || copyCommand.textContent.trim();
+      copyCommand.dataset.originalLabel = original;
+      copyCommand.textContent = text;
+      window.setTimeout(() => { copyCommand.textContent = original; }, 1600);
+    };
+    /* Clipboard access can be refused, and a button that silently does nothing is
+       worse than one that admits it - so a refusal shows the command instead. */
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(command).then(() => say("Copied"), () => say(command));
+    } else {
+      say(command);
+    }
+    return;
+  }
+
   const projectToggle = event.target.closest("[data-action='toggle-project']");
   if (projectToggle?.dataset.project) {
     const key = projectToggle.dataset.project;
@@ -804,7 +823,9 @@ const WT_ICONS = {
   external: '<path d="M14 4h6v6"/><path d="M20 4 10 14"/><path d="M18 13v6a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h6"/>',
   chevron: '<path d="m9 5 7 7-7 7"/>',
   chevronDown: '<path d="m5 9 7 7 7-7"/>',
-  user: '<circle cx="12" cy="8" r="4"/><path d="M4 21v-1a6 6 0 0 1 6-6h4a6 6 0 0 1 6 6v1"/>'
+  user: '<circle cx="12" cy="8" r="4"/><path d="M4 21v-1a6 6 0 0 1 6-6h4a6 6 0 0 1 6 6v1"/>',
+  copy: '<rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/>',
+  merge: '<circle cx="7" cy="18" r="3"/><circle cx="7" cy="6" r="3"/><circle cx="18" cy="12" r="3"/><path d="M7 9v6"/><path d="M10 6h3a2 2 0 0 1 2 2v2"/>'
 };
 
 // Hoisted, not const: the module's initial loadDashboard() call sits near the
@@ -928,24 +949,35 @@ function renderAttentionPanel() {
 
   const tone = sev === "down" ? "var(--wt-bad)" : sev === "attention" ? "var(--wt-attn)" : "var(--wt-ok)";
 
-  const rows = items.map(i => {
+  /* Yours first, and everything else marked with whose it is. The panel is
+     titled "needs your attention"; an item nobody can act on from here, listed
+     without saying so, is what taught the reader to bring all of it to a person. */
+  const mine = items.filter(i => (i.actor || "owner") === "owner");
+  const theirs = items.filter(i => (i.actor || "owner") !== "owner");
+
+  const row = i => {
     const s = String(i.severity || "").toLowerCase() === "down" ? "down" : "attention";
-    const isPr = /\bPR\b|pull request/i.test(`${i.label || ""} ${i.url || ""}`);
+    const actor = i.actor || "owner";
+    const word = actor === "owner" ? "YOURS" : actor === "plane" ? "PLANE" : "OPERATOR";
     /* One line per item. The "why" is a hover tooltip here rather than a
        paragraph: this panel exists to be counted at a glance, and the same
        detail is printed in full in the queue panel below, so nothing is lost. */
     return `
-      <div class="wt-item is-tight sev-${s}" title="${escapeAttribute(i.detail || "")}">
-        <span class="wt-badge sev-${s}">ATTENTION</span>
+      <div class="wt-item is-tight ${actor === "owner" ? "sev-" + s : ""}" title="${escapeAttribute(i.detail || "")}">
+        <span class="wt-badge ${actor === "owner" ? "sev-" + s : ""}">${word}</span>
         <div class="wt-item-body">
           <div class="wt-item-title wt-clip">${escapeHtml(i.label || "")}</div>
         </div>
         <div class="wt-item-right">
-          ${actionButton(i.url, isPr ? "Open PR" : "Open issue")}
+          ${renderAttentionAction(i.action, i)}
           ${chevronLink(i.url, i.label)}
         </div>
       </div>`;
-  }).join("");
+  };
+
+  const rows = mine.map(row).join("") + (theirs.length
+    ? `<div class="wt-subhead">Being handled &mdash; shown so you can see why</div>${theirs.map(row).join("")}`
+    : "");
 
   host.innerHTML = `
     <div class="wt-attn-top">
@@ -965,6 +997,27 @@ function renderAttentionPanel() {
       </div>
     </div>
     ${rows ? `<div class="wt-items">${rows}</div>` : ""}`;
+}
+
+/* An item the reader cannot act on does not belong on a panel addressed to them.
+   Where the action needs a terminal the exact command is offered, copyable, not
+   described: "its last run exited with code -2147023829" is not an action;
+   `schtasks /run /tn "ADCP Commander"` is. */
+function renderAttentionAction(action, item) {
+  if (!action) {
+    return item?.url ? actionLink(item.url, "Open") : "";
+  }
+
+  if (action.kind === "command" && action.command) {
+    return `<button type="button" class="wt-btn" data-action="copy-command"
+      data-command="${escapeAttribute(action.command)}"
+      title="${escapeAttribute(action.command)}">${icon("copy", 14)}${escapeHtml(action.label)}</button>`;
+  }
+
+  const url = action.url || item?.url;
+  if (!url) return "";
+  return `<a class="wt-btn" href="${escapeAttribute(url)}" target="_blank" rel="noreferrer">${
+    icon(action.kind === "merge" ? "merge" : "github", 14)}${escapeHtml(action.label)}</a>`;
 }
 
 /* ---------- 2. is the machinery healthy ---------- */

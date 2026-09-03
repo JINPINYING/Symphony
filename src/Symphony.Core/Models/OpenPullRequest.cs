@@ -35,4 +35,16 @@ public sealed record OpenPullRequest(
     // ("symphony/115") from one a person opened, which decides whether an
     // untracked green PR is a decision waiting on the owner or a fault where the
     // pipeline dropped its own work.
-    string? HeadRefName = null);
+    string? HeadRefName = null,
+    // The commit this pull request currently points at.
+    //
+    // LAST, and defaulted, on purpose. Adding it between the existing trailing
+    // parameters shifted every positional construction by one - HeadRefName
+    // silently became null, plane-opened branches stopped being recognised, and a
+    // dropped pull request started reporting as the owner's decision. The suite
+    // caught it; the compiler could not, because both are `string?`.
+    //
+    // Needed because "approved" is only ever a fact about a specific head: a
+    // verdict recorded against an earlier commit says nothing about the code that
+    // would actually be merged.
+    string? HeadSha = null);
