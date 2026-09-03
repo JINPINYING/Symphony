@@ -21,10 +21,14 @@ public sealed class OwnerAttentionSummaryTests
         IReadOnlyList<AgentActivityReport>? agentActivity = null,
         IReadOnlyList<WatchedTaskReport>? watchedTasks = null,
         TrackerReachabilitySnapshot? tracker = null,
+        IReadOnlyList<InFlightIssue>? inFlight = null,
+        IReadOnlyDictionary<string, string>? escalationReasons = null,
         DateTimeOffset? lastEvent = null,
-        string? primaryRepository = null,
-        IReadOnlyCollection<string>? activeIssueIds = null) =>
-        OwnerAttentionSummary.Build(healthy, escalated ?? [], running, retrying, phases ?? [], openPullRequests ?? [], agentActivity ?? [], watchedTasks ?? [], tracker, lastEvent, Now, primaryRepository, activeIssueIds);
+        string? primaryRepository = null) =>
+        OwnerAttentionSummary.Build(
+            healthy, escalated ?? [], running, retrying, phases ?? [], openPullRequests ?? [],
+            agentActivity ?? [], watchedTasks ?? [], tracker, inFlight ?? [],
+            escalationReasons ?? new Dictionary<string, string>(), lastEvent, Now, primaryRepository);
 
     // Once the plane watches more than one repository, "#115" stops being an answer:
     // both can have one, and a panel that names it without saying which is telling
@@ -79,7 +83,12 @@ public sealed class OwnerAttentionSummaryTests
     private static AgentActivityReport Activity(string summary, TimeSpan ago) =>
         new("Claude", summary, null, null, Now - ago);
 
-    private static OpenPullRequest Pr(int number, string? checks, bool draft = false, string? branch = null, string? headSha = null) =>
+    private static OpenPullRequest Pr(
+        int number,
+        string? checks,
+        bool draft = false,
+        string? branch = null,
+        string? headSha = null) =>
         new(number, $"Change {number}", $"https://example.invalid/pull/{number}", "someone", draft, checks, "MERGEABLE", Now.AddHours(-6), "", branch, headSha);
 
     private static RunEntity Escalated(
@@ -97,13 +106,82 @@ public sealed class OwnerAttentionSummaryTests
         EscalationPostedAtUtc = posted ? Now.AddMinutes(-5) : null,
     };
 
-    private static PhaseLedgerEntity Ledger(string issue, string stage, int pr = 1) => new()
+    private static PhaseLedgerEntity Ledger(
+        string issue,
+        string stage,
+        int pr = 1,
+        string? headSha = null,
+        string? verdict = null,
+        string? verdictHeadSha = null) => new()
     {
         IssueId = "issue-" + issue,
         IssueIdentifier = issue,
         Stage = stage,
-        PrNumber = pr
+        PrNumber = pr,
+        HeadSha = headSha,
+        LastVerdict = verdict,
+        // A verdict is always recorded against the head it was given at; defaulting
+        // to the ledger head keeps the common "approved at the head it carries"
+        // case from needing the sha written twice.
+        LastVerdictHeadSha = verdict is null ? null : verdictHeadSha ?? headSha
     };
+
+    private static InFlightIssue InFlight(string issue) => new("issue-" + issue, issue);
+
+    // ACTIONABLE, as a property rather than a case. The owner: "items needs my
+    // attention has to be true and actionable button for me to resolve." A new
+    // item type cannot be added without a way to act on it.
+    [Fact]
+    public void EveryItemCarriesAWayToActOnIt()
+    {
+        var result = Build(
+            healthy: false,
+            escalated: [Escalated("#63", posted: true)],
+            openPullRequests:
+            [
+                Pr(105, "SUCCESS"),
+                Pr(127, "FAILURE", branch: "symphony/115"),
+                Pr(131, "SUCCESS", branch: "symphony/120")
+            ],
+            phases: [Ledger("#115", PhaseStages.Closed, pr: 122)],
+            watchedTasks: [Task("ADCP Commander", WatchedTaskReport.HealthFailing, scheduledAgain: false)],
+            retrying: 2);
+
+        Assert.NotEmpty(result.Items);
+        Assert.All(result.Items, item =>
+        {
+            // The plane's own work is the one thing that needs no button: it is
+            // listed as context, not as a demand.
+            if (item.Actor == AttentionActors.Plane && item.Action is null)
+            {
+                return;
+            }
+
+            Assert.NotNull(item.Action);
+            Assert.False(string.IsNullOrWhiteSpace(item.Action!.Label));
+            Assert.True(
+                item.Action.Url is not null || item.Action.Command is not null,
+                $"'{item.Label}' is shown to someone with no way to act on it.");
+        });
+    }
+
+    // NOT YOURS, NOT SAID TO BE YOURS. When nothing on the list is the owner's,
+    // the headline must not count other people's work at them. This is the exact
+    // sentence the owner objected to.
+    [Fact]
+    public void AListWithNothingOfYoursDoesNotSayThingsAreWaitingOnYou()
+    {
+        var result = Build(
+            openPullRequests: [Pr(127, "SUCCESS", branch: "symphony/115")],
+            phases: [Ledger("#115", PhaseStages.Closed, pr: 122)]);
+
+        var item = Assert.Single(result.Items);
+        Assert.Equal(AttentionActors.Operator, item.Actor);
+        Assert.NotNull(item.Action?.Command);
+
+        Assert.Equal("Nothing needs you", result.Headline);
+        Assert.DoesNotContain("waiting on you", result.Headline);
+    }
 
     // The bug this whole input exists to fix: every other signal here is the
     // engine's own run state, so an empty queue read as "nothing needs you" while
@@ -255,31 +333,89 @@ public sealed class OwnerAttentionSummaryTests
         var result = Build(healthy: false, escalated: [Escalated("#63", posted: true)]);
 
         Assert.Equal(OwnerAttentionSummary.LevelDown, result.Level);
-        Assert.Equal("The engine is not answering", result.Items[0].Label);
-
-        // The headline no longer promises persistence for everything that is `down`;
-        // it says what stopped and counts only what is actually the owner's. The
-        // "will not clear on their own" claim moved to the detail, where it is made
-        // about the listed items rather than about the whole page.
+        // The headline no longer promises persistence for everything that is
+        // `down`; it says what stopped and counts only what is actually the
+        // owner's. The claim moved to the detail, about the listed items.
         Assert.Contains("stopped", result.Headline);
         Assert.Contains("will not clear on their own", result.Detail);
+        Assert.Equal("The engine is not answering", result.Items[0].Label);
     }
 
+    // The merge gate is the one thing that can approve a change and still refuse
+    // it, so the item is only that item when the approval is really there - at the
+    // head the pull request carries now, the way the gate itself checks.
     [Fact]
     public void APhaseStoppedAtTheMergeGateIsSurfaced()
     {
-        var result = Build(phases: [new PhaseLedgerEntity
-        {
-            IssueId = "issue-1",
-            IssueIdentifier = "#95",
-            Stage = PhaseStages.Escalated,
-            PrNumber = 96,
-        }]);
+        var result = Build(
+            phases: [Ledger("#95", PhaseStages.Escalated, pr: 96, headSha: "66c4d9a61b", verdict: ReviewVerdicts.Approved)],
+            escalationReasons: new Dictionary<string, string>
+            {
+                ["issue-#95"] = "Phase orchestration: Merge gate refused PR #96: the PR touches a protected path ('config/DIRECTION.md')."
+            });
 
         Assert.Equal(OwnerAttentionSummary.LevelAttention, result.Level);
         var item = Assert.Single(result.Items);
         Assert.Contains("#95", item.Label);
-        Assert.Contains("protected path", item.Detail);
+        Assert.Contains("stopped at the merge gate", item.Label);
+        Assert.Contains("approved at head 66c4d9a6", item.Detail);
+        // Which path, not "a protected path" - the path is the only part of the
+        // gate's refusal the owner can actually act on.
+        Assert.Contains("config/DIRECTION.md", item.Detail);
+    }
+
+    // 2026-09-02, and the most damaging item the panel has produced. Every phase
+    // escalation printed the merge-gate story, so PR #147 - which had never been
+    // reviewed, and whose run escalated during implementation - was announced to
+    // the owner as approved and waiting to be merged. The panel was inviting them
+    // to merge unreviewed code on its own word.
+    [Fact]
+    public void AnEscalationWithNoApprovalIsNotAMergeGateStory()
+    {
+        var result = Build(
+            phases: [Ledger("#146", PhaseStages.Escalated, pr: 147, headSha: "66c4d9a61b")],
+            escalationReasons: new Dictionary<string, string>
+            {
+                ["issue-#146"] = "Phase orchestration: the implementation run produced no reviewable change."
+            });
+
+        var item = Assert.Single(result.Items);
+        Assert.DoesNotContain("merge gate", item.Label);
+        Assert.DoesNotContain("was approved", item.Detail, StringComparison.OrdinalIgnoreCase);
+        // The phase it really stopped in, and its reason, in place of the story.
+        Assert.Contains("stopped in the phase pipeline", item.Label);
+        Assert.Contains("produced no reviewable change", item.Detail);
+        Assert.Contains("no review verdict at head 66c4d9a6", item.Detail);
+    }
+
+    // An approval for a head the branch has since moved past is not an approval of
+    // what is there now - the same exact-head rule the merge gate enforces.
+    [Fact]
+    public void AnApprovalForAHeadTheBranchHasMovedPastIsNotAnApproval()
+    {
+        var result = Build(phases:
+        [
+            Ledger("#95", PhaseStages.Escalated, pr: 96, headSha: "b2b2b2b2b2",
+                verdict: ReviewVerdicts.Approved, verdictHeadSha: "a1a1a1a1a1")
+        ]);
+
+        var item = Assert.Single(result.Items);
+        Assert.Contains("stopped in the phase pipeline", item.Label);
+        Assert.Contains("no review verdict at head b2b2b2b2", item.Detail);
+    }
+
+    [Fact]
+    public void AnEscalationCarryingChangesRequiredSaysSo()
+    {
+        var result = Build(phases:
+        [
+            Ledger("#142", PhaseStages.Escalated, pr: 148, headSha: "cc11cc11cc",
+                verdict: ReviewVerdicts.ChangesRequired)
+        ]);
+
+        var item = Assert.Single(result.Items);
+        Assert.Contains("CHANGES_REQUIRED at head cc11cc11", item.Detail);
+        Assert.Contains("not merge-ready", item.Detail);
     }
 
     [Fact]
@@ -304,8 +440,14 @@ public sealed class OwnerAttentionSummaryTests
             retrying: 3);
 
         Assert.Equal(3, result.Items.Count);
-        Assert.Equal("3 things are waiting on you", result.Headline);
+
+        // Three items, two of them the owner's. Retries are the plane's own
+        // business - counting them at the owner is how the number stopped meaning
+        // anything.
+        Assert.Equal("2 things are waiting on you", result.Headline);
         Assert.Contains(result.Items, i => i.Label.StartsWith("3 runs waiting", StringComparison.Ordinal));
+        Assert.Equal(AttentionActors.Plane,
+            result.Items.Single(i => i.Label.StartsWith("3 runs waiting", StringComparison.Ordinal)).Actor);
     }
 
     // The 27-hour blind spot. Every other input to this summary is the engine's
@@ -327,9 +469,12 @@ public sealed class OwnerAttentionSummaryTests
         Assert.Equal("schtasks /run /tn \"ADCP Commander\"", item.Action?.Command);
     }
 
+    // Disabled and failing will not recover on their own, so they outrank a run
+    // that is merely late - which a busy host can cause without anything at all
+    // being wrong.
     // "Cannot recover on its own" is about whether another run is booked, not about
-    // the last exit code. A disabled task has nothing coming; so does one whose
-    // schedule has no next run. Those are the two that need a person.
+    // the last exit code. A deploy killed the Commander mid-run on 2026-09-02; the
+    // panel called that unrecoverable and it ran clean six minutes later.
     [Theory]
     [InlineData(WatchedTaskReport.HealthDisabled, true)]
     [InlineData(WatchedTaskReport.HealthFailing, false)]
@@ -453,7 +598,28 @@ public sealed class OwnerAttentionSummaryTests
     {
         var result = Build(phases: [Ledger("#126", PhaseStages.Escalated, pr: 131)]);
 
-        Assert.Contains("stopped at the merge gate", Assert.Single(result.Items).Label);
+        Assert.Contains("stopped in the phase pipeline", Assert.Single(result.Items).Label);
+    }
+
+    // The run lane has linked to its issue since 2026-09-01; this lane did not, so
+    // whichever lane reported an escalation decided whether the reader got a link.
+    [Fact]
+    public void APhaseEscalationLinksToItsIssueToo()
+    {
+        var ledger = Ledger("#126", PhaseStages.Escalated, pr: 131);
+        ledger.Repository = "JINPINYING/Symphony";
+
+        var result = Build(phases: [ledger]);
+
+        Assert.Equal("https://github.com/JINPINYING/Symphony/issues/126", Assert.Single(result.Items).Url);
+    }
+
+    [Fact]
+    public void AnEscalationWithNoRecordedPhaseReasonSaysSoRatherThanInventingOne()
+    {
+        var result = Build(phases: [Ledger("#126", PhaseStages.Escalated, pr: 131)]);
+
+        Assert.Contains("did not record a reason", Assert.Single(result.Items).Detail);
     }
 
     // The owner asked whether "waiting on you" really meant them. For PR #127 it
@@ -477,129 +643,164 @@ public sealed class OwnerAttentionSummaryTests
     public void AGreenPullRequestThePipelineHoldsIsStillYourDecision()
     {
         var result = Build(
-            openPullRequests: [Pr(127, "SUCCESS", branch: "symphony/115")],
-            phases: [Ledger("#115", PhaseStages.Ready, pr: 127)]);
+            openPullRequests: [Pr(127, "SUCCESS", branch: "symphony/115", headSha: "aa11bb22cc")],
+            phases: [Ledger("#115", PhaseStages.Ready, pr: 127, headSha: "aa11bb22cc", verdict: ReviewVerdicts.Approved)]);
 
         var item = Assert.Single(result.Items);
         Assert.Contains("is waiting on you", item.Label);
         Assert.Contains("Nothing will merge it without you", item.Detail);
     }
 
-    // TRUE. "Waiting on you" was open + CI not failing, which is true of every pull
-    // request in flight - so the owner's list grew during healthy activity, exactly
-    // when they should be left alone. The stage is the pipeline's own statement of
-    // who is holding it, and four of them mean "the plane moves this next".
+    // 2026-09-02: "PR #148 is waiting on you ... Waiting less than a minute", posted
+    // while the issue behind it was RUNNING and an agent was mid-repair on that very
+    // branch. The panel announced healthy work as an owner obligation seconds after
+    // the plane picked it up.
+    [Fact]
+    public void APullRequestForAnIssueThePlaneIsRunningIsNotWaitingOnYou()
+    {
+        var result = Build(
+            openPullRequests: [Pr(148, "SUCCESS", branch: "symphony/142", headSha: "dd44dd44dd")],
+            phases: [Ledger("#142", PhaseStages.Ready, pr: 148, headSha: "dd44dd44dd", verdict: ReviewVerdicts.Approved)],
+            inFlight: [InFlight("#142")],
+            running: 1);
+
+        Assert.Equal(OwnerAttentionSummary.LevelClear, result.Level);
+        Assert.Empty(result.Items);
+    }
+
+    // "Nothing will merge it without you" for an issue sitting in the plane's own
+    // queue, three lines below on the same page. The plane will pick it up when a
+    // slot frees; the owner has nothing to do.
+    [Fact]
+    public void APullRequestForAQueuedIssueIsNotWaitingOnYou()
+    {
+        var result = Build(
+            openPullRequests: [Pr(147, "SUCCESS", branch: "symphony/146", headSha: "66c4d9a61b")],
+            phases: [Ledger("#146", PhaseStages.Ready, pr: 147, headSha: "66c4d9a61b", verdict: ReviewVerdicts.Approved)],
+            inFlight: [InFlight("#146")]);
+
+        Assert.Empty(result.Items);
+    }
+
+    // The repair is the plane's single bounded one, fenced until the head moves.
+    // Nothing about it is a decision, and the head it holds carries the rejection.
     [Theory]
     [InlineData(PhaseStages.AwaitingVerify)]
     [InlineData(PhaseStages.AwaitingReview)]
     [InlineData(PhaseStages.Reviewing)]
     [InlineData(PhaseStages.WaitForRepair)]
-    public void APullRequestThePipelineIsStillMovingIsNotYours(string stage)
+    public void APullRequestThePipelineIsDrivingIsNotWaitingOnYou(string stage)
     {
         var result = Build(
-            openPullRequests: [Pr(147, "SUCCESS", branch: "symphony/146")],
-            phases: [Ledger("#146", stage, pr: 147)]);
+            openPullRequests: [Pr(148, "SUCCESS", branch: "symphony/142", headSha: "dd44dd44dd")],
+            phases: [Ledger("#142", stage, pr: 148, headSha: "dd44dd44dd")]);
 
-        Assert.DoesNotContain(result.Items, i => i.Label.Contains("waiting on you"));
+        Assert.Equal(OwnerAttentionSummary.LevelClear, result.Level);
+        Assert.Empty(result.Items);
     }
 
-    // The dangerous one. "PR #147 was approved but not merged" was said of a pull
-    // request that had never been reviewed at its head at all. A verdict recorded
-    // against an earlier commit is not a verdict about the code that would merge,
-    // and stating otherwise invites merging unreviewed work on the panel's word.
+    // A head carrying CHANGES_REQUIRED is not mergeable by anyone, so calling it
+    // the owner's decision is doubly wrong: they cannot take it, and the plane has
+    // not finished with it.
     [Fact]
-    public void AVerdictAtAnEarlierHeadIsNotAnApprovalOfThisOne()
-    {
-        var ledger = Ledger("#146", PhaseStages.Ready, pr: 147);
-        ledger.LastVerdict = ReviewVerdicts.Approved;
-        ledger.LastVerdictHeadSha = "old00000";
-
-        var result = Build(
-            openPullRequests: [Pr(147, "SUCCESS", branch: "symphony/146", headSha: "new11111")],
-            phases: [ledger]);
-
-        Assert.DoesNotContain(result.Items, i => i.Label.Contains("waiting on you"));
-    }
-
-    [Fact]
-    public void AVerdictAtThisExactHeadIsYours()
-    {
-        var ledger = Ledger("#146", PhaseStages.Ready, pr: 147);
-        ledger.LastVerdict = ReviewVerdicts.Approved;
-        ledger.LastVerdictHeadSha = "same2222";
-
-        var result = Build(
-            openPullRequests: [Pr(147, "SUCCESS", branch: "symphony/146", headSha: "same2222")],
-            phases: [ledger]);
-
-        var item = Assert.Single(result.Items);
-        Assert.Contains("waiting on you", item.Label);
-        Assert.Equal(AttentionActors.Owner, item.Actor);
-        Assert.Equal("merge", item.Action?.Kind);
-    }
-
-    // An issue the plane is mid-run on is not waiting on anyone.
-    [Fact]
-    public void APullRequestWhoseIssueIsRunningIsNotWaitingOnYou()
+    public void APullRequestWhoseHeadCarriesChangesRequiredIsNotADecision()
     {
         var result = Build(
-            openPullRequests: [Pr(147, "SUCCESS", branch: "symphony/146")],
-            phases: [Ledger("#146", PhaseStages.Ready, pr: 147)],
-            activeIssueIds: ["issue-#146"]);
+            openPullRequests: [Pr(148, "SUCCESS", branch: "symphony/142", headSha: "dd44dd44dd")],
+            phases:
+            [
+                Ledger("#142", PhaseStages.Ready, pr: 148, headSha: "dd44dd44dd",
+                    verdict: ReviewVerdicts.ChangesRequired)
+            ]);
 
-        Assert.DoesNotContain(result.Items, i => i.Label.Contains("waiting on you"));
+        Assert.Empty(result.Items);
     }
 
-    // NOT YOURS, NOT SAID TO BE YOURS. A pull request the plane dropped is a fault
-    // to repair - its own detail text always said so while the panel filed it under
-    // the owner's decisions anyway.
+    // "Approved" has to be an approval of what is on the branch now. An approval
+    // recorded against an earlier head is the exact-head rule the merge gate keeps
+    // and the panel did not.
     [Fact]
-    public void AFaultToRepairIsNotFiledAsTheOwnersDecision()
+    public void AnApprovalForAnEarlierHeadDoesNotMakeAPullRequestYours()
+    {
+        var result = Build(
+            openPullRequests: [Pr(127, "SUCCESS", branch: "symphony/115", headSha: "b2b2b2b2b2")],
+            phases:
+            [
+                Ledger("#115", PhaseStages.Ready, pr: 127, headSha: "b2b2b2b2b2",
+                    verdict: ReviewVerdicts.Approved, verdictHeadSha: "a1a1a1a1a1")
+            ]);
+
+        Assert.Empty(result.Items);
+    }
+
+    // Not being able to check is not the same as having checked. A snapshot taken
+    // before the head was recorded must not be read as an approval.
+    [Fact]
+    public void APullRequestWithNoKnownHeadIsNotClaimedAsApproved()
     {
         var result = Build(
             openPullRequests: [Pr(127, "SUCCESS", branch: "symphony/115")],
-            phases: [Ledger("#115", PhaseStages.Closed, pr: 122)]);
+            phases:
+            [
+                Ledger("#115", PhaseStages.Ready, pr: 127, headSha: "aa11bb22cc",
+                    verdict: ReviewVerdicts.Approved)
+            ]);
 
-        var item = Assert.Single(result.Items);
-        Assert.Equal(AttentionActors.Operator, item.Actor);
-        Assert.NotNull(item.Action?.Command);
+        Assert.Empty(result.Items);
     }
 
-    // And when nothing on the list is the owner's, the headline must not claim
-    // otherwise. This is the exact sentence the owner objected to.
+    // An escalated phase is reported once, by the lane holding its reason. The
+    // pull request lane repeating it as an ordinary merge decision both doubled
+    // the count and relabelled a parked run.
     [Fact]
-    public void AListWithNothingOfYoursDoesNotSayThingsAreWaitingOnYou()
+    public void AnEscalatedPhasesPullRequestIsNotAlsoAMergeDecision()
+    {
+        var result = Build(
+            openPullRequests: [Pr(147, "SUCCESS", branch: "symphony/146", headSha: "66c4d9a61b")],
+            escalated: [Escalated("#146", posted: true, lastMessage: "Phase orchestration: implementation produced no change.")],
+            phases: [Ledger("#146", PhaseStages.Escalated, pr: 147, headSha: "66c4d9a61b")]);
+
+        var item = Assert.Single(result.Items);
+        Assert.Contains("needs a decision", item.Label);
+    }
+
+    // The other half of the same rule: a pull request a person opened has no
+    // ledger and never will, so nothing in the plane is ever going to move it.
+    // Silencing those would trade over-reporting for a page that says nothing.
+    [Fact]
+    public void APullRequestNobodyInThePlaneOwnsIsStillYours()
+    {
+        var result = Build(
+            openPullRequests: [Pr(200, "SUCCESS", branch: "feature/hand-written")],
+            inFlight: [InFlight("#142")]);
+
+        Assert.Contains(result.Items, i => i.Label == "PR #200 is waiting on you");
+    }
+
+    // "No review or merge will ever run" is a false alarm while the plane is
+    // running the very issue the branch belongs to - the ledger simply has not
+    // been written yet.
+    [Fact]
+    public void ABranchWhoseIssueIsInFlightIsNotYetAFault()
     {
         var result = Build(
             openPullRequests: [Pr(127, "SUCCESS", branch: "symphony/115")],
-            phases: [Ledger("#115", PhaseStages.Closed, pr: 122)]);
+            inFlight: [InFlight("#115")],
+            running: 1);
 
-        Assert.Equal("Nothing needs you", result.Headline);
-        Assert.DoesNotContain("waiting on you", result.Headline);
+        Assert.Empty(result.Items);
     }
 
-    // ACTIONABLE. Every item the owner is shown carries something they can do.
+    // And once the plane is genuinely not going to touch it, the fault is reported
+    // exactly as before.
     [Fact]
-    public void EveryOwnerItemCarriesAnAction()
+    public void ABranchWhoseIssueIsNotInFlightIsStillAFault()
     {
-        var ledger = Ledger("#146", PhaseStages.Ready, pr: 147);
-        ledger.LastVerdict = ReviewVerdicts.Approved;
-        ledger.LastVerdictHeadSha = "same2222";
-
         var result = Build(
-            openPullRequests: [Pr(147, "SUCCESS", branch: "symphony/146", headSha: "same2222")],
-            phases: [ledger],
-            watchedTasks: [Task("ADCP Commander", WatchedTaskReport.HealthFailing, scheduledAgain: false)]);
+            openPullRequests: [Pr(127, "SUCCESS", branch: "symphony/115")],
+            inFlight: [InFlight("#138")]);
 
-        Assert.NotEmpty(result.Items);
-        Assert.All(result.Items, item =>
-        {
-            Assert.NotNull(item.Action);
-            Assert.False(string.IsNullOrWhiteSpace(item.Action!.Label));
-            Assert.True(
-                item.Action.Url is not null || item.Action.Command is not null,
-                $"'{item.Label}' offers no way to act on it.");
-        });
+        Assert.Contains("fell out of the pipeline", Assert.Single(result.Items).Label);
     }
 
     // Red CI outranks both: the gate will not take it whoever it belongs to.
