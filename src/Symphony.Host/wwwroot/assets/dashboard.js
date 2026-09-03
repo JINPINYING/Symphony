@@ -273,8 +273,8 @@ function render() {
   renderAttentionPanel();   // 1. does this need me
   renderHealthPanel();      // 2. is the machinery healthy
   renderTeamPanel();        // 3. what is the team doing
-  renderActivityPanel();    // 4. what just happened
-  renderQueuePanel();       // 5. what is queued or blocked, and why
+  renderQueuePanel();       // 4. what is queued or blocked, and why
+  renderActivityPanel();    // 5. what just happened
   renderRoadmapPanel();     // 6. how are the projects progressing
 
   renderUtilityStrip();
@@ -795,7 +795,7 @@ function escapeAttribute(value) {
 /* ===========================================================================
    WATCHTOWER LAYOUT
    Panels in priority order: does this need me -> is the machinery healthy ->
-   who is working -> what just happened -> what is queued or blocked -> how are
+   who is working -> what is queued or blocked -> what just happened -> how are
    the projects progressing.
 
    Every state carries a WORD. Where a coloured dot or bar appears it sits
@@ -1137,7 +1137,7 @@ function renderTeamPanel() {
       : `<div class="wt-empty">No workers configured.</div>`}`;
 }
 
-/* ---------- 4. what just happened ---------- */
+/* ---------- 5. what just happened ---------- */
 function renderActivityPanel() {
   const host = document.getElementById("panel-activity");
   if (!host) return;
@@ -1172,7 +1172,7 @@ function renderActivityPanel() {
     ${rows ? `<div class="wt-feed">${rows}</div>` : `<div class="wt-empty">Nothing reported yet.</div>`}`;
 }
 
-/* ---------- 5. what is queued or blocked, and why ---------- */
+/* ---------- 4. what is queued or blocked, and why ---------- */
 function renderQueuePanel() {
   const host = document.getElementById("panel-queue");
   if (!host) return;
