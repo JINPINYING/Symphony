@@ -36,15 +36,19 @@ public sealed record OpenPullRequest(
     // untracked green PR is a decision waiting on the owner or a fault where the
     // pipeline dropped its own work.
     string? HeadRefName = null,
-    // The commit this pull request currently points at.
-    //
-    // LAST, and defaulted, on purpose. Adding it between the existing trailing
-    // parameters shifted every positional construction by one - HeadRefName
-    // silently became null, plane-opened branches stopped being recognised, and a
-    // dropped pull request started reporting as the owner's decision. The suite
-    // caught it; the compiler could not, because both are `string?`.
+    // The exact commit this pull request currently points at.
     //
     // Needed because "approved" is only ever a fact about a specific head: a
     // verdict recorded against an earlier commit says nothing about the code that
-    // would actually be merged.
+    // would actually be merged. Without it a reader can only ask "was this
+    // approved at some point", which is the question that let the status page
+    // announce an approval for a head no reviewer had ever seen. Every claim about
+    // a verdict binds to this, exactly as the merge gate does.
+    //
+    // LAST, and defaulted, on purpose - for the snapshot-compatibility reason the
+    // two above give, and because putting it between them shifted every positional
+    // construction by one. HeadRefName silently became null, plane-opened branches
+    // stopped being recognised, and a dropped pull request began reporting as the
+    // owner's decision. The suite caught it; the compiler could not, because both
+    // are `string?`.
     string? HeadSha = null);

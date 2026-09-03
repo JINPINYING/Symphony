@@ -36,6 +36,142 @@ public sealed class RuntimeStateService(
 
 
     /// <summary>
+    /// Issues carrying a directive the plane has accepted but not consumed yet.
+    ///
+    /// The owner has already answered; the plane simply has not reached it, and
+    /// until it does the issue is not waiting on anyone. A marker is believed only
+    /// while it is fresh and only while its comment is still unconsumed, so neither
+    /// a deleted comment nor a directive the plane has since acted on can go on
+    /// suppressing an item.
+    /// </summary>
+    private async Task<HashSet<string>> ReadPendingDirectiveIssueIdsAsync(
+        DateTimeOffset now,
+        CancellationToken cancellationToken)
+    {
+        var markers = (await dbContext.EventLog
+            .AsNoTracking()
+            .Where(entry => entry.EventName == DirectiveProcessor.PendingDirectiveEvent
+                         && entry.IssueId != null
+                         && entry.DataJson != null)
+            .Select(entry => new { entry.IssueId, entry.DataJson, entry.OccurredAtUtc })
+            .ToListAsync(cancellationToken))
+            .Select(marker => new PendingDirectiveMarker(marker.IssueId!, marker.DataJson, marker.OccurredAtUtc))
+            .ToList();
+
+        if (markers.Count == 0)
+        {
+            return [];
+        }
+
+        var consumed = (await dbContext.DirectiveLog
+            .AsNoTracking()
+            .Select(entry => entry.CommentId)
+            .ToListAsync(cancellationToken))
+            .ToHashSet(StringComparer.Ordinal);
+
+        return SelectPendingDirectiveIssueIds(markers, consumed, now);
+    }
+
+    internal sealed record PendingDirectiveMarker(string IssueId, string? DataJson, DateTimeOffset OccurredAtUtc);
+
+    /// <summary>
+    /// Which recorded markers still mean "the plane owes this issue an action".
+    /// </summary>
+    /// <remarks>
+    /// Separated from the query because this is the part that can silently hide an
+    /// owner's item, and both conditions are ones that get it wrong in opposite
+    /// directions. A consumed comment means the plane has already acted, so the
+    /// marker is spent. A stale one means the plane stopped re-recording it - the
+    /// comment was deleted, or this is a marker from a world that no longer exists -
+    /// and believing it forever would suppress that issue's pull request for good.
+    ///
+    /// The freshness cut is applied here rather than in the query because SQLite
+    /// cannot compare a DateTimeOffset at all; there is one row per pending
+    /// directive, so there is nothing to gain from pushing it down anyway.
+    /// </remarks>
+    internal static HashSet<string> SelectPendingDirectiveIssueIds(
+        IReadOnlyList<PendingDirectiveMarker> markers,
+        IReadOnlySet<string> consumedCommentIds,
+        DateTimeOffset now)
+    {
+        var oldest = now - DirectiveProcessor.PendingDirectiveWindow;
+
+        return markers
+            .Where(marker => marker.OccurredAtUtc >= oldest)
+            .Where(marker => ReadPendingDirectiveCommentId(marker.DataJson) is { } commentId
+                             && !consumedCommentIds.Contains(commentId))
+            .Select(marker => marker.IssueId)
+            .ToHashSet(StringComparer.Ordinal);
+    }
+
+    private static string? ReadPendingDirectiveCommentId(string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            return null;
+        }
+
+        try
+        {
+            var state = JsonSerializer.Deserialize<DirectiveProcessor.PendingDirectiveState>(json);
+            return string.IsNullOrWhiteSpace(state?.CommentId) ? null : state.CommentId;
+        }
+        catch (JsonException)
+        {
+            // A row this cannot read is a row from a different shape of the world.
+            // Treating it as no marker at all is the safe failure: the panel goes
+            // back to reporting the item rather than silently hiding one.
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// The reason the phase machine recorded when it escalated, by issue id.
+    ///
+    /// Read from the same durable event the run lane's message is written from, so
+    /// a phase item and a run item for one escalation cannot tell different
+    /// stories. Scoped to the escalated ledgers, because the event log holds every
+    /// escalation the plane has ever recorded and only the live ones are wanted.
+    /// </summary>
+    private async Task<Dictionary<string, string>> ReadPhaseEscalationReasonsAsync(
+        IReadOnlyList<PhaseLedgerEntity> phases,
+        CancellationToken cancellationToken)
+    {
+        var escalatedIssueIds = phases
+            .Where(phase => string.Equals(phase.Stage, PhaseStages.Escalated, StringComparison.Ordinal))
+            .Select(phase => phase.IssueId)
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
+        if (escalatedIssueIds.Count == 0)
+        {
+            return [];
+        }
+
+        // Ordered by Id, not OccurredAtUtc: SQLite cannot ORDER BY a DateTimeOffset,
+        // and the identity column answers "written last" exactly.
+        var events = await dbContext.EventLog
+            .AsNoTracking()
+            .Where(entry => entry.EventName == PhaseOrchestrator.EscalationEventName
+                         && entry.IssueId != null
+                         && escalatedIssueIds.Contains(entry.IssueId))
+            .OrderByDescending(entry => entry.Id)
+            .Select(entry => new { entry.IssueId, entry.Message })
+            .ToListAsync(cancellationToken);
+
+        var reasons = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var entry in events)
+        {
+            if (!string.IsNullOrWhiteSpace(entry.Message))
+            {
+                reasons.TryAdd(entry.IssueId!, entry.Message);
+            }
+        }
+
+        return reasons;
+    }
+
+    /// <summary>
     /// Whether a cached issue carries one of the contract's execution labels.
     /// Reads the cached label JSON rather than re-querying: the queue must reflect
     /// what the dispatcher will see on its next pass, which is this same cache.
@@ -263,6 +399,40 @@ public sealed class RuntimeStateService(
             // than a queue built on a guess.
         }
 
+        // What the plane will pick up next. Computed once, because the queue view
+        // below and the owner-attention panel have to agree about it - the panel
+        // announcing a pull request as the owner's while the queue on the same page
+        // names its issue is the contradiction this whole input exists to end.
+        var queuedIssues = issueCacheEntries
+            .Where(entry => !IssueStateMatcher.IsClosedState(entry.State))
+            .Where(entry => !runningIssueIds.Contains(entry.IssueId)
+                         && !retryIssueIds.Contains(entry.IssueId))
+            .Where(entry => HasExecutionLabel(entry.LabelsJson, executionLabels))
+            .OrderBy(entry => entry.UpdatedAtUtc ?? entry.CachedAtUtc)
+            .ToList();
+
+        var pendingDirectiveIssueIds = await ReadPendingDirectiveIssueIdsAsync(generatedAt, cancellationToken);
+
+        // Running, retrying, queued for a slot, or holding a directive the plane has
+        // accepted and not consumed yet: four ways an issue is the plane's to move
+        // rather than the owner's.
+        var inFlightIssues = issueCacheEntries
+            .Where(entry => runningIssueIds.Contains(entry.IssueId)
+                         || retryIssueIds.Contains(entry.IssueId)
+                         || pendingDirectiveIssueIds.Contains(entry.IssueId))
+            .Select(entry => new InFlightIssue(entry.IssueId, entry.Identifier, entry.Repository ?? string.Empty))
+            .Concat(queuedIssues.Select(entry =>
+                new InFlightIssue(entry.IssueId, entry.Identifier, entry.Repository ?? string.Empty)))
+            // A run can outlive its cache row, and an issue the cache has not seen
+            // is still being worked on. Taking the runs directly keeps the panel
+            // from re-reporting one because a cache entry expired.
+            .Concat(runningRuns.Select(run =>
+                new InFlightIssue(run.IssueId, run.IssueIdentifier, run.Repository ?? string.Empty)))
+            .DistinctBy(issue => issue.IssueId, StringComparer.Ordinal)
+            .ToList();
+
+        var phaseEscalationReasons = await ReadPhaseEscalationReasonsAsync(phaseRows, cancellationToken);
+
         var attention = OwnerAttentionSummary.Build(
             engineHealthy: true, // this code only runs when the engine is serving
             escalatedRuns: escalatedRuns,
@@ -273,14 +443,11 @@ public sealed class RuntimeStateService(
             agentActivity: agentActivity,
             watchedTasks: watchedTasks,
             tracker: trackerReachability.Current,
+            inFlightIssues: inFlightIssues,
+            phaseEscalationReasons: phaseEscalationReasons,
             lastEventAtUtc: recentActivity.Count > 0 ? recentActivity[0].At : null,
             now: generatedAt,
-            primaryRepository: primaryRepository,
-            // What the plane is holding right now. Without this the panel cannot
-            // tell "nobody is going to move this" from "it is being moved".
-            activeIssueIds: runningRuns.Select(run => run.IssueId)
-                .Concat(retryEntries.Select(retry => retry.IssueId))
-                .ToHashSet(StringComparer.OrdinalIgnoreCase));
+            primaryRepository: primaryRepository);
 
         // The workforce view. Runners come from the workflow so an unconfigured
         // vendor is not silently reported as an idle worker.
@@ -505,12 +672,7 @@ public sealed class RuntimeStateService(
             // not claim (#115 sat on implementation_redispatch_blocked) was
             // indistinguishable from one merely waiting its turn, which is the
             // difference between patience and a fault.
-            queue = issueCacheEntries
-                .Where(entry => !IssueStateMatcher.IsClosedState(entry.State))
-                .Where(entry => !runningIssueIds.Contains(entry.IssueId)
-                             && !retryIssueIds.Contains(entry.IssueId))
-                .Where(entry => HasExecutionLabel(entry.LabelsJson, executionLabels))
-                .OrderBy(entry => entry.UpdatedAtUtc ?? entry.CachedAtUtc)
+            queue = queuedIssues
                 .Select(entry => new
                 {
                     issue_identifier = entry.Identifier,
