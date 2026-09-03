@@ -359,7 +359,7 @@ public sealed partial class OrchestrationTickService
                 continue;
             }
 
-            if (await ShouldBlockImplementationRedispatchAsync(issue, latestRunByIssueId, workflowDefinition, cancellationToken))
+            if (await ShouldBlockImplementationRedispatchAsync(issue, latestRunByIssueId, workflowDefinition, instanceId, cancellationToken))
             {
                 await RecordCandidateRefusalAsync(issue, "implementation_redispatch_blocked", cancellationToken);
                 continue;
@@ -538,10 +538,36 @@ public sealed partial class OrchestrationTickService
                 StringComparer.OrdinalIgnoreCase);
     }
 
+    /// <summary>
+    /// How long the redispatch guard may keep refusing one issue before the
+    /// refusal is itself reported as a fault.
+    ///
+    /// The guard is right: reimplementing an issue whose pull request is still
+    /// open produces a competing branch for the same work. But it is only half a
+    /// mechanism — it refuses on the assumption that some phase (verify, the
+    /// cross-vendor review, or the single bounded repair) is positioned to advance
+    /// that pull request instead. When none is, the two halves close every exit at
+    /// once: the pull request blocks the issue, and the issue cannot reach the pull
+    /// request. #51 records 27 minutes of exactly that, with the plane reporting
+    /// nothing running and the dashboard showing everything idle — both true, and
+    /// useless. A person closing the pull request by hand was the only way out.
+    ///
+    /// So the refusal is bounded. Past this it stops being patience and goes to the
+    /// command center naming both remedies, which is what the M3 directive lane
+    /// exists to answer.
+    ///
+    /// Deliberately the same two hours a phase stage may sit without progress
+    /// (<see cref="PhaseOrchestrator.StuckStageTimeout"/>). Both answer one
+    /// question — how long a pull request may plausibly take to be advanced — and
+    /// two answers to it would only be two numbers to keep in step.
+    /// </summary>
+    public static readonly TimeSpan RedispatchBlockTimeout = PhaseOrchestrator.StuckStageTimeout;
+
     private async Task<bool> ShouldBlockImplementationRedispatchAsync(
         NormalizedIssue issue,
         IReadOnlyDictionary<string, RunEntity> latestRunByIssueId,
         WorkflowDefinition workflowDefinition,
+        string instanceId,
         CancellationToken cancellationToken)
     {
         if (!latestRunByIssueId.TryGetValue(issue.Id, out var latestRun))
@@ -595,10 +621,17 @@ public sealed partial class OrchestrationTickService
             return false;
         }
 
-        var alreadyLogged = await dbContext.EventLog.AnyAsync(
-            entry => entry.RunId == latestRun.Id && entry.EventName == "implementation_redispatch_blocked",
-            cancellationToken);
-        if (!alreadyLogged)
+        // The first refusal for this run is also the clock the escape runs on:
+        // one durable timestamp, written where the block is already recorded,
+        // rather than a second piece of state to keep in step with it.
+        var priorBlocks = await dbContext.EventLog
+            .Where(entry => entry.RunId == latestRun.Id && entry.EventName == "implementation_redispatch_blocked")
+            .ToListAsync(cancellationToken);
+        var blockedSinceUtc = priorBlocks.Count == 0
+            ? null
+            : (DateTimeOffset?)priorBlocks.Min(entry => entry.OccurredAtUtc);
+
+        if (blockedSinceUtc is null)
         {
             dbContext.EventLog.Add(new EventLogEntity
             {
@@ -612,12 +645,62 @@ public sealed partial class OrchestrationTickService
             });
             await dbContext.SaveChangesAsync(cancellationToken);
         }
+        else if (timeProvider.GetUtcNow() - blockedSinceUtc.Value > RedispatchBlockTimeout)
+        {
+            await EscalateRunToCommandCenterAsync(
+                latestRun,
+                issue.Id,
+                issue.Identifier,
+                instanceId,
+                BuildRedispatchDeadlockReason(
+                    issue,
+                    blockMessage,
+                    timeProvider.GetUtcNow() - blockedSinceUtc.Value),
+                cancellationToken);
+
+            // Still blocked. Escalating says why nothing is moving; it does not
+            // authorize reimplementing over an open pull request. The run is now
+            // needs_command_center, so the check at the top of this method refuses
+            // every later tick and this reports exactly once.
+            return true;
+        }
 
         logger.LogWarning(
             "Blocked implementation redispatch for issue {IssueIdentifier}: {Reason}",
             issue.Identifier,
             blockMessage);
         return true;
+    }
+
+    // The refusal reason names the block; an escalation has to name the remedy.
+    // An operator reading "implementation_redispatch_blocked" on an otherwise idle
+    // plane learns that something is refused and nothing about what to do, and had
+    // to open run records in SQLite to get the rest (#51).
+    private static string BuildRedispatchDeadlockReason(
+        NormalizedIssue issue,
+        string blockMessage,
+        TimeSpan blockedFor)
+    {
+        var openPullRequest = issue.PullRequests
+            .Where(pullRequest => pullRequest.Number.HasValue &&
+                                  (string.IsNullOrWhiteSpace(pullRequest.State) ||
+                                   pullRequest.State.Trim().Equals("open", StringComparison.OrdinalIgnoreCase)))
+            .OrderByDescending(pullRequest => pullRequest.Number!.Value)
+            .Select(pullRequest => (int?)pullRequest.Number!.Value)
+            .FirstOrDefault();
+
+        var minutes = Math.Max(1, (int)blockedFor.TotalMinutes);
+        var pullRequestRemedy = openPullRequest is null
+            ? "close or merge the pull request this implementation produced"
+            : $"close or merge PR #{openPullRequest}";
+
+        return
+            $"Issue {issue.Identifier} has been refused dispatch for {minutes} minutes and no phase is advancing it. " +
+            $"Cause: {blockMessage} " +
+            "Nothing in the plane will move this on its own - no verify, review or repair phase owns the issue, so " +
+            "the pull request blocks the issue and the issue cannot reach the pull request. " +
+            $"To clear it, either {pullRequestRemedy} so the issue becomes dispatchable again, or post a " +
+            "command-center directive dispatching an explicit repair/review phase against the existing pull request.";
     }
 
     private async Task<bool> TryBlockImplementationRetryRedispatchAsync(

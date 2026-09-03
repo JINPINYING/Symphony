@@ -1588,6 +1588,106 @@ public sealed class OrchestrationTickServiceTests
     }
 
     [Fact]
+    public async Task RunTickAsync_ShouldEscalateWhenRedispatchStaysBlockedAndNoPhaseAdvancesThePullRequest()
+    {
+        // #51: the guard refuses because a pull request is open, and refusing is
+        // right - but nothing else is positioned to advance that pull request, so
+        // the two halves close every exit. The refusal has to stop being silent
+        // and permanent.
+        var issueWithOpenPr = BuildIssue(
+            "issue-1",
+            "#1",
+            "Open",
+            null,
+            pullRequests: [new PullRequestRef("pr-1", 89, "OPEN", null, null, null)]);
+
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: new FakeTrackerClient([issueWithOpenPr]),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await harness.InsertRunAsync(
+            "issue-1",
+            "#1",
+            "Open",
+            "instance-1",
+            status: RunStatusNames.Succeeded,
+            sessionId: "session-1",
+            completedAtUtc: DateTimeOffset.UtcNow.AddMinutes(-5));
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        // A fresh block is patience, not a fault: recorded, not escalated.
+        Assert.Equal(RunStatusNames.Succeeded, (await harness.DbContext.Runs.SingleAsync()).Status);
+        var blocked = Assert.Single(
+            await harness.DbContext.EventLog.ToListAsync(),
+            entry => entry.EventName == "implementation_redispatch_blocked");
+
+        // Age the block past the point where a repair would plausibly have run.
+        blocked.OccurredAtUtc =
+            DateTimeOffset.UtcNow - OrchestrationTickService.RedispatchBlockTimeout - TimeSpan.FromMinutes(10);
+        await harness.DbContext.SaveChangesAsync();
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        // Reported, with both remedies named - and still not reimplemented, because
+        // saying why nothing moves is not permission to open a competing branch.
+        Assert.Equal(RunStatusNames.NeedsCommandCenter, (await harness.DbContext.Runs.SingleAsync()).Status);
+        Assert.Empty(harness.Coordinator.StartRequests);
+
+        var escalation = Assert.Single(
+            await harness.DbContext.EventLog.ToListAsync(),
+            entry => entry.EventName == "needs_command_center");
+        Assert.Contains("close or merge PR #89", escalation.Message);
+        Assert.Contains("command-center directive", escalation.Message);
+        Assert.Contains("no phase is advancing it", escalation.Message);
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldReportWhenTheBoundedRepairCannotBeDispatched()
+    {
+        // The verdict landed and no repair run started, which used to be recorded
+        // nowhere at all: the plane showed nothing running and everything idle
+        // while the repair was in fact being attempted and deferred every tick.
+        var tracker = new FakeTrackerClient([]);
+        var issue = BuildIssue("issue-1", "#1", "Open", null,
+            pullRequests: [new PullRequestRef("pr-5", 5, "OPEN", null, "symphony/1", "main")]);
+        tracker.IssuesById["issue-1"] = issue;
+        tracker.PullRequestStatusByNumber[5] = new PullRequestStatus(5, "OPEN", false, "aaa111", "SUCCESS", "MERGEABLE");
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await harness.InsertRunAsync("issue-1", "#1", "Open", "instance-1", RunStatusNames.Succeeded);
+        await harness.InsertWorkspaceRecordAsync("issue-1", "#1", "symphony/1");
+        tracker.OpenPullRequestNumberByHeadBranch["symphony/1"] = 5;
+
+        await harness.Service.RunTickAsync(CancellationToken.None); // seed + verify
+        await harness.Service.RunTickAsync(CancellationToken.None); // review dispatched, and it keeps the only slot
+
+        tracker.CommentsByIssueId.TryAdd("issue-1", []);
+        tracker.CommentsByIssueId["issue-1"].Add(new NormalizedIssueComment(
+            "review-1",
+            PhaseOrchestrator.ReviewVerdictMarker(5, "aaa111") + "\nVERDICT: CHANGES_REQUIRED",
+            "reviewer", "OWNER", DateTimeOffset.UtcNow));
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var ledger = Assert.Single(await harness.DbContext.PhaseLedger.ToListAsync());
+        Assert.Equal(PhaseStages.Reviewing, ledger.Stage);
+        Assert.Single(harness.Coordinator.StartRequests); // the review only; no repair started
+
+        // Said once for the stage, not once per tick.
+        var deferral = Assert.Single(
+            await harness.DbContext.EventLog.ToListAsync(),
+            entry => entry.EventName == "phase_repair_deferred");
+        Assert.Contains("PR #5", deferral.Message);
+        Assert.Contains("no agent slot is free", deferral.Message);
+    }
+
+    [Fact]
     public async Task RunTickAsync_ShouldAllowRedispatchOfSucceededIssueOncePullRequestIsNoLongerOpen()
     {
         var issueWithMergedPr = BuildIssue(

@@ -917,10 +917,26 @@ public sealed class PhaseOrchestrator(
         Func<NormalizedIssue, PhaseDispatchRequest, CancellationToken, Task<bool>> dispatchAsync,
         CancellationToken cancellationToken)
     {
+        // A repair that cannot start says so.
+        //
+        // Both of the returns below used to be silent, and silence is the whole
+        // complaint in #51: the verdict landed, no repair run was ever started, and
+        // the only place that fact existed was the absence of a row. The plane
+        // reported nothing running and the dashboard showed everything idle, so an
+        // operator had to read run records in SQLite to find out that a repair was
+        // being attempted and refused every tick.
+        //
+        // Neither case is a fault on its own - a busy plane and a contended claim
+        // both resolve themselves, and the stage backstop already bounds them - so
+        // this reports rather than escalates, once per stage entry per cause.
         var runningCount = await dbContext.Runs
             .CountAsync(run => run.Status == RunStatusNames.Running, cancellationToken);
         if (runningCount >= workflowDefinition.Runtime.Agent.MaxConcurrentAgents)
         {
+            await ReportRepairDeferredAsync(
+                ledger,
+                $"no agent slot is free ({runningCount} running, limit {workflowDefinition.Runtime.Agent.MaxConcurrentAgents})",
+                cancellationToken);
             return; // No slot; the verdict comment stays and this retries next tick.
         }
 
@@ -939,6 +955,7 @@ public sealed class PhaseOrchestrator(
             cancellationToken);
         if (!dispatched)
         {
+            await ReportRepairDeferredAsync(ledger, "the dispatch claim was refused", cancellationToken);
             return;
         }
 
@@ -951,6 +968,38 @@ public sealed class PhaseOrchestrator(
         AddPhaseEvent(ledger.IssueId, ledger.IssueIdentifier, "phase_repair_dispatched",
             $"CHANGES_REQUIRED at head {Short(ledger.RejectedHeadSha)}; the single bounded repair dispatched to {ledger.ImplementerRunner}. WAIT_FOR_REPAIR until the head moves.");
         await dbContext.SaveChangesAsync(cancellationToken);
+    }
+
+    // Reported once per stage entry per cause. `UpdatedAtUtc` is the stamp the
+    // ledger took when it entered this stage and is not touched while the repair is
+    // deferred, so it is exactly the window one report should cover: a plane that
+    // is busy for six ticks says so once, and says so again if the cause changes or
+    // the stage is re-entered.
+    private async Task ReportRepairDeferredAsync(
+        PhaseLedgerEntity ledger,
+        string cause,
+        CancellationToken cancellationToken)
+    {
+        var message =
+            $"CHANGES_REQUIRED is recorded for PR #{ledger.PrNumber} at head {Short(ledger.HeadSha)}, but the bounded " +
+            $"repair could not be dispatched: {cause}. It is retried every tick.";
+
+        // Filtered in memory: SQLite does not compare DateTimeOffset reliably.
+        var reported = await dbContext.EventLog
+            .Where(entry => entry.IssueId == ledger.IssueId && entry.EventName == "phase_repair_deferred")
+            .ToListAsync(cancellationToken);
+        if (reported.Any(entry => entry.OccurredAtUtc >= ledger.UpdatedAtUtc &&
+                                  string.Equals(entry.Message, message, StringComparison.Ordinal)))
+        {
+            return;
+        }
+
+        AddPhaseEvent(ledger.IssueId, ledger.IssueIdentifier, "phase_repair_deferred", message);
+        await dbContext.SaveChangesAsync(cancellationToken);
+        logger.LogWarning(
+            "Repair dispatch deferred for {IssueIdentifier}: {Cause}",
+            ledger.IssueIdentifier,
+            cause);
     }
 
     private async Task HandleWaitForRepairAsync(
