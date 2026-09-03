@@ -80,6 +80,8 @@ internal static class DashboardEventPresentation
         ["phase_review_dispatched"] = "Review dispatched",
         ["phase_review_redispatch"] = "Review re-dispatched",
         ["phase_repair_dispatched"] = "Repair dispatched",
+        ["phase_repair_deferred"] = "Repair deferred",
+        ["phase_repair_redispatch"] = "Repair re-dispatched",
         ["phase_ready"] = "Approved",
         ["phase_merged"] = "Merged",
         ["phase_escalated"] = "Escalated",
