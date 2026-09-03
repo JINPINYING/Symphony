@@ -73,6 +73,10 @@ public sealed class PhaseOrchestrator(
         : span.TotalHours < 24 ? $"{(int)span.TotalHours} hours"
         : $"{(int)span.TotalDays} days";
 
+    // Enough to cover every branch an issue could have open at once, without asking
+    // the tracker for a page it will never read.
+    private const int OpenPullRequestScanLimit = 50;
+
     public static string ReviewVerdictMarker(int prNumber, string headSha) =>
         $"<!-- symphony:review-verdict:{prNumber}:{headSha} -->";
 
@@ -338,6 +342,30 @@ public sealed class PhaseOrchestrator(
             if (byBranch is not null)
             {
                 return byBranch.Number;
+            }
+
+            // The branch the plane PREPARED is not always the branch the agent
+            // PUSHED. CyberMed #150 prepared `symphony/150`, whose pull request was
+            // merged; the second cycle pushed `symphony/150-toolcalls` and opened
+            // PR #162. The exact-name lookup found nothing, the ledger never
+            // reseeded, and a green pull request sat outside the pipeline with the
+            // panel telling the owner to go and repair it by hand.
+            //
+            // A suffixed branch is still this issue's branch. The separator is
+            // required so `symphony/150` cannot claim `symphony/1500`.
+            var family = $"{branchName}-";
+            var openPullRequests = await trackerClient.FetchOpenPullRequestsAsync(query, OpenPullRequestScanLimit, cancellationToken);
+            var byFamily = openPullRequests
+                .Where(candidate => candidate.HeadRefName is not null &&
+                                    candidate.HeadRefName.StartsWith(family, StringComparison.OrdinalIgnoreCase))
+                .OrderByDescending(candidate => candidate.Number)
+                .FirstOrDefault();
+            if (byFamily is not null)
+            {
+                AddPhaseEvent(issue.Id, issue.Identifier, "phase_pr_resolved_by_branch_family",
+                    $"PR #{byFamily.Number} is on '{byFamily.HeadRefName}', a branch of the '{branchName}' family " +
+                    "rather than that exact name; entering it into the pipeline.");
+                return byFamily.Number;
             }
         }
 
