@@ -2830,6 +2830,45 @@ public sealed class OrchestrationTickServiceTests
         Assert.Empty(await harness.DbContext.RetryQueue.ToListAsync());
     }
 
+    // A retry whose issue is not in the candidate set gets reloaded by id to decide
+    // whether the work still exists. That reload used to go to the PRIMARY
+    // repository whatever the work belonged to - correct while the plane watched
+    // one repository, silently wrong afterwards.
+    //
+    // A GraphQL node id is global, so asking the wrong repository returns nothing
+    // rather than erroring, and the issue reads as vanished. The plane's own first
+    // self-modification was parked this way: a Symphony retry asked CyberMed to
+    // reload it, got nothing, and escalated "could not be reloaded by id from the
+    // tracker" while the issue was open and its pull request was green.
+    [Fact]
+    public async Task RunTickAsync_ShouldReloadAMissingRetryCandidateFromItsOwnRepository()
+    {
+        var tracker = new FakeTrackerClient([]);
+        tracker.IssuesByRepository["JINPINYING/Product"] = [];
+        tracker.IssuesByRepository["JINPINYING/Symphony"] = [];
+
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(
+                maxConcurrentAgents: 1,
+                repositories: [("JINPINYING", "Product"), ("JINPINYING", "Symphony")]),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await harness.InsertRetryingRunAsync(
+            "issue-s", "#50", "Open", "instance-1",
+            dueAtUtc: DateTimeOffset.UtcNow.AddMinutes(-1));
+
+        // The work belongs to Symphony, and only the run row records that.
+        var run = await harness.DbContext.Runs.SingleAsync();
+        run.Repository = "JINPINYING/Symphony";
+        await harness.DbContext.SaveChangesAsync();
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Contains("JINPINYING/Symphony", tracker.IssueStateFetchRepositories);
+        Assert.DoesNotContain("JINPINYING/Product", tracker.IssueStateFetchRepositories);
+    }
+
     [Fact]
     public async Task RunTickAsync_ShouldKeepAnActiveRateLimitPauseAcrossAProcessRestart()
     {
@@ -3466,8 +3505,15 @@ public sealed class OrchestrationTickServiceTests
         public Task<IReadOnlyList<NormalizedIssue>> FetchIssuesByStatesAsync(TrackerQuery query, IReadOnlyList<string> states, CancellationToken cancellationToken = default)
             => Task.FromResult<IReadOnlyList<NormalizedIssue>>([]);
 
+        // Which repository each by-id reload was aimed at. A node id is global, so
+        // asking the wrong repository returns nothing rather than erroring - the
+        // only way to catch it is to record the question.
+        public List<string> IssueStateFetchRepositories { get; } = [];
+
         public Task<IReadOnlyList<IssueStateSnapshot>> FetchIssueStatesByIdsAsync(TrackerQuery query, IReadOnlyList<string> issueIds, CancellationToken cancellationToken = default)
         {
+            IssueStateFetchRepositories.Add($"{query.Owner}/{query.Repo}");
+
             if (throwOnFetchStatesByIds)
             {
                 throw new InvalidOperationException("simulated tracker outage");

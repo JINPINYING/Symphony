@@ -234,7 +234,7 @@ public sealed partial class OrchestrationTickService
             {
                 await HandleMissingRetryCandidateAsync(
                     retryEntry,
-                    query,
+                    queries,
                     workflowDefinition,
                     instanceId,
                     cancellationToken);
@@ -1464,11 +1464,34 @@ public sealed partial class OrchestrationTickService
 
     private async Task HandleMissingRetryCandidateAsync(
         RetryQueueEntity retryEntry,
-        TrackerQuery query,
+        TrackerQuerySet queries,
         WorkflowDefinition workflowDefinition,
         string instanceId,
         CancellationToken cancellationToken)
     {
+        // Ask the repository the work actually came from.
+        //
+        // This used to be handed the PRIMARY query, which was correct while the
+        // plane watched one repository and silently wrong afterwards: a retry for a
+        // Symphony issue asked the CyberMed repository to reload it by id, got
+        // nothing, and escalated "could not be reloaded by id from the tracker".
+        // A GraphQL node id is global, so the failure looks like a vanished issue
+        // rather than a question put to the wrong repository.
+        //
+        // The retry row carries no repository of its own, so it comes off the run -
+        // which does. An unknown or empty key falls back to primary, which is right
+        // for every row written before multi-repository tracking existed.
+        // Ordered in memory: SQLite cannot ORDER BY a DateTimeOffset, so every
+        // newest-run lookup in this codebase materialises first.
+        var issueRuns = await dbContext.Runs
+            .Where(run => run.IssueId == retryEntry.IssueId)
+            .ToListAsync(cancellationToken);
+        var retryRepository = issueRuns
+            .OrderByDescending(run => run.StartedAtUtc)
+            .Select(run => run.Repository)
+            .FirstOrDefault();
+        var query = queries.For(retryRepository);
+
         IssueStateSnapshot? snapshot;
         try
         {
