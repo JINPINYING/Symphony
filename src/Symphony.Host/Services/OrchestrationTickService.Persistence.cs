@@ -237,6 +237,21 @@ public sealed partial class OrchestrationTickService
                 hasChanges = true;
             }
 
+            // Labels too, not just state.
+            //
+            // They were written only by the candidate scan, which by definition
+            // returns issues that MATCH the execution label - so an issue that lost
+            // `symphony-ready` fell out of the scan and kept the label in cache
+            // forever. The owner's queue listed six issues as "next to be picked up"
+            // that the plane could not claim, and the plane sat idle beside them.
+            var refreshedLabels = JsonSerializer.Serialize(refreshedState.Labels);
+            if (!string.Equals(cachedIssue.LabelsJson, refreshedLabels, StringComparison.Ordinal))
+            {
+                cachedIssue.LabelsJson = refreshedLabels;
+                cachedIssue.CachedAtUtc = refreshedAtUtc;
+                hasChanges = true;
+            }
+
             if (isTerminal)
             {
                 await CleanupTerminalTrackedIssueWorkspaceAsync(

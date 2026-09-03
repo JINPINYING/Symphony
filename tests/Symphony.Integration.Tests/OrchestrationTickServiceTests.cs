@@ -1022,6 +1022,35 @@ public sealed class OrchestrationTickServiceTests
     // exact-name lookup found nothing, the ledger never reseeded, and a green pull
     // request sat outside the pipeline while the panel told the owner to go and
     // repair it - work the plane could do and was not doing.
+    // Six issues sat in the owner's queue reading "next to be picked up" that the
+    // plane could never claim: they had lost `symphony-ready` on GitHub, and the
+    // cache still carried it. Labels were written only by the candidate scan, which
+    // by definition returns issues that MATCH the label - so losing it dropped the
+    // issue out of the scan and froze the label in cache forever.
+    [Fact]
+    public async Task RunTickAsync_ShouldRefreshLabelsAndNotOnlyState()
+    {
+        var tracker = new FakeTrackerClient([], issueStatesById: new Dictionary<string, string>
+        {
+            ["issue-1"] = "Open"
+        });
+        // The tracker now reports the issue without the execution label.
+        tracker.IssueLabelsById["issue-1"] = ["lane:control-plane"];
+
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await harness.InsertIssueCacheAsync("issue-1", "#158", "Open", labelsJson: """["symphony-ready","lane:control-plane"]""");
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var cached = await harness.DbContext.IssueCache.SingleAsync();
+        Assert.DoesNotContain("symphony-ready", cached.LabelsJson, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("lane:control-plane", cached.LabelsJson, StringComparison.OrdinalIgnoreCase);
+    }
+
     [Fact]
     public async Task RunTickAsync_ShouldSeedALedgerForAPullRequestOnASuffixedBranch()
     {
@@ -3467,7 +3496,8 @@ public sealed class OrchestrationTickServiceTests
             string state,
             DateTimeOffset? cachedAtUtc = null,
             DateTimeOffset? eligibleSeenAtUtc = null,
-            string pullRequestsJson = "[]")
+            string pullRequestsJson = "[]",
+            string labelsJson = "[]")
         {
             var nowUtc = cachedAtUtc ?? DateTimeOffset.UtcNow;
             DbContext.IssueCache.Add(new IssueCacheEntity
@@ -3476,7 +3506,7 @@ public sealed class OrchestrationTickServiceTests
                 Identifier = identifier,
                 Title = $"Issue {identifier}",
                 State = state,
-                LabelsJson = "[]",
+                LabelsJson = labelsJson,
                 PullRequestsJson = pullRequestsJson,
                 BlockedByJson = "[]",
                 EligibleSeenAtUtc = eligibleSeenAtUtc,
@@ -3740,6 +3770,11 @@ public sealed class OrchestrationTickServiceTests
         // only way to catch it is to record the question.
         public List<string> IssueStateFetchRepositories { get; } = [];
 
+        // What the by-id refresh reports as an issue's current labels. The cache
+        // used to keep whatever the candidate scan last saw, which froze a removed
+        // `symphony-ready` in place forever.
+        public Dictionary<string, IReadOnlyList<string>> IssueLabelsById { get; } = new(StringComparer.OrdinalIgnoreCase);
+
         public Task<IReadOnlyList<IssueStateSnapshot>> FetchIssueStatesByIdsAsync(TrackerQuery query, IReadOnlyList<string> issueIds, CancellationToken cancellationToken = default)
         {
             IssueStateFetchRepositories.Add($"{query.Owner}/{query.Repo}");
@@ -3751,7 +3786,10 @@ public sealed class OrchestrationTickServiceTests
 
             var snapshots = issueIds
                 .Where(id => statesById.ContainsKey(id))
-                .Select(id => new IssueStateSnapshot(id, statesById[id]))
+                .Select(id => new IssueStateSnapshot(
+                    id,
+                    statesById[id],
+                    IssueLabelsById.TryGetValue(id, out var labels) ? labels : []))
                 .ToList();
             return Task.FromResult<IReadOnlyList<IssueStateSnapshot>>(snapshots);
         }

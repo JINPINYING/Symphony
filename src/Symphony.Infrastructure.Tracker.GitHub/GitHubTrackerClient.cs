@@ -98,6 +98,11 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
             ... on Issue {
               id
               state
+              labels(first: 50) {
+                nodes {
+                  name
+                }
+              }
               repository {
                 name
                 owner {
@@ -202,7 +207,7 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
                 }
 
                 var normalizedState = NormalizeState(GetOptionalString(issueNode, "state")) ?? "Open";
-                statesById[issueId] = new IssueStateSnapshot(issueId, normalizedState);
+                statesById[issueId] = new IssueStateSnapshot(issueId, normalizedState, ExtractLabelNames(issueNode));
             }
         }
 
@@ -1287,6 +1292,20 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
 
         return candidateIssues;
     }
+
+    private static IReadOnlyList<string> ExtractLabelNames(JsonElement issueNode) =>
+        issueNode.TryGetProperty("labels", out var labelsNode) &&
+        labelsNode.ValueKind == JsonValueKind.Object &&
+        labelsNode.TryGetProperty("nodes", out var labelNodes) &&
+        labelNodes.ValueKind == JsonValueKind.Array
+            ? labelNodes
+                .EnumerateArray()
+                .Select(node => GetOptionalString(node, "name"))
+                .Where(name => !string.IsNullOrWhiteSpace(name))
+                .Select(name => name!.Trim().ToLowerInvariant())
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList()
+            : [];
 
     private static NormalizedIssue ParseIssue(JsonElement issueNode, bool includePullRequests, string repository)
     {

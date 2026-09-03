@@ -715,7 +715,7 @@ public sealed class CodexAgentRunnerTests
         {
             RefreshCount++;
             var nextState = pendingStates.Count == 0 ? "Closed" : pendingStates.Dequeue();
-            return Task.FromResult<IReadOnlyList<IssueStateSnapshot>>([new IssueStateSnapshot(issueIds[0], nextState)]);
+            return Task.FromResult<IReadOnlyList<IssueStateSnapshot>>([new IssueStateSnapshot(issueIds[0], nextState, [])]);
         }
 
         public Task<GitHubGraphQlExecutionResult> ExecuteGitHubGraphQlAsync(TrackerQuery query, string graphQlDocument, string? variablesJson, CancellationToken cancellationToken = default)
