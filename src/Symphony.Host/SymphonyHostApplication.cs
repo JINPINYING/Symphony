@@ -8,6 +8,8 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Options;
 using Symphony.Core.Configuration;
 using Symphony.Core.Metadata;
+using Symphony.Core.Abstractions;
+using Symphony.Core.Models;
 using Symphony.Host.Services;
 using Symphony.Host.Setup;
 using Symphony.Host.Workers;
@@ -237,6 +239,25 @@ internal static class SymphonyHostApplication
                 context.Context.Response.Headers.CacheControl = "no-cache, must-revalidate";
             }
         });
+    }
+
+    // The host's own copy of the query set. The orchestration service has one, but
+    // it is private to that partial class, and an endpoint that posts a comment
+    // has to reach the repository the issue actually lives in.
+    private static TrackerQuerySet BuildTrackerQueriesForHost(WorkflowDefinition workflowDefinition, string apiKey)
+    {
+        var tracker = workflowDefinition.Runtime.Tracker;
+        return new TrackerQuerySet(tracker.TrackedRepositories
+            .Select(repository => new TrackerQuery(
+                tracker.Endpoint,
+                apiKey,
+                repository.Owner,
+                repository.Repo,
+                tracker.ActiveStates,
+                tracker.Labels,
+                tracker.Milestone,
+                tracker.IncludePullRequests))
+            .ToList());
     }
 
     private static string ResolveWebRootPath()
@@ -507,6 +528,100 @@ internal static class SymphonyHostApplication
             await dbContext.SaveChangesAsync(cancellationToken);
 
             return Results.Accepted(value: new { recorded_at = at });
+        });
+
+        // The only write the panel can make on the owner's behalf.
+        //
+        // Every "action" on the status page was, until now, either a link to
+        // GitHub or a button that copied text to a clipboard - and one of those
+        // copied a command that did not exist. A control that does not do the
+        // thing it is labelled with is worse than no control, because the reader
+        // presses it and believes something happened.
+        //
+        // Deliberately narrow: it posts a directive comment, which is the plane's
+        // own documented way to un-park an escalated issue, and nothing else. It
+        // does not merge, close, label or delete. The grammar is validated with
+        // the same parser the plane reads comments with, so the panel cannot post
+        // something the engine would then reject.
+        app.MapPost("/api/v1/actions/directive", async (
+            DirectiveActionRequest request,
+            ITrackerClient trackerClient,
+            IWorkflowDefinitionProvider workflowProvider,
+            SymphonyDbContext dbContext,
+            TimeProvider timeProvider,
+            CancellationToken cancellationToken) =>
+        {
+            var issueId = request.IssueId?.Trim();
+            if (string.IsNullOrWhiteSpace(issueId))
+            {
+                return Results.BadRequest(new
+                {
+                    error = new { code = "issue_required", message = "A directive needs the issue it acts on." }
+                });
+            }
+
+            var action = string.IsNullOrWhiteSpace(request.Action) ? DirectiveActions.Resume : request.Action.Trim();
+            var phase = string.IsNullOrWhiteSpace(request.Phase) ? null : request.Phase.Trim();
+
+            var body = phase is null
+                ? $"symphony:directive\naction: {action}"
+                : $"symphony:directive\naction: {action}\nphase: {phase}";
+
+            // Validate before posting, with the parser the plane itself uses. A
+            // directive the engine would refuse is a comment the owner has to go
+            // and delete by hand.
+            var parsed = DirectiveParser.Parse(body);
+            if (parsed.Outcome != DirectiveParseOutcome.Valid)
+            {
+                return Results.BadRequest(new
+                {
+                    error = new { code = "directive_invalid", message = parsed.Error ?? "The directive is not valid." }
+                });
+            }
+
+            var definition = await workflowProvider.GetCurrentAsync(cancellationToken);
+            string apiKey;
+            try
+            {
+                apiKey = WorkflowDispatchPreflightValidator.ValidateAndResolveApiKey(definition);
+            }
+            catch (Exception ex)
+            {
+                return Results.Json(
+                    new { error = new { code = "tracker_unavailable", message = ex.Message } },
+                    statusCode: StatusCodes.Status503ServiceUnavailable);
+            }
+
+            var queries = BuildTrackerQueriesForHost(definition, apiKey);
+            var query = queries.For(request.Repository);
+
+            string? commentId;
+            try
+            {
+                commentId = await trackerClient.PostIssueCommentAsync(query, issueId, body, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                // Say it failed. The page reports what this returns, and a silent
+                // failure here would be a button that looks like it worked.
+                return Results.Json(
+                    new { error = new { code = "post_failed", message = ex.Message } },
+                    statusCode: StatusCodes.Status502BadGateway);
+            }
+
+            var at = timeProvider.GetUtcNow();
+            dbContext.EventLog.Add(new EventLogEntity
+            {
+                IssueId = issueId,
+                IssueIdentifier = request.IssueIdentifier ?? string.Empty,
+                EventName = "directive_posted_from_panel",
+                Level = LogLevel.Information.ToString(),
+                Message = $"The owner posted '{action}'{(phase is null ? string.Empty : $" at phase {phase}")} from the status page.",
+                OccurredAtUtc = at
+            });
+            await dbContext.SaveChangesAsync(cancellationToken);
+
+            return Results.Accepted(value: new { comment_id = commentId, posted_at = at, action, phase });
         });
 
         app.MapPost("/api/v1/refresh", (

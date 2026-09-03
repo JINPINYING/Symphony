@@ -1068,9 +1068,111 @@ public sealed class ApiSmokeTests
         });
     }
 
+    // The panel's one write. Every "action" on the status page used to be a link
+    // or a button that copied text - and one of those copied a command-center flag
+    // that did not exist. A control has to do the thing it is labelled with.
+    [Fact]
+    public async Task DirectiveAction_ShouldPostTheDirectiveTheOwnerPressed()
+    {
+        var workflowPath = CreateValidWorkflowPath();
+        var dbPath = Path.Combine(Path.GetTempPath(), $"symphony-int-{Guid.NewGuid():N}.db");
+        var stderr = new StringWriter();
+        var tracker = new FakeGitHubTrackerClient();
+        HttpStatusCode? statusCode = null;
+
+        try
+        {
+            var exitCode = await SymphonyHostApplication.RunCliAsync(
+                [workflowPath],
+                stderr,
+                configureBuilder: builder => ConfigureTestServer(builder, dbPath),
+                configureServices: services => RegisterFakeTracker(services, tracker),
+                runApplicationAsync: async (app, cancellationToken) =>
+                {
+                    await app.StartAsync(cancellationToken);
+                    using var client = app.GetTestClient();
+                    var response = await client.PostAsync(
+                        "/api/v1/actions/directive",
+                        new StringContent(
+                            """{"issueId":"issue-1","issueIdentifier":"#142","action":"resume","phase":"review"}""",
+                            System.Text.Encoding.UTF8,
+                            "application/json"),
+                        cancellationToken);
+                    statusCode = response.StatusCode;
+                    await app.StopAsync(cancellationToken);
+                });
+
+            Assert.True(exitCode == 0, stderr.ToString());
+            Assert.Equal(HttpStatusCode.Accepted, statusCode);
+
+            var posted = Assert.Single(tracker.PostedComments);
+            Assert.Equal("issue-1", posted.IssueId);
+            Assert.Contains("symphony:directive", posted.Body, StringComparison.Ordinal);
+            Assert.Contains("action: resume", posted.Body, StringComparison.Ordinal);
+            Assert.Contains("phase: review", posted.Body, StringComparison.Ordinal);
+        }
+        finally
+        {
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            TryDeleteFile(dbPath);
+            TryDeleteFile(workflowPath);
+        }
+    }
+
+    // And a directive the engine would refuse is refused here, rather than posted
+    // and left for the owner to delete by hand.
+    [Fact]
+    public async Task DirectiveAction_ShouldRefuseADirectiveTheEngineWouldReject()
+    {
+        var workflowPath = CreateValidWorkflowPath();
+        var dbPath = Path.Combine(Path.GetTempPath(), $"symphony-int-{Guid.NewGuid():N}.db");
+        var stderr = new StringWriter();
+        var tracker = new FakeGitHubTrackerClient();
+        HttpStatusCode? statusCode = null;
+
+        try
+        {
+            var exitCode = await SymphonyHostApplication.RunCliAsync(
+                [workflowPath],
+                stderr,
+                configureBuilder: builder => ConfigureTestServer(builder, dbPath),
+                configureServices: services => RegisterFakeTracker(services, tracker),
+                runApplicationAsync: async (app, cancellationToken) =>
+                {
+                    await app.StartAsync(cancellationToken);
+                    using var client = app.GetTestClient();
+                    var response = await client.PostAsync(
+                        "/api/v1/actions/directive",
+                        new StringContent(
+                            """{"issueId":"issue-1","action":"resume","phase":"not_a_phase"}""",
+                            System.Text.Encoding.UTF8,
+                            "application/json"),
+                        cancellationToken);
+                    statusCode = response.StatusCode;
+                    await app.StopAsync(cancellationToken);
+                });
+
+            Assert.True(exitCode == 0, stderr.ToString());
+            Assert.Equal(HttpStatusCode.BadRequest, statusCode);
+            Assert.Empty(tracker.PostedComments);
+        }
+        finally
+        {
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            TryDeleteFile(dbPath);
+            TryDeleteFile(workflowPath);
+        }
+    }
+
     private static void RegisterFakeTracker(IServiceCollection services)
     {
         var trackerClient = new FakeGitHubTrackerClient();
+        services.AddSingleton<ITrackerClient>(trackerClient);
+        services.AddSingleton<IGitHubTrackerClient>(trackerClient);
+    }
+
+    private static void RegisterFakeTracker(IServiceCollection services, FakeGitHubTrackerClient trackerClient)
+    {
         services.AddSingleton<ITrackerClient>(trackerClient);
         services.AddSingleton<IGitHubTrackerClient>(trackerClient);
     }
@@ -1269,13 +1371,16 @@ public sealed class ApiSmokeTests
                 new IssueCommentMarkerSnapshot(issueId, "Open", null, MarkerFound: false));
         }
 
+        public List<(string Repository, string IssueId, string Body)> PostedComments { get; } = [];
+
         public Task<string?> PostIssueCommentAsync(
             TrackerQuery query,
             string issueId,
             string body,
             CancellationToken cancellationToken = default)
         {
-            return Task.FromResult<string?>(null);
+            PostedComments.Add(($"{query.Owner}/{query.Repo}", issueId, body));
+            return Task.FromResult<string?>("comment-1");
         }
 
         public Task<IReadOnlyList<NormalizedIssueComment>> FetchIssueCommentsAsync(
