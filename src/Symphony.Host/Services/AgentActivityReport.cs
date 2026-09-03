@@ -26,6 +26,18 @@ public sealed record AgentActivityReport(
 /// deserialization error.</summary>
 public sealed record AgentActivityRequest(string? Actor, string? Summary, string? Detail, string? Url);
 
+/// <summary>
+/// A directive the owner posts from the status page. The repository is carried
+/// because an issue id is global but the tracker query is not, and "#142" exists
+/// in every repository the plane watches.
+/// </summary>
+public sealed record DirectiveActionRequest(
+    string? IssueId,
+    string? IssueIdentifier,
+    string? Repository,
+    string? Action,
+    string? Phase);
+
 public static class AgentActivity
 {
     public const string EventName = "agent_activity_reported";

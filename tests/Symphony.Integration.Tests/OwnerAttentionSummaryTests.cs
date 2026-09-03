@@ -161,8 +161,14 @@ public sealed class OwnerAttentionSummaryTests
 
             Assert.NotNull(item.Action);
             Assert.False(string.IsNullOrWhiteSpace(item.Action!.Label));
+
+            // Three shapes count as a way to act: somewhere to go, something to
+            // run, or a directive the page can post through the plane. Anything
+            // else is a control that cannot do what its label says.
             Assert.True(
-                item.Action.Url is not null || item.Action.Command is not null,
+                item.Action.Url is not null ||
+                item.Action.Command is not null ||
+                item.Action.IssueId is not null,
                 $"'{item.Label}' is shown to someone with no way to act on it.");
         });
     }
@@ -179,7 +185,12 @@ public sealed class OwnerAttentionSummaryTests
 
         var item = Assert.Single(result.Items);
         Assert.Equal(AttentionActors.Operator, item.Actor);
-        Assert.NotNull(item.Action?.Command);
+
+        // The ledger here is for a different pull request, so there is no issue to
+        // post a directive on. The action says what it can do - open it - rather
+        // than offering a re-entry it cannot perform.
+        Assert.Equal("open", item.Action?.Kind);
+        Assert.NotNull(item.Action?.Url);
 
         Assert.Equal("Nothing needs you", result.Headline);
         Assert.DoesNotContain("waiting on you", result.Headline);

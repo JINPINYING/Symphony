@@ -70,6 +70,49 @@ document.addEventListener("click", async event => {
     return;
   }
 
+  const directiveButton = event.target.closest("[data-action='post-directive']");
+  if (directiveButton?.dataset.issueId) {
+    const button = directiveButton;
+    if (button.disabled) return;
+
+    const original = button.textContent.trim();
+    button.disabled = true;
+    button.textContent = "Posting…";
+
+    const payload = {
+      issueId: button.dataset.issueId,
+      issueIdentifier: button.dataset.issueIdentifier || null,
+      repository: button.dataset.repository || null,
+      action: button.dataset.directiveAction || "resume",
+      phase: button.dataset.directivePhase || null
+    };
+
+    /* Report what happened, including failure. A button that silently does
+       nothing is the fault this whole panel exists to stop making. */
+    fetch("/api/v1/actions/directive", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    }).then(async response => {
+      if (response.ok) {
+        button.textContent = "Posted";
+        loadDashboard();
+        return;
+      }
+      const detail = await response.json().catch(() => null);
+      button.textContent = detail?.error?.message
+        ? `Failed: ${String(detail.error.message).slice(0, 60)}`
+        : `Failed (${response.status})`;
+      button.disabled = false;
+    }).catch(error => {
+      button.textContent = `Failed: ${error?.message || "no answer from the plane"}`;
+      button.disabled = false;
+    });
+
+    window.setTimeout(() => { button.textContent = original; button.disabled = false; }, 6000);
+    return;
+  }
+
   const copyCommand = event.target.closest("[data-action='copy-command']");
   if (copyCommand?.dataset.command) {
     const command = copyCommand.dataset.command;
@@ -1008,10 +1051,26 @@ function renderAttentionAction(action, item) {
     return item?.url ? actionLink(item.url, "Open") : "";
   }
 
+  /* A command is shown, not offered as a button.
+     It ran as a <button> that only copied text to the clipboard, which is a
+     control that does not do the thing it is labelled with - and one of the
+     commands behind it did not exist at all. A thing that looks pressable has to
+     act; anything else is text, and this is text. */
   if (action.kind === "command" && action.command) {
-    return `<button type="button" class="wt-btn" data-action="copy-command"
-      data-command="${escapeAttribute(action.command)}"
-      title="${escapeAttribute(action.command)}">${icon("copy", 14)}${escapeHtml(action.label)}</button>`;
+    return `<code class="wt-cmd" title="Run this yourself">${escapeHtml(action.command)}</code>`;
+  }
+
+  /* A directive is the one thing the page can actually DO. It posts through the
+     plane, which holds the tracker key; the browser has no credentials of its
+     own. Everything else here is a link, and says so by being one. */
+  if (action.kind === "directive" && action.issue_id) {
+    return `<button type="button" class="wt-btn" data-action="post-directive"
+      data-issue-id="${escapeAttribute(action.issue_id)}"
+      data-issue-identifier="${escapeAttribute(action.issue_identifier || "")}"
+      data-repository="${escapeAttribute(action.repository || "")}"
+      data-directive-action="${escapeAttribute(action.directive_action || "resume")}"
+      data-directive-phase="${escapeAttribute(action.directive_phase || "")}"
+      >${icon("refresh", 14)}${escapeHtml(action.label)}</button>`;
   }
 
   const url = action.url || item?.url;

@@ -546,7 +546,12 @@ public sealed class RuntimeStateService(
                         kind = item.Action.Kind,
                         label = item.Action.Label,
                         url = item.Action.Url,
-                        command = item.Action.Command
+                        command = item.Action.Command,
+                        issue_id = item.Action.IssueId,
+                        issue_identifier = item.Action.IssueIdentifier,
+                        repository = item.Action.Repository,
+                        directive_action = item.Action.DirectiveAction,
+                        directive_phase = item.Action.DirectivePhase
                     }
                 })
             },

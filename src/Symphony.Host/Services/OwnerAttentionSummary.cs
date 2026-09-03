@@ -17,7 +17,19 @@ namespace Symphony.Host.Services;
 /// <param name="Label">The button text. Says what happens, not where it goes.</param>
 /// <param name="Url">Where to act, for the kinds that resolve on the tracker.</param>
 /// <param name="Command">The exact command, for actions needing a terminal. Never a description of one.</param>
-public sealed record AttentionAction(string Kind, string Label, string? Url = null, string? Command = null);
+public sealed record AttentionAction(
+    string Kind,
+    string Label,
+    string? Url = null,
+    string? Command = null,
+    // What a "directive" action needs to actually post itself. Carried rather
+    // than parsed out of the label, because a panel that reconstructs an issue id
+    // from display text will eventually reconstruct the wrong one.
+    string? IssueId = null,
+    string? IssueIdentifier = null,
+    string? Repository = null,
+    string? DirectiveAction = null,
+    string? DirectivePhase = null);
 
 /// <summary>
 /// Who can clear this. The panel is titled "needs your attention", so listing
@@ -250,7 +262,10 @@ public static class OwnerAttentionSummary
                 Action: posted
                     ? new AttentionAction("directive", "Un-park it",
                         Url: IssueUrl(run.Repository, run.IssueIdentifier),
-                        Command: "symphony:directive" + Environment.NewLine + "action: resume")
+                        IssueId: run.IssueId,
+                        IssueIdentifier: run.IssueIdentifier,
+                        Repository: run.Repository,
+                        DirectiveAction: "resume")
                     : new AttentionAction("command", "Check the publisher",
                         Command: @"Get-Content D:\AutonomousDevControlPlane\logs\symphony.log -Tail 50")));
         }
@@ -325,7 +340,10 @@ public static class OwnerAttentionSummary
                 // offer - the panel used to file it as the owner's anyway.
                 Actor: AttentionActors.Operator,
                 Action: new AttentionAction("directive", "Un-park it", Url: url,
-                    Command: "symphony:directive" + Environment.NewLine + "action: resume")));
+                    IssueId: phase.IssueId,
+                    IssueIdentifier: phase.IssueIdentifier,
+                    Repository: phase.Repository,
+                    DirectiveAction: "resume")));
         }
 
         var inFlightIssueIds = inFlightIssues
@@ -445,8 +463,23 @@ public static class OwnerAttentionSummary
                 ? new AttentionAction("open", "See the failing checks", Url: prUrl)
                 : tracked
                     ? new AttentionAction("merge", "Merge it", Url: prUrl)
-                    : new AttentionAction("command", "Re-enter it into the pipeline",
-                        Command: $"python scripts/command-center.py --readmit {pr.Number}");
+                    // Was a copyable `command-center.py --readmit` line. That flag
+                    // does not exist - it was written without checking, and shipped
+                    // onto the owner's panel as a button. A dropped pull request is
+                    // re-admitted the same way anything else parked is: a directive.
+                    : ledger is not null
+                        ? new AttentionAction("directive", "Re-enter it into the pipeline",
+                            Url: prUrl,
+                            IssueId: ledger.IssueId,
+                            IssueIdentifier: ledger.IssueIdentifier,
+                            Repository: pr.Repository,
+                            DirectiveAction: "resume")
+                        // No ledger means no issue to post a directive on, so there
+                        // is nothing to offer beyond looking at it. Labelling this
+                        // "re-enter it into the pipeline" would be a control that
+                        // cannot do what it says - which is the whole reason this
+                        // action shape exists.
+                        : new AttentionAction("open", "Open PR", Url: prUrl);
 
             items.Add(new AttentionItem(
                 failing
