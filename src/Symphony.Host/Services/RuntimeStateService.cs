@@ -331,6 +331,18 @@ public sealed class RuntimeStateService(
             .ToListAsync(cancellationToken);
         var phaseRows = await dbContext.PhaseLedger.AsNoTracking().ToListAsync(cancellationToken);
 
+        // The tracker's own verdict on what is finished. Read from the cache the
+        // tick already refreshes rather than asking GitHub here: this path renders
+        // on every poll, and a network call in it would make the page slow or blank
+        // exactly when the owner is checking on things.
+        var closedIssueIds = (await dbContext.IssueCache
+                .AsNoTracking()
+                .Select(cached => new { cached.IssueId, cached.State })
+                .ToListAsync(cancellationToken))
+            .Where(cached => IssueStateMatcher.IsClosedState(cached.State ?? string.Empty))
+            .Select(cached => cached.IssueId)
+            .ToHashSet(StringComparer.Ordinal);
+
         // Written by the orchestration tick rather than fetched here: the page is
         // rendered on every poll, and a GitHub call in this path would make it
         // slow or blank precisely when the owner is checking on things.
@@ -447,7 +459,8 @@ public sealed class RuntimeStateService(
             phaseEscalationReasons: phaseEscalationReasons,
             lastEventAtUtc: recentActivity.Count > 0 ? recentActivity[0].At : null,
             now: generatedAt,
-            primaryRepository: primaryRepository);
+            primaryRepository: primaryRepository,
+            closedIssueIds: closedIssueIds);
 
         // The workforce view. Runners come from the workflow so an unconfigured
         // vendor is not silently reported as an idle worker.
