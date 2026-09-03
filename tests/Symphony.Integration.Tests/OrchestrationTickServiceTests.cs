@@ -52,6 +52,47 @@ public sealed class OrchestrationTickServiceTests
         Assert.Empty(await harness.DbContext.RetryQueue.ToListAsync());
     }
 
+    // Symphony #53 was dispatched at 01:17 while open, closed at 01:21 by the pull
+    // request that fixed it, and worked on until 01:40. ReconcileRunningIssuesAsync
+    // is right there and does exactly the right thing - it just never had the state
+    // to fire on, because the by-id refresh asked the PRIMARY repository about a
+    // Symphony issue and a global node id returns nothing from the wrong repo.
+    //
+    // "Not in the response" then reads as "nothing to do", which is the same shape
+    // as every other fault found here: a failed read treated as a quiet answer.
+    [Fact]
+    public async Task RunTickAsync_ShouldStopARunWhoseNonPrimaryIssueWasClosed()
+    {
+        var tracker = new FakeTrackerClient([], issueStatesById: new Dictionary<string, string>
+        {
+            ["issue-s"] = "Closed"
+        });
+        tracker.IssuesByRepository["JINPINYING/Product"] = [];
+        tracker.IssuesByRepository["JINPINYING/Symphony"] = [];
+
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(
+                maxConcurrentAgents: 1,
+                repositories: [("JINPINYING", "Product"), ("JINPINYING", "Symphony")]),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await harness.InsertRunningRunAsync("issue-s", "#53", "Open", "instance-1");
+        var seeded = await harness.DbContext.Runs.SingleAsync();
+        seeded.Repository = "JINPINYING/Symphony";
+        await harness.DbContext.SaveChangesAsync();
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var run = await harness.DbContext.Runs.SingleAsync();
+        Assert.False(
+            string.IsNullOrWhiteSpace(run.RequestedStopReason),
+            "a run on a closed Symphony issue was left working");
+
+        // And the repository it belongs to is the one that was asked.
+        Assert.Contains("JINPINYING/Symphony", tracker.IssueStateFetchRepositories);
+    }
+
     [Fact]
     public async Task RunTickAsync_ShouldEscalateMissingRetryCandidateWithUnfinishedWork()
     {

@@ -247,7 +247,10 @@ public sealed partial class OrchestrationTickService
             apiKey,
             runningIssues.Select(run => run.IssueId).ToList(),
             "Running issue reconciliation failed; active runs will continue.",
-            cancellationToken);
+            cancellationToken,
+            runningIssues
+                .GroupBy(run => run.IssueId, StringComparer.Ordinal)
+                .ToDictionary(group => group.Key, group => group.First().Repository, StringComparer.Ordinal));
         if (refreshedStates is null)
         {
             return;
