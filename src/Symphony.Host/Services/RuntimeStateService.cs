@@ -275,7 +275,12 @@ public sealed class RuntimeStateService(
             tracker: trackerReachability.Current,
             lastEventAtUtc: recentActivity.Count > 0 ? recentActivity[0].At : null,
             now: generatedAt,
-            primaryRepository: primaryRepository);
+            primaryRepository: primaryRepository,
+            // What the plane is holding right now. Without this the panel cannot
+            // tell "nobody is going to move this" from "it is being moved".
+            activeIssueIds: runningRuns.Select(run => run.IssueId)
+                .Concat(retryEntries.Select(retry => retry.IssueId))
+                .ToHashSet(StringComparer.OrdinalIgnoreCase));
 
         // The workforce view. Runners come from the workflow so an unconfigured
         // vendor is not silently reported as an idle worker.
@@ -351,7 +356,18 @@ public sealed class RuntimeStateService(
                     label = item.Label,
                     detail = item.Detail,
                     severity = item.Severity,
-                    url = item.Url
+                    url = item.Url,
+                    // Who can clear it, and what they would do. A panel titled
+                    // "needs your attention" that lists things the reader cannot
+                    // act on teaches them to bring all of it to a person.
+                    actor = item.Actor,
+                    action = item.Action is null ? null : new
+                    {
+                        kind = item.Action.Kind,
+                        label = item.Action.Label,
+                        url = item.Action.Url,
+                        command = item.Action.Command
+                    }
                 })
             },
             tracker_reachability = new

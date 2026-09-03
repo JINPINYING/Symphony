@@ -779,7 +779,8 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
                 status.Mergeable,
                 updatedAt,
                 $"{query.Owner}/{query.Repo}",
-                GetOptionalString(prNode, "headRefName")));
+                GetOptionalString(prNode, "headRefName"),
+                status.HeadSha));
         }
 
         return results;
