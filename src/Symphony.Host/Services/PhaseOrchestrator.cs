@@ -198,6 +198,15 @@ public sealed class PhaseOrchestrator(
                 // as a review posts its verdict, and that is a reported outcome.
                 // Anything else is a contract violation and is escalated with a
                 // reason a person can act on.
+                // A settled ledger means the work reached its end by some other
+                // route - the pull request was found later, merged, or closed. The
+                // missing pull request is then history, not a fault, and escalating
+                // it puts the phase lane and the reconciler in a loop.
+                if (existingLedger is not null && IsTerminalStage(existingLedger.Stage))
+                {
+                    continue;
+                }
+
                 var comments = await trackerClient.FetchIssueCommentsAsync(query, issue.Id, cancellationToken);
                 var noChangeMarker = NoChangeNeededMarker(issue.Id);
                 var declaredNoChange = comments.Any(
@@ -211,6 +220,32 @@ public sealed class PhaseOrchestrator(
                     await dbContext.SaveChangesAsync(cancellationToken);
                     continue;
                 }
+
+                // ONCE. Not once per tick.
+                //
+                // This escalation and ReconcileEscalatedLedgers were fighting each
+                // other in production within an hour of shipping: escalate at :19,
+                // "phase_escalation_cleared" at :22, escalate again at :44, around
+                // every 25 seconds. Flipping the run off `succeeded` was supposed to
+                // make it self-limiting, and it does not - the reconciler resolves
+                // the run and the scan finds the next succeeded implementation for
+                // the same issue.
+                //
+                // The dossier that prompted this work warned about exactly this
+                // shape: "a rule doing that was shipped and looped within the hour".
+                // So the guard is the event log, the same way
+                // implementation_redispatch_blocked dedupes itself.
+                var alreadyEscalated = await dbContext.EventLog.AnyAsync(
+                    entry => entry.IssueId == issue.Id &&
+                             entry.EventName == "phase_implementation_no_pull_request",
+                    cancellationToken);
+                if (alreadyEscalated)
+                {
+                    continue;
+                }
+
+                AddPhaseEvent(issue.Id, issue.Identifier, "phase_implementation_no_pull_request",
+                    $"Implementation for {issue.Identifier} reported success and produced no pull request.");
 
                 await EscalateRunAsync(
                     issue.Id,

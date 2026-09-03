@@ -1062,9 +1062,17 @@ public sealed class OrchestrationTickServiceTests
         await harness.Service.RunTickAsync(CancellationToken.None);
         await harness.Service.RunTickAsync(CancellationToken.None);
 
+        // Once, not once per tick. Flipping the run off `succeeded` was supposed to
+        // be enough and is not: ReconcileEscalatedLedgers resolves the escalated run
+        // and the scan finds the next succeeded implementation for the same issue,
+        // so the two lanes escalated and cleared each other every 25 seconds in
+        // production. The event log is the guard.
         Assert.Single(
             (await harness.DbContext.EventLog.ToListAsync())
                 .Where(entry => entry.EventName == "needs_command_center"));
+        Assert.Single(
+            (await harness.DbContext.EventLog.ToListAsync())
+                .Where(entry => entry.EventName == "phase_implementation_no_pull_request"));
     }
 
     // A pull request closed and then reopened was orphaned forever. The ledger

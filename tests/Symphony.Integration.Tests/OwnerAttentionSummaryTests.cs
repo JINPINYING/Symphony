@@ -24,11 +24,13 @@ public sealed class OwnerAttentionSummaryTests
         IReadOnlyList<InFlightIssue>? inFlight = null,
         IReadOnlyDictionary<string, string>? escalationReasons = null,
         DateTimeOffset? lastEvent = null,
-        string? primaryRepository = null) =>
+        string? primaryRepository = null,
+        IReadOnlyCollection<string>? closedIssueIds = null) =>
         OwnerAttentionSummary.Build(
             healthy, escalated ?? [], running, retrying, phases ?? [], openPullRequests ?? [],
             agentActivity ?? [], watchedTasks ?? [], tracker, inFlight ?? [],
-            escalationReasons ?? new Dictionary<string, string>(), lastEvent, Now, primaryRepository);
+            escalationReasons ?? new Dictionary<string, string>(), lastEvent, Now, primaryRepository,
+            closedIssueIds);
 
     // Once the plane watches more than one repository, "#115" stops being an answer:
     // both can have one, and a panel that names it without saying which is telling
@@ -181,6 +183,30 @@ public sealed class OwnerAttentionSummaryTests
 
         Assert.Equal("Nothing needs you", result.Headline);
         Assert.DoesNotContain("waiting on you", result.Headline);
+    }
+
+    // Not every issue has a ledger. Symphony #50 was fixed by a pull request opened
+    // by hand, so no ledger ever reached a terminal stage - and its escalated run
+    // went on asking the owner for a decision about work already merged and
+    // deployed. The tracker's answer outranks the absence of a ledger row.
+    [Fact]
+    public void AnEscalationForAClosedIssueIsNotADecisionAnyMore()
+    {
+        var result = Build(
+            escalated: [Escalated("#50", posted: true)],
+            closedIssueIds: ["issue-#50"]);
+
+        Assert.Empty(result.Items);
+        Assert.Equal(OwnerAttentionSummary.LevelClear, result.Level);
+    }
+
+    [Fact]
+    public void AnEscalationForAnOpenIssueStillIs()
+    {
+        var result = Build(escalated: [Escalated("#50", posted: true)]);
+
+        var item = Assert.Single(result.Items);
+        Assert.Contains("needs a decision", item.Label);
     }
 
     // The bug this whole input exists to fix: every other signal here is the

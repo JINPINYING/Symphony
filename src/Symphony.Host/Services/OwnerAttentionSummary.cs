@@ -167,7 +167,10 @@ public static class OwnerAttentionSummary
         // multi-repository tracking carry no repository, and they all belong to the
         // repository that was the only one at the time - so they can be labelled
         // correctly instead of being the one line on the panel that stays ambiguous.
-        string? primaryRepository = null)
+        string? primaryRepository = null,
+        // Issues the tracker reports closed. A closed issue is finished: nothing
+        // about it is a decision on offer, however the engine's own rows read.
+        IReadOnlyCollection<string>? closedIssueIds = null)
     {
         var items = new List<AttentionItem>();
 
@@ -213,6 +216,14 @@ public static class OwnerAttentionSummary
                      || string.Equals(p.Stage, PhaseStages.Merged, StringComparison.Ordinal))
             .Select(p => p.IssueId)
             .ToHashSet(StringComparer.Ordinal);
+
+        // And an issue that is closed on the tracker is settled whatever the ledger
+        // says, because not every issue has one. Symphony #50 was fixed by a pull
+        // request opened by hand, so no ledger ever existed to reach a terminal
+        // stage - and its escalated run went on asking the owner for a decision
+        // about work that was merged and shipped. The tracker's own answer outranks
+        // the absence of a ledger entry.
+        settledIssues.UnionWith(closedIssueIds ?? []);
 
         foreach (var run in escalatedRuns.Where(run => !settledIssues.Contains(run.IssueId)))
         {
