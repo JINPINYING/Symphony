@@ -222,6 +222,124 @@ public sealed class OrchestrationTickServiceTests
         Assert.Equal("consumed_dispatched", ledger.Outcome);
     }
 
+    // Symphony#50. A directive asked for `review`, the ack said `review`, and the
+    // run that followed was `implementation` attempt 2 on an issue that already had
+    // an open PR - the exact condition that had escalated it. The phase survived the
+    // directive path intact; the retry threw it away, because a retry passes neither
+    // a directive nor a phase dispatch and the phase fell through to implementation.
+    // Nobody outside could tell "review ran and found nothing" from "review never
+    // ran", which is why the ack was worse than the wasted run.
+    [Fact]
+    public async Task RunTickAsync_ShouldResumeTheDirectivePhaseWhenTheDispatchIsRetried()
+    {
+        var issue = BuildIssue("issue-1", "#1", "Open", null,
+            pullRequests: [new PullRequestRef("pr-7", 7, "OPEN", null, "symphony/1", "main")]);
+        var tracker = new FakeTrackerClient([issue]);
+        tracker.IssuesById["issue-1"] = issue;
+        tracker.CommentsByIssueId["issue-1"] =
+        [
+            new NormalizedIssueComment(
+                "directive-1",
+                "symphony:directive\naction: resume\nphase: review\ninstructions: review the open PR",
+                "owner-login",
+                "OWNER",
+                DateTimeOffset.UtcNow.AddMinutes(-1))
+        ];
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Failure));
+
+        await harness.InsertRunAsync("issue-1", "#1", "Open", "instance-1", RunStatusNames.NeedsCommandCenter);
+
+        // Tick 1: the directive dispatches the review, and it fails into the retry queue.
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var dispatched = Assert.Single(harness.Coordinator.StartRequests);
+        Assert.Equal(RunPhaseNames.Review, dispatched.DirectivePhase);
+
+        var retryEntry = await harness.DbContext.RetryQueue.SingleAsync();
+        retryEntry.DueAtUtc = DateTimeOffset.UtcNow.AddSeconds(-1);
+        await harness.DbContext.SaveChangesAsync();
+
+        // Tick 2: the retry re-dispatches the same run row.
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Equal(2, harness.Coordinator.StartRequests.Count);
+        var resumed = harness.Coordinator.StartRequests[1];
+        Assert.Equal(RunPhaseNames.Review, resumed.DirectivePhase);
+        Assert.Equal(DirectiveActions.Resume, resumed.DirectiveAction);
+        Assert.Equal("review the open PR", resumed.DirectiveInstructions);
+
+        // The record agrees with what was dispatched: still a review, never
+        // relabelled as a second implementation attempt.
+        var reviewRun = Assert.Single(
+            await harness.DbContext.Runs
+                .Where(run => run.Status != RunStatusNames.ResolvedByDirective)
+                .ToListAsync());
+        Assert.Equal(RunPhaseNames.Review, reviewRun.Phase);
+        Assert.Equal(DirectiveActions.Resume, reviewRun.DirectiveAction);
+        Assert.Equal("review the open PR", reviewRun.DirectiveInstructions);
+    }
+
+    // The resume must not reach further than the run it is retrying: an ordinary
+    // implementation retry still gets the ordinary prompt and no directive block.
+    [Fact]
+    public async Task RunTickAsync_ShouldRetryAnOrdinaryImplementationWithoutInventingDispatchContext()
+    {
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: new FakeTrackerClient([BuildIssue("issue-1", "#1", "Open", null)]),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Failure));
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var retryEntry = await harness.DbContext.RetryQueue.SingleAsync();
+        retryEntry.DueAtUtc = DateTimeOffset.UtcNow.AddSeconds(-1);
+        await harness.DbContext.SaveChangesAsync();
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Equal(2, harness.Coordinator.StartRequests.Count);
+        var retried = harness.Coordinator.StartRequests[1];
+        Assert.Equal(1, retried.Attempt);
+        Assert.Equal(RunPhaseNames.Implementation, retried.DirectivePhase);
+        Assert.Null(retried.DirectiveAction);
+        Assert.Null(retried.DirectiveInstructions);
+        Assert.Null(retried.PromptOverride);
+        Assert.Null(retried.RunnerOverride);
+        Assert.Equal(RunPhaseNames.Implementation, (await harness.DbContext.Runs.SingleAsync()).Phase);
+    }
+
+    // Rows written before the dispatch context was durable carry a phase name and
+    // nothing behind it. Resuming one would hand the worker the ordinary
+    // implementation prompt while the run still reported `review` - the same lie the
+    // other way round, and harder to spot. It stops and asks for a person instead.
+    [Fact]
+    public async Task RunTickAsync_ShouldEscalateARetryOfAPhaseItCannotReproduce()
+    {
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: new FakeTrackerClient([BuildIssue("issue-1", "#1", "Open", null)]),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await harness.InsertRetryingRunAsync("issue-1", "#1", "Open", "instance-1");
+        var stranded = await harness.DbContext.Runs.SingleAsync();
+        stranded.Phase = RunPhaseNames.Review;
+        await harness.DbContext.SaveChangesAsync();
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Empty(harness.Coordinator.StartRequests);
+        var run = await harness.DbContext.Runs.SingleAsync();
+        Assert.Equal(RunStatusNames.NeedsCommandCenter, run.Status);
+        Assert.Equal(RunPhaseNames.Review, run.Phase);
+        Assert.Empty(await harness.DbContext.RetryQueue.ToListAsync());
+        Assert.Contains(
+            await harness.DbContext.EventLog.ToListAsync(),
+            entry => entry.EventName == "phase_retry_unresumable");
+    }
+
     [Fact]
     public async Task RunTickAsync_ShouldConsumeDirectiveExactlyOnceAcrossTicks()
     {

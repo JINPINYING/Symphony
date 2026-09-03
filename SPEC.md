@@ -785,6 +785,12 @@ Retry handling behavior:
    - Dispatch if slots are available.
    - Otherwise requeue with error `no available orchestrator slots`.
 5. If found but no longer active, release claim.
+6. A retry resumes the run it is retrying. It re-dispatches at the phase recorded on that run,
+   with the same dispatch context (directive action and instructions, or phase prompt and forced
+   runner), rather than starting a fresh implementation. A run whose recorded phase is not
+   `implementation` and whose dispatch context is not recoverable is not retried at all: it
+   escalates to the command center, because running the ordinary implementation prompt under
+   another phase's name misreports what happened as surely as changing the name does.
 
 Note:
 

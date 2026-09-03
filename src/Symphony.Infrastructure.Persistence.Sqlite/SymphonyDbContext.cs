@@ -96,6 +96,8 @@ public sealed class SymphonyDbContext(DbContextOptions<SymphonyDbContext> option
             entity.Property(x => x.Status).HasMaxLength(50).IsRequired();
             entity.Property(x => x.State).HasMaxLength(100).IsRequired();
             entity.Property(x => x.Runner).HasMaxLength(50).IsRequired();
+            entity.Property(x => x.DirectiveAction).HasMaxLength(50);
+            entity.Property(x => x.PhaseRunner).HasMaxLength(50);
             entity.Property(x => x.WorkspacePath).HasMaxLength(2048);
             entity.Property(x => x.SessionId).HasMaxLength(256);
             entity.Property(x => x.RequestedStopReason).HasMaxLength(100);

@@ -23,6 +23,22 @@ public sealed class RunEntity
     // Which agent runner executes this run (M4): codex or claude. Stall detection
     // and dashboards read it — a slower runner gets a wider stall window.
     public string Runner { get; set; } = "codex";
+
+    // The dispatch context that made this run the phase it is: an M3 command-center
+    // directive, or an M4 phase dispatch. A retry re-dispatches the run row it is
+    // retrying and is handed neither, so without a durable copy the phase name was
+    // the only thing left of it — and a phase with no prompt behind it is a label,
+    // not a phase. The retry therefore fell back to a plain implementation and
+    // rewrote Phase to match, which is how a directive acknowledged at `review`
+    // produced a second implementation attempt on an issue that already had an
+    // open pull request.
+    public string? DirectiveAction { get; set; }
+    public string? DirectiveInstructions { get; set; }
+
+    // A phase dispatch replaces the prompt outright and forces the runner, because
+    // an independent review must not land on the vendor that implemented (ADR-006).
+    public string? PhasePrompt { get; set; }
+    public string? PhaseRunner { get; set; }
     public int? CurrentRetryAttempt { get; set; }
     public string? WorkspacePath { get; set; }
     public string? SessionId { get; set; }
