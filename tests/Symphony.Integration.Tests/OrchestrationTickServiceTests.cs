@@ -1017,6 +1017,67 @@ public sealed class OrchestrationTickServiceTests
     // did not exist. This asserts the postcondition instead - no pull request and
     // no statement that none was needed is a contract violation, and it is said
     // out loud.
+    // CyberMed #150. The plane prepared `symphony/150`, whose pull request merged;
+    // the second cycle pushed `symphony/150-toolcalls` and opened a new one. The
+    // exact-name lookup found nothing, the ledger never reseeded, and a green pull
+    // request sat outside the pipeline while the panel told the owner to go and
+    // repair it - work the plane could do and was not doing.
+    [Fact]
+    public async Task RunTickAsync_ShouldSeedALedgerForAPullRequestOnASuffixedBranch()
+    {
+        var tracker = new FakeTrackerClient([]);
+        tracker.IssuesById["issue-1"] = BuildIssue("issue-1", "#150", "Open", null, pullRequests: []);
+        tracker.OpenPullRequests =
+        [
+            new OpenPullRequest(162, "toolcalls", "https://example.invalid/pull/162", "codex", false,
+                "SUCCESS", "MERGEABLE", DateTimeOffset.UtcNow, "", "symphony/150-toolcalls")
+        ];
+        tracker.PullRequestStatusByNumber[162] =
+            new PullRequestStatus(162, "OPEN", false, "cc33cc33", "SUCCESS", "MERGEABLE");
+
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success));
+
+        await harness.InsertRunAsync("issue-1", "#150", "Open", "instance-1", RunStatusNames.Succeeded);
+        // The branch the plane prepared - not the one the agent pushed.
+        await harness.InsertWorkspaceRecordAsync("issue-1", "#150", "symphony/150");
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var ledger = Assert.Single(await harness.DbContext.PhaseLedger.ToListAsync());
+        Assert.Equal(162, ledger.PrNumber);
+        Assert.Contains(
+            await harness.DbContext.EventLog.ToListAsync(),
+            entry => entry.EventName == "phase_pr_resolved_by_branch_family");
+    }
+
+    // The separator is required, so an issue cannot claim another issue's branch.
+    [Fact]
+    public async Task RunTickAsync_ShouldNotClaimAPullRequestFromALongerIssueNumber()
+    {
+        var tracker = new FakeTrackerClient([]);
+        tracker.IssuesById["issue-1"] = BuildIssue("issue-1", "#150", "Open", null, pullRequests: []);
+        tracker.OpenPullRequests =
+        [
+            new OpenPullRequest(200, "a different issue", "https://example.invalid/pull/200", "codex", false,
+                "SUCCESS", "MERGEABLE", DateTimeOffset.UtcNow, "", "symphony/1500")
+        ];
+
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success));
+
+        await harness.InsertRunAsync("issue-1", "#150", "Open", "instance-1", RunStatusNames.Succeeded);
+        await harness.InsertWorkspaceRecordAsync("issue-1", "#150", "symphony/150");
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Empty(await harness.DbContext.PhaseLedger.ToListAsync());
+    }
+
     [Fact]
     public async Task RunTickAsync_ShouldEscalateWhenImplementationSucceedsWithoutAPullRequest()
     {
