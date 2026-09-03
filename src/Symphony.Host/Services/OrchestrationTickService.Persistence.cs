@@ -206,7 +206,10 @@ public sealed partial class OrchestrationTickService
             apiKey,
             cachedIssues.Select(issue => issue.IssueId).ToList(),
             "Tracked issue cache state refresh failed; dashboard issue-state summaries may be stale.",
-            cancellationToken);
+            cancellationToken,
+            cachedIssues
+                .GroupBy(issue => issue.IssueId, StringComparer.Ordinal)
+                .ToDictionary(group => group.Key, group => group.First().Repository, StringComparer.Ordinal));
         if (refreshedStates is null)
         {
             return;
@@ -358,12 +361,30 @@ public sealed partial class OrchestrationTickService
         return false;
     }
 
+    // Ask each repository about its own issues.
+    //
+    // This used to send every id to BuildTrackerQuery - the PRIMARY repository -
+    // whatever repository the work belonged to. A GraphQL node id is global, so
+    // the wrong repository returns nothing rather than erroring, and both callers
+    // treat "not in the response" as "nothing to do":
+    //
+    //   - the tracked-issue cache never refreshed a Symphony or ADCP issue, so its
+    //     State froze at whatever it was when first seen. Symphony #50 still read
+    //     `Open` on the owner's panel an hour after it was closed and deployed.
+    //   - running-run reconciliation never saw a non-primary issue reach a terminal
+    //     state, so it never asked such a run to stop. Symphony #53 was closed four
+    //     minutes into its run and worked on for another nineteen.
+    //
+    // The second one is why the mechanism looked present and absent at the same
+    // time: RequestRunStopAsync is right there and correct, and simply never had
+    // the state to fire on.
     private async Task<IReadOnlyList<IssueStateSnapshot>?> TryFetchIssueStatesByIdsAsync(
         WorkflowDefinition workflowDefinition,
         string apiKey,
         IReadOnlyList<string> issueIds,
         string failureMessage,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        IReadOnlyDictionary<string, string>? repositoryByIssueId = null)
     {
         if (issueIds.Count == 0)
         {
@@ -372,10 +393,33 @@ public sealed partial class OrchestrationTickService
 
         try
         {
-            return await trackerClient.FetchIssueStatesByIdsAsync(
-                BuildTrackerQuery(workflowDefinition, apiKey),
-                issueIds,
-                cancellationToken);
+            var queries = BuildTrackerQueries(workflowDefinition, apiKey);
+            if (!queries.IsMultiRepository || repositoryByIssueId is null)
+            {
+                return await trackerClient.FetchIssueStatesByIdsAsync(
+                    queries.Primary,
+                    issueIds,
+                    cancellationToken);
+            }
+
+            // One call per repository that actually owns some of these ids, rather
+            // than one per id: the fetch is by list, and the repository count is
+            // small and fixed.
+            var byRepository = issueIds
+                .GroupBy(id => repositoryByIssueId.TryGetValue(id, out var repo) ? repo : string.Empty,
+                         StringComparer.OrdinalIgnoreCase);
+
+            var combined = new List<IssueStateSnapshot>();
+            foreach (var group in byRepository)
+            {
+                var states = await trackerClient.FetchIssueStatesByIdsAsync(
+                    queries.For(group.Key),
+                    group.ToList(),
+                    cancellationToken);
+                combined.AddRange(states);
+            }
+
+            return combined;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
