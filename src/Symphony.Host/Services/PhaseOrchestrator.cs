@@ -58,6 +58,16 @@ public sealed class PhaseOrchestrator(
     /// </summary>
     public static readonly TimeSpan StuckStageTimeout = TimeSpan.FromHours(2);
 
+    /// <summary>
+    /// The event name a phase escalation and its reason are recorded under.
+    ///
+    /// Read back by the status page, so it is a persisted value and not just a log
+    /// string - renaming it silently leaves the owner-attention panel with a
+    /// parked phase and no reason to show for it, which is how that panel came to
+    /// print the same invented merge-gate story over every escalation.
+    /// </summary>
+    public const string EscalationEventName = "needs_command_center";
+
     private static string Humanise(TimeSpan span) =>
         span.TotalMinutes < 60 ? $"{(int)span.TotalMinutes} minutes"
         : span.TotalHours < 24 ? $"{(int)span.TotalHours} hours"
@@ -1129,7 +1139,7 @@ public sealed class PhaseOrchestrator(
             latestRun.EscalationPostedAtUtc = null;
         }
 
-        AddPhaseEvent(ledger.IssueId, ledger.IssueIdentifier, "needs_command_center", $"Phase orchestration: {reason}");
+        AddPhaseEvent(ledger.IssueId, ledger.IssueIdentifier, EscalationEventName, $"Phase orchestration: {reason}");
         await dbContext.SaveChangesAsync(cancellationToken);
         logger.LogError("Phase escalation for {IssueIdentifier}: {Reason}", ledger.IssueIdentifier, reason);
     }
@@ -1160,7 +1170,7 @@ public sealed class PhaseOrchestrator(
             latestRun.EscalationPostedAtUtc = null;
         }
 
-        AddPhaseEvent(issueId, issueIdentifier, "needs_command_center", $"Phase orchestration: {reason}");
+        AddPhaseEvent(issueId, issueIdentifier, EscalationEventName, $"Phase orchestration: {reason}");
         await dbContext.SaveChangesAsync(cancellationToken);
         logger.LogError("Phase escalation for {IssueIdentifier}: {Reason}", issueIdentifier, reason);
     }
@@ -1172,7 +1182,7 @@ public sealed class PhaseOrchestrator(
             IssueId = issueId,
             IssueIdentifier = issueIdentifier,
             EventName = eventName,
-            Level = (eventName == "needs_command_center" ? LogLevel.Error : LogLevel.Information).ToString(),
+            Level = (eventName == EscalationEventName ? LogLevel.Error : LogLevel.Information).ToString(),
             Message = message,
             OccurredAtUtc = timeProvider.GetUtcNow()
         });

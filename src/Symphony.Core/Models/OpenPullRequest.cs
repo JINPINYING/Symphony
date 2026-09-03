@@ -35,4 +35,12 @@ public sealed record OpenPullRequest(
     // ("symphony/115") from one a person opened, which decides whether an
     // untracked green PR is a decision waiting on the owner or a fault where the
     // pipeline dropped its own work.
-    string? HeadRefName = null);
+    string? HeadRefName = null,
+    // The exact commit the pull request currently points at. Trailing and
+    // defaulted for the same snapshot-compatibility reason as the two above.
+    //
+    // Without it a reader can only ask "was this approved at some point", which is
+    // the question that let the status page announce an approval for a head no
+    // reviewer had ever seen. Every claim about a review verdict has to bind to
+    // this, exactly as the merge gate does.
+    string? HeadSha = null);

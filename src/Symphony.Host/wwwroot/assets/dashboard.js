@@ -1151,7 +1151,12 @@ function renderQueuePanel() {
        to make - the engine's own detail text says so. Filing it under "your
        decision" told the reader to choose something when nothing is on offer. */
     const orphaned = /fell out of the pipeline|is not tracking it/i.test(`${label} ${item.detail || ""}`);
-    if (!orphaned && !/needs a decision|stopped at the merge gate|waiting on you/i.test(label)) continue;
+    /* "stopped in the phase pipeline" is what an escalation reads as when the
+       engine cannot say it was approved - which is most of them. Matching only
+       the merge-gate wording would have dropped every one of those from this
+       panel the moment the engine stopped over-claiming approvals. */
+    if (!orphaned &&
+        !/needs a decision|stopped at the merge gate|stopped in the phase pipeline|waiting on you/i.test(label)) continue;
     rows.push({
       word: orphaned ? "NEEDS REPAIR" : "AWAITING DECISION",
       sev: orphaned ? "down" : "attention",

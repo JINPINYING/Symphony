@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -252,6 +253,82 @@ public sealed class OrchestrationTickServiceTests
         Assert.Single(
             tracker.PostedComments.Where(comment =>
                 comment.Body.Contains(DirectiveProcessor.AckMarkerFor("directive-1"), StringComparison.Ordinal)));
+    }
+
+    // A directive the plane has accepted but cannot act on yet used to exist only
+    // in a log line, so from the outside the issue looked untouched - and the
+    // owner-attention panel went on telling the owner its pull request was theirs
+    // to merge, while the answer they had already given waited for a slot.
+    [Fact]
+    public async Task RunTickAsync_ShouldRecordADeferredDirectiveAsPending()
+    {
+        var tracker = new FakeTrackerClient([]);
+        tracker.IssuesById["issue-1"] = BuildIssue("issue-1", "#1", "Open", null);
+        tracker.CommentsByIssueId["issue-1"] =
+        [
+            new NormalizedIssueComment(
+                "directive-1",
+                "symphony:directive\naction: resume",
+                "owner-login",
+                "OWNER",
+                DateTimeOffset.UtcNow.AddMinutes(-1))
+        ];
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await harness.InsertRunAsync("issue-1", "#1", "Open", "instance-1", RunStatusNames.NeedsCommandCenter);
+        // The only slot is taken, so the directive cannot dispatch this tick.
+        await harness.InsertRunAsync("issue-2", "#2", "Open", "instance-1", RunStatusNames.Running);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        // Not consumed - it still has to be acted on once a slot frees.
+        Assert.Empty(await harness.DbContext.DirectiveLog.ToListAsync());
+
+        var pending = Assert.Single(await harness.DbContext.EventLog
+            .Where(entry => entry.EventName == DirectiveProcessor.PendingDirectiveEvent)
+            .ToListAsync());
+        Assert.Equal("issue-1", pending.IssueId);
+        // The comment id is persisted as data, not left to be parsed back out of
+        // prose that somebody will improve one day.
+        var state = JsonSerializer.Deserialize<DirectiveProcessor.PendingDirectiveState>(pending.DataJson!);
+        Assert.Equal("directive-1", state!.CommentId);
+        Assert.Equal(DirectiveActions.Resume, state.Action);
+    }
+
+    // The tick runs every few seconds and a directive can sit behind a full queue
+    // for hours. One row, rewritten, not one row per tick.
+    [Fact]
+    public async Task RunTickAsync_ShouldNotAddAPendingDirectiveRowPerTick()
+    {
+        var tracker = new FakeTrackerClient([]);
+        tracker.IssuesById["issue-1"] = BuildIssue("issue-1", "#1", "Open", null);
+        tracker.CommentsByIssueId["issue-1"] =
+        [
+            new NormalizedIssueComment(
+                "directive-1",
+                "symphony:directive\naction: resume",
+                "owner-login",
+                "OWNER",
+                DateTimeOffset.UtcNow.AddMinutes(-1))
+        ];
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await harness.InsertRunAsync("issue-1", "#1", "Open", "instance-1", RunStatusNames.NeedsCommandCenter);
+        await harness.InsertRunAsync("issue-2", "#2", "Open", "instance-1", RunStatusNames.Running);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Single(await harness.DbContext.EventLog
+            .Where(entry => entry.EventName == DirectiveProcessor.PendingDirectiveEvent)
+            .ToListAsync());
     }
 
     [Fact]

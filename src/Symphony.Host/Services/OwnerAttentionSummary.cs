@@ -11,6 +11,23 @@ namespace Symphony.Host.Services;
 public sealed record AttentionItem(string Label, string Detail, string Severity, string? Url = null);
 
 /// <summary>
+/// An issue the plane itself will move next: running, waiting for a free agent
+/// slot, retrying, or carrying a directive it has accepted but not consumed yet.
+///
+/// This is the input the panel was missing. Every claim it makes is "nothing
+/// will move this without you", and the state that contradicts it was sitting in
+/// the same payload the whole time - the run said RUNNING and the queue named
+/// the issue while the panel announced the pull request as the owner's to merge.
+///
+/// Carries both keys because the panel reaches an issue two ways: through the
+/// phase ledger, which knows the id, and through a "symphony/115" branch name,
+/// which knows only the number. <paramref name="Repository"/> is "owner/repo",
+/// empty for the primary, so "#115" in one repository cannot silence "#115" in
+/// another.
+/// </summary>
+public sealed record InFlightIssue(string IssueId, string IssueIdentifier, string Repository = "");
+
+/// <summary>
 /// The answer to "does this need me?", computed by the engine rather than
 /// assembled by hand somewhere else.
 ///
@@ -24,6 +41,15 @@ public sealed record AttentionItem(string Label, string Detail, string Severity,
 /// plane is the normal, healthy state - it means the queue is empty, not that
 /// something is wrong - and reporting idleness as a problem is how a status page
 /// teaches its reader to ignore it.
+///
+/// The same conservatism now applies to work in flight. Every item here is the
+/// claim "nothing will move this without you", and each one is checked against
+/// the rest of the payload before it is made: an issue the plane is running,
+/// queueing, or holding a directive for is the plane's to move, not the owner's.
+/// Without that check the rule was effectively "open pull request + CI not red",
+/// which is true of every change in flight - so the count grew with healthy
+/// activity, and grew fastest during exactly the busy periods when the owner
+/// should have been left alone.
 /// </summary>
 public static class OwnerAttentionSummary
 {
@@ -86,6 +112,15 @@ public static class OwnerAttentionSummary
         IReadOnlyList<AgentActivityReport> agentActivity,
         IReadOnlyList<WatchedTaskReport> watchedTasks,
         TrackerReachabilitySnapshot? tracker,
+        // Issues the plane will move on its own. Required, not defaulted: a caller
+        // that forgets it gets the panel back that reported healthy in-flight work
+        // as the owner's obligation, and silently.
+        IReadOnlyList<InFlightIssue> inFlightIssues,
+        // The reason the phase machine recorded when it escalated, by issue id.
+        // The phase lane can only describe the general case from a ledger row, and
+        // describing the general case is how "stopped at the merge gate" came to be
+        // printed over an escalation that happened during implementation.
+        IReadOnlyDictionary<string, string> phaseEscalationReasons,
         DateTimeOffset? lastEventAtUtc,
         DateTimeOffset now,
         // The primary repository key when the plane watches more than one, and null
@@ -159,8 +194,15 @@ public static class OwnerAttentionSummary
                 IssueUrl(run.Repository, run.IssueIdentifier)));
         }
 
-        // A PR that reached ready and stayed there means the merge gate refused it
-        // for a reason a person has to resolve.
+        // A phase that escalated and is not already reported through the run lane.
+        //
+        // What it escalated FOR is not something this lane may guess. It used to
+        // print one story for every escalation - "PR #N was approved but not
+        // merged, the gate escalates on a protected path" - and on 2026-09-02 that
+        // story appeared over PR #147, which had never been reviewed at all and had
+        // escalated during implementation. An owner reading it was being invited to
+        // merge unreviewed code on the panel's word.
+        //
         // Only when the run lane is not already reporting this issue.
         //
         // A phase escalation marks BOTH records: EscalateAsync sets the ledger to
@@ -171,9 +213,11 @@ public static class OwnerAttentionSummary
         // is asked to trust is worse than the redundancy looks.
         //
         // The run item is the one kept, because it carries the actual reason the
-        // phase recorded ("Phase orchestration: ..."), where this one can only
-        // describe the general case. A ledger escalated with no run behind it still
-        // reports here, so nothing stops being covered.
+        // phase recorded ("Phase orchestration: ..."). A ledger escalated with no
+        // run behind it still reports here, so nothing stops being covered - and it
+        // now reads the same reason back out of the event the phase wrote it to,
+        // rather than describing the general case, which is what made the two lanes
+        // tell different stories about one escalation.
         var issuesAlreadyReported = escalatedRuns
             .Where(run => !settledIssues.Contains(run.IssueId))
             .Select(run => run.IssueId)
@@ -183,18 +227,42 @@ public static class OwnerAttentionSummary
                      string.Equals(p.Stage, PhaseStages.Escalated, StringComparison.Ordinal) &&
                      !issuesAlreadyReported.Contains(p.IssueId)))
         {
+            var issueLabel = Qualify(primaryRepository, phase.Repository, phase.IssueIdentifier);
+            var pullRequestLabel = Qualify(primaryRepository, phase.Repository, $"PR #{phase.PrNumber}");
+            var url = IssueUrl(phase.Repository, phase.IssueIdentifier);
+
+            // The reason the phase machine recorded names the phase it stopped in
+            // and, for a merge-gate refusal, the protected path itself - which is
+            // the only part of that refusal the owner can act on.
+            var recorded = phaseEscalationReasons.TryGetValue(phase.IssueId, out var reason) &&
+                           !string.IsNullOrWhiteSpace(reason)
+                ? reason.Trim()
+                : null;
+
+            // "Stopped at the merge gate" is a specific claim: reviewed, approved
+            // at the head it still carries, and refused by the gate anyway. It is
+            // the merge gate's own test, so it is tested the merge gate's way.
+            if (IsApprovedAtHead(phase, phase.HeadSha))
+            {
+                items.Add(new AttentionItem(
+                    $"{issueLabel} stopped at the merge gate",
+                    $"{pullRequestLabel} was approved at head {Short(phase.HeadSha)} and the gate refused to merge it. " +
+                    (recorded ?? "The engine did not record which condition it refused on."),
+                    LevelAttention,
+                    url));
+                continue;
+            }
+
             items.Add(new AttentionItem(
-                $"{Qualify(primaryRepository, phase.Repository, phase.IssueIdentifier)} stopped at the merge gate",
-                $"{Qualify(primaryRepository, phase.Repository, $"PR #{phase.PrNumber}")} was approved but not merged. The gate escalates rather than merging when a change touches a protected path.",
-                LevelAttention));
+                $"{issueLabel} stopped in the phase pipeline",
+                $"{recorded ?? "The engine did not record a reason."} {VerdictAtHead(pullRequestLabel, phase)}",
+                LevelAttention,
+                url));
         }
 
-        // Pull requests the phase pipeline holds a ledger row for. Anything else
-        // the plane opened is outside its own machinery and will not advance.
-        var trackedPullRequestNumbers = phases
-            .Where(p => p.PrNumber > 0 && !string.Equals(p.Stage, PhaseStages.Closed, StringComparison.Ordinal))
-            .Select(p => p.PrNumber)
-            .ToHashSet();
+        var inFlightIssueIds = inFlightIssues
+            .Select(issue => issue.IssueId)
+            .ToHashSet(StringComparer.Ordinal);
 
         // An open pull request is the most common way work waits on a person, and
         // for a long time this summary could not see one: every other input here
@@ -211,6 +279,64 @@ public static class OwnerAttentionSummary
             if (string.Equals(checks, "PENDING", StringComparison.OrdinalIgnoreCase) ||
                 string.Equals(checks, "EXPECTED", StringComparison.OrdinalIgnoreCase))
             {
+                continue;
+            }
+
+            // The pipeline's own row for this pull request, if it holds one.
+            // Anything else the plane opened is outside its own machinery and will
+            // not advance.
+            var ledger = phases.FirstOrDefault(p =>
+                p.PrNumber == pr.Number &&
+                !string.Equals(p.Stage, PhaseStages.Closed, StringComparison.Ordinal) &&
+                SameRepository(p.Repository, pr.Repository));
+
+            // Listing a pull request here asserts that NOTHING will move it without
+            // the owner. Before asserting it, check what the same payload already
+            // knows - because on 2026-09-02 it knew otherwise for two of the three
+            // items on the panel, and said them anyway.
+            if (ledger is not null)
+            {
+                // The plane holds a run or a queue place for the issue behind it,
+                // or a directive it has accepted and not consumed yet. PR #148 was
+                // announced as needing the owner less than a minute after the plane
+                // started a repair on that very branch.
+                if (inFlightIssueIds.Contains(ledger.IssueId))
+                {
+                    continue;
+                }
+
+                // The phase machine is mid-flight: verifying, dispatching a review,
+                // reviewing, or fenced waiting for the one bounded repair. A stage
+                // that genuinely stops moving escalates on its own backstop, and is
+                // then reported by the escalation lane above, with its reason.
+                if (PipelineIsDrivingIt(ledger.Stage))
+                {
+                    continue;
+                }
+
+                // Escalated is reported once, above, by whichever lane holds the
+                // reason. Repeating it here would both double the count and relabel
+                // a parked run as an ordinary merge decision.
+                if (string.Equals(ledger.Stage, PhaseStages.Escalated, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                // What is left is a pull request the pipeline holds and is not
+                // acting on, which is the owner's only when the review says so at
+                // the head it carries now. A head carrying CHANGES_REQUIRED, or no
+                // verdict at all, is not a merge decision waiting on anyone.
+                if (!IsApprovedAtHead(ledger, pr.HeadSha))
+                {
+                    continue;
+                }
+            }
+            else if (IsPlaneOpened(pr.HeadRefName) && IsInFlightByBranch(pr, inFlightIssues))
+            {
+                // No ledger yet, but the plane is running or queueing the issue this
+                // branch belongs to. "The plane is not tracking it, so no review or
+                // merge will ever run" is a false alarm while the plane is working
+                // on exactly that issue.
                 continue;
             }
 
@@ -231,12 +357,11 @@ public static class OwnerAttentionSummary
             //
             // Both halves are required. Most open pull requests have no ledger
             // because a person opened them, and those genuinely are the owner's to
-            // merge - calling every untracked PR a fault would relabel all normal
-            // work as breakage. The fault is specifically a branch the PLANE
-            // created that the plane is no longer tracking.
-            var planeOpened = pr.HeadRefName?.StartsWith("symphony/", StringComparison.OrdinalIgnoreCase) == true;
-            var droppedByPipeline = planeOpened && !trackedPullRequestNumbers.Contains(pr.Number);
-            var tracked = !droppedByPipeline;
+            // merge - nothing in the plane will ever touch them - so calling every
+            // untracked PR a fault would relabel all normal work as breakage. The
+            // fault is specifically a branch the PLANE created that the plane is no
+            // longer tracking.
+            var tracked = ledger is not null || !IsPlaneOpened(pr.HeadRefName);
 
             items.Add(new AttentionItem(
                 failing
@@ -344,6 +469,90 @@ public static class OwnerAttentionSummary
 
         return (level, headline, detail, items);
     }
+
+    /// <summary>
+    /// The merge gate's own approval test, applied to what the panel is about to
+    /// claim: the recorded verdict is APPROVED and it was recorded against the head
+    /// the pull request carries now.
+    ///
+    /// Approval inferred from anything else - a stage name, a green tick, an open
+    /// pull request that has been open a while - is exactly the inference that put
+    /// "PR #147 was approved but not merged" on the panel for a change no reviewer
+    /// had ever seen. An unknown head fails the test rather than passing it: not
+    /// being able to check is not the same as having checked.
+    /// </summary>
+    private static bool IsApprovedAtHead(PhaseLedgerEntity ledger, string? headSha) =>
+        string.Equals(ledger.LastVerdict, ReviewVerdicts.Approved, StringComparison.Ordinal) &&
+        !string.IsNullOrWhiteSpace(ledger.LastVerdictHeadSha) &&
+        !string.IsNullOrWhiteSpace(headSha) &&
+        string.Equals(ledger.LastVerdictHeadSha, headSha, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Stages the phase machine advances by itself on the next tick. None of them
+    /// is waiting on a person, and each one that stops moving escalates on the
+    /// stuck-stage backstop rather than sitting silent - so staying quiet here
+    /// cannot lose a stall.
+    /// </summary>
+    private static bool PipelineIsDrivingIt(string stage) =>
+        string.Equals(stage, PhaseStages.AwaitingVerify, StringComparison.Ordinal) ||
+        string.Equals(stage, PhaseStages.AwaitingReview, StringComparison.Ordinal) ||
+        string.Equals(stage, PhaseStages.Reviewing, StringComparison.Ordinal) ||
+        string.Equals(stage, PhaseStages.WaitForRepair, StringComparison.Ordinal);
+
+    /// <summary>
+    /// What the review says about the head the pull request carries now, said
+    /// plainly. The panel's job when it cannot claim an approval is to report the
+    /// absence, not to fill it with the commonest story.
+    /// </summary>
+    private static string VerdictAtHead(string pullRequestLabel, PhaseLedgerEntity ledger)
+    {
+        var head = Short(ledger.HeadSha);
+
+        if (string.IsNullOrWhiteSpace(ledger.LastVerdict) ||
+            string.IsNullOrWhiteSpace(ledger.LastVerdictHeadSha) ||
+            !string.Equals(ledger.LastVerdictHeadSha, ledger.HeadSha, StringComparison.OrdinalIgnoreCase))
+        {
+            return $"{pullRequestLabel} carries no review verdict at head {head}, so nothing has approved it.";
+        }
+
+        return $"{pullRequestLabel} carries {ledger.LastVerdict} at head {head}, so it is not merge-ready as it stands.";
+    }
+
+    private static bool IsPlaneOpened(string? headRefName) =>
+        headRefName?.StartsWith("symphony/", StringComparison.OrdinalIgnoreCase) == true;
+
+    /// <summary>
+    /// Whether a "symphony/115" branch belongs to an issue the plane is already
+    /// moving. The branch carries the issue number and nothing else, so the match
+    /// is on the identifier - and on the repository too, because "#115" exists in
+    /// every repository the plane watches.
+    /// </summary>
+    private static bool IsInFlightByBranch(OpenPullRequest pr, IReadOnlyList<InFlightIssue> inFlightIssues)
+    {
+        var number = pr.HeadRefName!["symphony/".Length..];
+        if (number.Length == 0 || !number.All(char.IsDigit))
+        {
+            return false;
+        }
+
+        return inFlightIssues.Any(issue =>
+            string.Equals(issue.IssueIdentifier.TrimStart('#'), number, StringComparison.Ordinal) &&
+            SameRepository(issue.Repository, pr.Repository));
+    }
+
+    /// <summary>
+    /// An empty repository key means "the repository that was the only one at the
+    /// time", so it matches anything rather than nothing - the same rule
+    /// <see cref="Qualify"/> follows for rows written before multi-repository
+    /// tracking.
+    /// </summary>
+    private static bool SameRepository(string? left, string? right) =>
+        string.IsNullOrWhiteSpace(left) ||
+        string.IsNullOrWhiteSpace(right) ||
+        string.Equals(left, right, StringComparison.OrdinalIgnoreCase);
+
+    private static string Short(string? sha) =>
+        string.IsNullOrWhiteSpace(sha) ? "unknown" : sha.Length > 8 ? sha[..8] : sha;
 
     private static string Humanise(TimeSpan span)
     {

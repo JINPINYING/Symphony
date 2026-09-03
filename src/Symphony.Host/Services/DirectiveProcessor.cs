@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Symphony.Core.Models;
 using Symphony.Infrastructure.Persistence.Sqlite;
@@ -31,6 +32,32 @@ public sealed class DirectiveProcessor(
     ILogger<DirectiveProcessor> logger)
 {
     private static readonly string[] AuthorizedAssociations = ["OWNER", "MEMBER", "COLLABORATOR"];
+
+    /// <summary>
+    /// The event name a deferred directive is recorded under.
+    ///
+    /// A directive the plane has accepted but cannot act on yet - no free agent
+    /// slot, claim refused - was previously visible only in a log line, so from
+    /// the outside the issue looked untouched. The owner-attention panel then told
+    /// the owner that its pull request was theirs to merge, while the answer they
+    /// had already given sat in the queue waiting for a slot.
+    /// </summary>
+    public const string PendingDirectiveEvent = "directive_pending";
+
+    /// <summary>
+    /// How long a recorded pending directive is believed for.
+    ///
+    /// The marker is rewritten while the directive genuinely waits, so a live one
+    /// is never stale. The window matters for the other case: a directive comment
+    /// deleted before the plane could act on it stops being re-recorded, and a
+    /// marker that never expired would go on suppressing that issue's pull request
+    /// for ever.
+    /// </summary>
+    public static readonly TimeSpan PendingDirectiveWindow = TimeSpan.FromMinutes(15);
+
+    // Long enough that a directive parked behind a busy queue does not add a row
+    // per tick, short enough that the marker stays well inside the window above.
+    private static readonly TimeSpan PendingDirectiveRefresh = TimeSpan.FromMinutes(5);
 
     public static string AckMarkerFor(string commentId) => $"<!-- symphony:directive-ack:{commentId} -->";
 
@@ -208,6 +235,10 @@ public sealed class DirectiveProcessor(
             logger.LogInformation(
                 "Deferring directive {CommentId} on {IssueIdentifier}: no free agent slot ({Running}/{Max}).",
                 comment.Id, issueIdentifier, runningCount, workflowDefinition.Runtime.Agent.MaxConcurrentAgents);
+            await RecordPendingDirectiveAsync(
+                comment.Id, issueId, issueIdentifier, action,
+                $"no free agent slot ({runningCount}/{workflowDefinition.Runtime.Agent.MaxConcurrentAgents})",
+                cancellationToken);
             return false;
         }
 
@@ -236,6 +267,8 @@ public sealed class DirectiveProcessor(
             logger.LogWarning(
                 "Directive {CommentId} on {IssueIdentifier} could not dispatch (claim refused); it stays pending and will retry next tick.",
                 comment.Id, issueIdentifier);
+            await RecordPendingDirectiveAsync(
+                comment.Id, issueId, issueIdentifier, action, "the dispatch claim was refused", cancellationToken);
             return false;
         }
 
@@ -291,6 +324,69 @@ public sealed class DirectiveProcessor(
         var body = $"{AckMarkerFor(comment.Id)}\n{message}\n\n— Symphony directive processor";
         await trackerClient.PostIssueCommentAsync(query, issueId, body, cancellationToken);
     }
+
+    /// <summary>
+    /// Record that a valid directive is accepted and waiting for the plane, so the
+    /// fact survives this process and can be read by anything that needs to know
+    /// whether an issue is still the owner's to move.
+    /// </summary>
+    /// <remarks>
+    /// One row per directive, rewritten rather than appended, and only once every
+    /// <see cref="PendingDirectiveRefresh"/>: a directive can sit deferred for
+    /// hours behind a full queue, and the tick that defers it runs every few
+    /// seconds. The comment id goes in DataJson rather than being read back out of
+    /// the message, following the candidate-scan pause - a value recovered by
+    /// parsing prose breaks the next time somebody improves the wording.
+    /// </remarks>
+    private async Task RecordPendingDirectiveAsync(
+        string commentId,
+        string issueId,
+        string issueIdentifier,
+        string action,
+        string reason,
+        CancellationToken cancellationToken)
+    {
+        var nowUtc = timeProvider.GetUtcNow();
+        var payload = JsonSerializer.Serialize(new PendingDirectiveState(commentId, action));
+        var message = $"Directive comment {commentId} ({action}) is accepted and waiting for the plane: {reason}.";
+
+        // Ordered by Id for the same reason the pause restore is: SQLite cannot
+        // ORDER BY a DateTimeOffset, and the identity column answers "written last"
+        // exactly.
+        var existing = await dbContext.EventLog
+            .Where(entry => entry.EventName == PendingDirectiveEvent && entry.DataJson == payload)
+            .OrderByDescending(entry => entry.Id)
+            .FirstOrDefaultAsync(cancellationToken);
+
+        if (existing is not null)
+        {
+            if (nowUtc - existing.OccurredAtUtc < PendingDirectiveRefresh)
+            {
+                return;
+            }
+
+            existing.Message = message;
+            existing.OccurredAtUtc = nowUtc;
+        }
+        else
+        {
+            dbContext.EventLog.Add(new EventLogEntity
+            {
+                IssueId = issueId,
+                IssueIdentifier = issueIdentifier,
+                EventName = PendingDirectiveEvent,
+                Level = LogLevel.Information.ToString(),
+                Message = message,
+                DataJson = payload,
+                OccurredAtUtc = nowUtc
+            });
+        }
+
+        await dbContext.SaveChangesAsync(cancellationToken);
+    }
+
+    /// <summary>The comment a pending directive belongs to, as persisted.</summary>
+    public sealed record PendingDirectiveState(string CommentId, string Action);
 
     private async Task RecordConsumptionAsync(
         string commentId,
