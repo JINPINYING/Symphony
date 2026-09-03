@@ -537,6 +537,14 @@ public sealed partial class OrchestrationTickService
         }
 
         nextCandidateScanUtc = state.ResumeAtUtc;
+
+        // The reachability singleton resets with the process, so without this a
+        // restart inside a pause leaves the panel with a pause it cannot see and
+        // an unexplained gap in scanning. Restarting is exactly what a person does
+        // when the page says something needs them, so this is the moment the
+        // explanation matters most.
+        trackerReachability.RecordScanPause(state.ResumeAtUtc, "a GitHub rate limit recorded before this process started");
+
         logger.LogWarning(
             "Resuming a candidate-scan pause recorded before this process started; scanning stays paused until {ResumeAtUtc:u}.",
             nextCandidateScanUtc);

@@ -30,6 +30,20 @@ public sealed record WatchedTaskReport(
 {
     public const string HealthOk = "ok";
     public const string HealthLate = "late";
+
+    /// <summary>
+    /// One run did not succeed, and the task is still scheduled to run again.
+    ///
+    /// This is a state the plane comes out of by itself, and it is not the same
+    /// thing as <see cref="HealthFailing"/>. On 2026-09-02 the Commander task was
+    /// killed mid-run by a deploy; the panel read that single exit code as a
+    /// permanent fault, promised it "will keep failing on the same schedule", and
+    /// put it in front of the owner as work they had to do. It ran clean six
+    /// minutes later, unattended.
+    /// </summary>
+    public const string HealthRecovering = "recovering";
+
+    /// <summary>More than one run in a row did not succeed - a streak, not a blip.</summary>
     public const string HealthFailing = "failing";
     public const string HealthDisabled = "disabled";
     public const string HealthUnknown = "unknown";
@@ -57,6 +71,46 @@ public static class WatchedTaskEvaluator
     internal static bool IsSchedulerStatusCode(int? lastResult) =>
         lastResult is SchedulerTaskRunning or SchedulerTaskDisabled
                    or SchedulerTaskHasNotRun or SchedulerTaskTerminated;
+
+    /// <summary>
+    /// <c>0x8007042B</c>, which Task Scheduler reports as the signed
+    /// <c>-2147023829</c>: the process was aborted by something outside it.
+    ///
+    /// Worth naming because the raw number tells the reader nothing and its
+    /// meaning changes what they should do. The owner was shown it as evidence
+    /// that the Commander had crashed and would keep crashing; it had been killed
+    /// by <c>deploy-safe.ps1 -Force</c> stopping the service mid-run, which is a
+    /// deploy working, not a task failing.
+    /// </summary>
+    internal const int ErrorProcessAborted = unchecked((int)0x8007042B);
+
+    /// <summary>
+    /// What an exit code means, when it means something specific. Silence is the
+    /// right answer for the rest: inventing an explanation for an arbitrary code
+    /// is worse than printing the number and letting the reader look it up.
+    /// </summary>
+    private static string DescribeExitCode(int code) => code == ErrorProcessAborted
+        ? " That is ERROR_PROCESS_ABORTED, which means something stopped the run rather than the run crashing - on this host, usually a deploy restarting the service mid-run."
+        : string.Empty;
+
+    /// <summary>
+    /// Promote a single failed run to an observed streak.
+    ///
+    /// The evaluator sees one sample and can only speak about it in the past
+    /// tense. "It will keep failing" is a claim about the future, and it is only
+    /// honest once more than one consecutive run has actually failed - which
+    /// takes memory across observations, which lives in
+    /// <see cref="WatchedTaskHistory"/>.
+    /// </summary>
+    public static WatchedTaskReport EscalateToFailing(WatchedTaskReport report, int consecutiveFailures) =>
+        report with
+        {
+            Health = WatchedTaskReport.HealthFailing,
+            Explanation =
+                $"Its last {consecutiveFailures} runs in a row exited non-zero, most recently with code {report.LastResult}." +
+                $"{DescribeExitCode(report.LastResult ?? 0)}" +
+                " It is still scheduled, so it will keep failing on the same schedule until the cause is fixed."
+        };
 
     /// <summary>
     /// How far past its expected interval a task may drift before it counts as
@@ -128,10 +182,26 @@ public static class WatchedTaskEvaluator
                 : $"Currently running, started {Humanise(runningFor.Value)} ago.");
         }
 
+        // One failed run, reported as one failed run.
+        //
+        // This used to read "it will keep failing on the same schedule until the
+        // cause is fixed" - a prediction, from a single observation, about a task
+        // that is still scheduled and has not been given the chance to disagree.
+        // The owner was shown it about a run that had been killed by a deploy, and
+        // the very next run six minutes later exited zero. Everything the page can
+        // honestly say here is in the past tense.
+        //
+        // The streak that would justify the old wording is counted across
+        // observations by WatchedTaskHistory, which escalates this to `failing`
+        // once a SECOND consecutive run has actually failed.
         if (lastResult is not null && lastResult != 0 && !IsSchedulerStatusCode(lastResult))
         {
-            return Build(WatchedTaskReport.HealthFailing,
-                $"Its last run exited with code {lastResult}. It is still scheduled, so it will keep failing on the same schedule until the cause is fixed.");
+            var nextRun = nextRunUtc is not null && nextRunUtc > now
+                ? $" It is scheduled to run again in {Humanise(nextRunUtc.Value - now)}."
+                : " It is still scheduled.";
+
+            return Build(WatchedTaskReport.HealthRecovering,
+                $"Its last run exited with code {lastResult}.{DescribeExitCode(lastResult.Value)}{nextRun} Nothing yet says the next run will fail too.");
         }
 
         if (lastRunUtc is null)

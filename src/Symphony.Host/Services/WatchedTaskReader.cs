@@ -43,6 +43,7 @@ public sealed class UnsupportedWatchedTaskReader : IWatchedTaskReader
 [SupportedOSPlatform("windows")]
 public sealed class WindowsWatchedTaskReader(
     TimeProvider timeProvider,
+    WatchedTaskHistory history,
     ILogger<WindowsWatchedTaskReader> logger) : IWatchedTaskReader
 {
     private static readonly TimeSpan CacheFor = TimeSpan.FromSeconds(30);
@@ -79,7 +80,11 @@ public sealed class WindowsWatchedTaskReader(
             var reports = new List<WatchedTaskReport>(watched.Count);
             foreach (var task in watched)
             {
-                reports.Add(await ReadOneAsync(task, now, cancellationToken));
+                // The history is consulted here rather than inside the evaluator
+                // because it is the only layer that sees successive polls. The
+                // evaluator stays a pure function of one sample, which is what
+                // makes its wording testable.
+                reports.Add(history.Observe(await ReadOneAsync(task, now, cancellationToken)));
             }
 
             _cached = reports;

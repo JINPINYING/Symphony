@@ -327,6 +327,46 @@ public sealed class OwnerAttentionSummaryTests
         Assert.Equal(OwnerAttentionSummary.LevelDown, result.Level);
     }
 
+    // 2026-09-02, 20:55. The Commander was killed mid-run by a deploy and the page
+    // led with "Something is wrong and it will not clear itself", "the items below
+    // are blocking work", "nothing new will be picked up". At 21:01 the same task
+    // ran and exited zero, unattended, while the plane had been dispatching
+    // throughout. Every one of those sentences was false.
+    [Fact]
+    public void OneFailedRunIsNotSomethingTheOwnerHasToFix()
+    {
+        var result = Build(watchedTasks: [Task("ADCP Commander", WatchedTaskReport.HealthRecovering)]);
+
+        Assert.Equal(OwnerAttentionSummary.LevelRecovering, result.Level);
+        Assert.DoesNotContain("will not clear itself", result.Headline);
+        Assert.DoesNotContain("waiting on you", result.Headline);
+
+        // Still shown - the page must not claim all is well either.
+        var item = Assert.Single(result.Items);
+        Assert.Equal(OwnerAttentionSummary.LevelRecovering, item.Severity);
+        // "Is not running as scheduled" was false: it ran, on time, and failed.
+        Assert.Equal("ADCP Commander had a run that did not succeed", item.Label);
+    }
+
+    // The headline counts decisions. A recovering item is not one, and counting it
+    // is exactly how nine consequences of a single rate-limit pause were presented
+    // as nine things the owner owed.
+    [Fact]
+    public void RecoveringItemsAreNotCountedAsThingsWaitingOnYou()
+    {
+        var result = Build(
+            escalated: [Escalated("#63", posted: true)],
+            watchedTasks: [Task("ADCP Commander", WatchedTaskReport.HealthRecovering)]);
+
+        Assert.Equal(OwnerAttentionSummary.LevelAttention, result.Level);
+        Assert.Equal("One thing is waiting on you", result.Headline);
+        Assert.Equal(2, result.Items.Count);
+
+        // And the decision leads; the self-clearing row sits below it.
+        Assert.Contains("#63", result.Items[0].Label);
+        Assert.Equal(OwnerAttentionSummary.LevelRecovering, result.Items[1].Severity);
+    }
+
     [Fact]
     public void TheWorstSchedulerLeads()
     {
@@ -524,6 +564,83 @@ public sealed class OwnerAttentionSummaryTests
         // is what sent the real answer to a 64 MB log file in the first place.
         Assert.Contains("api.github.com", item.Detail);
     }
+
+    // The defect this issue is named for. Candidate fetch was refused for all
+    // three tracked repositories, the engine backed off for ten minutes, and the
+    // panel reported it as a fault the owner had to resolve while simultaneously
+    // telling them "the plane is running normally".
+    [Fact]
+    public void ARateLimitPauseIsAWaitAndNotADemandOnTheOwner()
+    {
+        var result = Build(tracker: Paused(pausedFor: TimeSpan.FromMinutes(8), blindFor: TimeSpan.FromMinutes(2)));
+
+        Assert.Equal(OwnerAttentionSummary.LevelRecovering, result.Level);
+        var item = Assert.Single(result.Items);
+        Assert.Equal("GitHub scanning is paused", item.Label);
+        Assert.Equal(OwnerAttentionSummary.LevelRecovering, item.Severity);
+
+        // It says when it comes back, and that nothing is owed.
+        Assert.Contains("resumes scanning in 8 minutes", item.Detail);
+        Assert.Contains("Nothing is needed from you", item.Detail);
+
+        // The two sentences the live page had wrong, in both directions.
+        Assert.DoesNotContain("will not clear itself", result.Headline);
+        Assert.DoesNotContain("running normally", result.Detail);
+    }
+
+    // The other half: a page that says all is well while it cannot see any of its
+    // repositories is lying about the one thing it is asked.
+    [Fact]
+    public void APausedScanIsNeverReportedAsNothingNeedingAttention()
+    {
+        var result = Build(tracker: Paused(pausedFor: TimeSpan.FromMinutes(8), blindFor: TimeSpan.FromMinutes(2)));
+
+        Assert.NotEqual(OwnerAttentionSummary.LevelClear, result.Level);
+        Assert.NotEmpty(result.Items);
+    }
+
+    // "It recovers on its own" is an observation, and it expires. Once backing off
+    // has failed for longer than GitHub's own window, waiting is no longer the
+    // explanation and the plane genuinely is blind.
+    [Fact]
+    public void APauseThatOutlivesTheRecoveryWindowBecomesARealOutage()
+    {
+        var result = Build(tracker: Paused(
+            pausedFor: TimeSpan.FromMinutes(8),
+            blindFor: TrackerReachability.SelfRecoveryLimit + TimeSpan.FromMinutes(5)));
+
+        Assert.Equal(OwnerAttentionSummary.LevelDown, result.Level);
+        var item = Assert.Single(result.Items);
+        Assert.Equal("The issue tracker cannot be reached", item.Label);
+        Assert.Contains("Backing off has not cleared it", item.Detail);
+    }
+
+    // A pause that has already run out is not a pause. Left unchecked this would
+    // suppress a real outage forever on the strength of one stale timestamp.
+    [Fact]
+    public void AnExpiredPauseDoesNotSuppressABlindPlane()
+    {
+        var result = Build(tracker: new TrackerReachabilitySnapshot(
+            ConsecutiveFailures: 40,
+            LastSuccessUtc: Now.AddMinutes(-30),
+            UnreachableSinceUtc: Now.AddMinutes(-30),
+            LastFailureReason: "API rate limit already exceeded",
+            LastFailureTransient: false,
+            ScanPausedUntilUtc: Now.AddMinutes(-1),
+            ScanPauseReason: "API rate limit already exceeded"));
+
+        Assert.Equal(OwnerAttentionSummary.LevelDown, result.Level);
+        Assert.Equal("The issue tracker cannot be reached", Assert.Single(result.Items).Label);
+    }
+
+    private static TrackerReachabilitySnapshot Paused(TimeSpan pausedFor, TimeSpan blindFor) =>
+        new(ConsecutiveFailures: 3,
+            LastSuccessUtc: Now - blindFor,
+            UnreachableSinceUtc: Now - blindFor,
+            LastFailureReason: "GitHub GraphQL: API rate limit already exceeded",
+            LastFailureTransient: false,
+            ScanPausedUntilUtc: Now + pausedFor,
+            ScanPauseReason: "GitHub GraphQL: API rate limit already exceeded");
 
     // The point of the whole feature is that silence is legible - which means a
     // healthy scheduler must stay silent, or the page fills with cron noise and

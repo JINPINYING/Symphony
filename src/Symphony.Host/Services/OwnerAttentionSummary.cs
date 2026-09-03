@@ -73,6 +73,24 @@ public static class OwnerAttentionSummary
     }
 
     public const string LevelClear   = "clear";
+
+    /// <summary>
+    /// Something is degraded and the plane gets out of it by itself.
+    ///
+    /// The third answer this panel was missing. It only had "everything is fine"
+    /// and "a person must act", so a ten-minute rate-limit backoff - a wait the
+    /// engine chose, on a clock, that clears unattended - had to be filed as one
+    /// or the other. It was filed as both at once: the headline said "something is
+    /// wrong and it will not clear itself" while the sub-line said "the plane is
+    /// running normally", and nine consequences of one pause were counted as nine
+    /// decisions the owner owed.
+    ///
+    /// Items at this level are shown, because a page that says all is well while a
+    /// core read is failing is not to be trusted either. They are NOT counted as
+    /// things waiting on the owner, because they are not.
+    /// </summary>
+    public const string LevelRecovering = "recovering";
+
     public const string LevelAttention = "attention";
     public const string LevelDown    = "down";
 
@@ -107,12 +125,48 @@ public static class OwnerAttentionSummary
         // firing. Reported only once it has lasted, because the observed failures
         // were DNS blips that cleared within a tick, and a page that flags each of
         // those is one that trains its reader to ignore red.
-        if (tracker?.UnreachableSinceUtc is { } blindSince &&
-            now - blindSince > TrackerReachability.UnreachableGrace)
+        //
+        // A pause the engine took on purpose is a different fact from a tracker it
+        // cannot reach, and telling them apart is the whole point of this issue. A
+        // rate limit is refused, the engine backs off for ten minutes, the window
+        // resets and scanning resumes - nobody does anything. Reported as an
+        // outage it became "something is wrong and it will not clear itself",
+        // which was untrue in both halves.
+        //
+        // The pause is still reported, because the opposite failure is just as
+        // bad: a page that claims the plane is running normally while a core read
+        // is refused is a page that lied on the one question it exists to answer.
+        // It is reported as a wait, not as a demand.
+        var blindFor = tracker?.UnreachableSinceUtc is { } since ? now - since : (TimeSpan?)null;
+
+        // "It recovers on its own" is an observation, and it expires. Past an hour
+        // the backing off has demonstrably not worked, and continuing to call it
+        // self-clearing would be the same over-claim in the other direction.
+        var stillSelfClearing = blindFor is null || blindFor.Value <= TrackerReachability.SelfRecoveryLimit;
+
+        if (tracker?.ScanPausedUntilUtc is { } resumeAt && resumeAt > now && stillSelfClearing)
         {
+            var cause = string.IsNullOrWhiteSpace(tracker.ScanPauseReason)
+                ? string.Empty
+                : $" Cause: {tracker.ScanPauseReason}";
+
+            items.Add(new AttentionItem(
+                "GitHub scanning is paused",
+                $"GitHub refused further requests, so the plane stopped asking and resumes scanning in {Humanise(resumeAt - now)}. No new work is picked up until then; runs already under way are unaffected. Nothing is needed from you.{cause}",
+                LevelRecovering));
+        }
+        else if (blindFor is { } age && age > TrackerReachability.UnreachableGrace)
+        {
+            // Backing off is the plane's whole answer to a refusal, so a refusal
+            // that has outlived the backoff is one the plane has no answer for.
+            // Saying so is the difference between this item and the one above.
+            var backoffFailed = tracker?.ScanPausedUntilUtc is not null
+                ? " Backing off has not cleared it."
+                : string.Empty;
+
             items.Add(new AttentionItem(
                 "The issue tracker cannot be reached",
-                $"No candidate scan has succeeded for {Humanise(now - blindSince)}, so nothing new will be picked up. Last cause: {tracker.LastFailureReason}",
+                $"No candidate scan has succeeded for {Humanise(age)}, so nothing new will be picked up.{backoffFailed} Last cause: {tracker!.LastFailureReason}",
                 LevelDown));
         }
 
@@ -269,19 +323,36 @@ public static class OwnerAttentionSummary
                          WatchedTaskReport.HealthDisabled => 0,
                          WatchedTaskReport.HealthFailing => 1,
                          WatchedTaskReport.HealthLate => 2,
+                         WatchedTaskReport.HealthRecovering => 4,
                          _ => 3
                      }))
         {
-            // Disabled and failing are hard stops: the task will not recover on
-            // its own. Late and unknown are reported at attention level, because a
-            // busy host can legitimately delay a run and a page that escalates
-            // ordinary jitter to "down" is one that gets ignored.
-            var severity = task.Health is WatchedTaskReport.HealthDisabled or WatchedTaskReport.HealthFailing
-                ? LevelDown
-                : LevelAttention;
+            // Disabled, and failing more than once in a row, are hard stops: the
+            // task will not recover on its own. Late and unknown are reported at
+            // attention level, because a busy host can legitimately delay a run and
+            // a page that escalates ordinary jitter to "down" is one that gets
+            // ignored.
+            //
+            // A SINGLE failed run on a task that is still scheduled is neither. It
+            // used to read as a hard stop, and on 2026-09-02 the owner was told the
+            // Commander "will keep failing on the same schedule" about a run a
+            // deploy had killed - it ran clean six minutes later, unattended. One
+            // observation cannot support a claim about the next run, so this level
+            // says what was seen and waits for the next one.
+            var severity = task.Health switch
+            {
+                WatchedTaskReport.HealthDisabled or WatchedTaskReport.HealthFailing => LevelDown,
+                WatchedTaskReport.HealthRecovering => LevelRecovering,
+                _ => LevelAttention
+            };
 
             items.Add(new AttentionItem(
-                $"{task.Name} is not running as scheduled",
+                // "Is not running as scheduled" is false for a task that ran on
+                // time and exited non-zero. It ran; it failed. Those need different
+                // sentences because they need different responses.
+                task.Health == WatchedTaskReport.HealthRecovering
+                    ? $"{task.Name} had a run that did not succeed"
+                    : $"{task.Name} is not running as scheduled",
                 task.Explanation,
                 severity));
         }
@@ -302,9 +373,29 @@ public static class OwnerAttentionSummary
             .OrderByDescending(report => report.AtUtc)
             .FirstOrDefault();
 
+        // Two different lists that used to be one. A decision is something only a
+        // person can make; a recovering item is something the plane is already
+        // handling. Counting them together is what put nine consequences of one
+        // rate-limit pause in front of the owner as nine things they owed.
+        var decisions = items.Count(i => i.Severity != LevelRecovering);
+        var recovering = items.Count - decisions;
+
         var level = items.Any(i => i.Severity == LevelDown) ? LevelDown
-                  : items.Count > 0 ? LevelAttention
+                  : decisions > 0 ? LevelAttention
+                  : recovering > 0 ? LevelRecovering
                   : LevelClear;
+
+        // Worst first, and everything self-clearing last, so the top of the list is
+        // always the part that needs a person. OrderBy is stable, so the ordering
+        // each lane already established survives.
+        items = items
+            .OrderBy(i => i.Severity switch
+            {
+                LevelDown => 0,
+                LevelAttention => 1,
+                _ => 2
+            })
+            .ToList();
 
         string headline;
         string detail;
@@ -312,12 +403,34 @@ public static class OwnerAttentionSummary
         if (level == LevelDown)
         {
             headline = "Something is wrong and it will not clear itself";
-            detail = "The items below are blocking work. Nothing new will be picked up until they are resolved.";
+            detail = recovering == 0
+                ? "The items below are blocking work. Nothing new will be picked up until they are resolved."
+                : "The items at the top are blocking work and will not resolve on their own. The rest are recovering by themselves and need nothing.";
         }
         else if (level == LevelAttention)
         {
-            headline = items.Count == 1 ? "One thing is waiting on you" : $"{items.Count} things are waiting on you";
-            detail = "The plane is running normally. These are decisions it will not make on its own.";
+            headline = decisions == 1 ? "One thing is waiting on you" : $"{decisions} things are waiting on you";
+            // Never "running normally" while a core read is failing. That sentence
+            // sat above a plane that could not see any of its repositories, and it
+            // is the reason this issue exists.
+            detail = recovering == 0
+                ? "The plane is running normally. These are decisions it will not make on its own."
+                : "These are decisions it will not make on its own. Below them, something is degraded and recovering by itself - no action needed there.";
+        }
+        else if (level == LevelRecovering)
+        {
+            // Nothing needs a person, and the plane is not at full strength. Both
+            // halves have to be said: claiming normality here is the defect, and so
+            // is asking for a decision that does not exist.
+            //
+            // A single item names itself, because "GitHub scanning is paused" is a
+            // better headline than any summary of it could be.
+            headline = recovering == 1
+                ? items[0].Label
+                : $"{recovering} things are recovering on their own";
+            detail = recovering == 1
+                ? items[0].Detail
+                : "The plane is degraded and working its own way out. None of it needs you; if any of it is still here once it should have cleared, it will move up into the list above.";
         }
         else if (runningCount > 0)
         {

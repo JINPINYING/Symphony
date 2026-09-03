@@ -129,8 +129,53 @@ public sealed class WatchedTaskEvaluatorTests
     {
         var report = Evaluate(since: TimeSpan.FromMinutes(1), lastResult: 2);
 
-        Assert.Equal(WatchedTaskReport.HealthFailing, report.Health);
+        // One sample, so the honest classification is "recovering": it failed, it
+        // is still scheduled, and nothing has been observed about the next run.
+        // WatchedTaskHistory promotes this to `failing` once a second consecutive
+        // run has actually failed.
+        Assert.Equal(WatchedTaskReport.HealthRecovering, report.Health);
         Assert.Contains("exited with code 2", report.Explanation);
+    }
+
+    // 2026-09-02. The owner was shown "Its last run exited with code -2147023829.
+    // It is still scheduled, so it will keep failing on the same schedule until
+    // the cause is fixed", under a headline reading "Something is wrong and it
+    // will not clear itself". The next run, six minutes later, exited zero. The
+    // sentence was a prediction dressed as an observation, made from one sample.
+    [Fact]
+    public void OneFailedRunIsNotAPredictionAboutTheNextOne()
+    {
+        var report = Evaluate(since: TimeSpan.FromMinutes(1), lastResult: 2);
+
+        Assert.DoesNotContain("will keep failing", report.Explanation);
+        Assert.Contains("Nothing yet says the next run will fail too", report.Explanation);
+        // And it says when the next chance to find out is.
+        Assert.Contains("scheduled to run again", report.Explanation);
+    }
+
+    // -2147023829 is 0x8007042B, ERROR_PROCESS_ABORTED: the run was stopped, not
+    // crashed. On this host that is a deploy restarting the service mid-run, and
+    // the raw number sends the reader looking for a bug that is not there.
+    [Fact]
+    public void AnAbortedProcessSaysItWasStoppedRatherThanThatItCrashed()
+    {
+        var report = Evaluate(since: TimeSpan.FromMinutes(1), lastResult: -2147023829);
+
+        Assert.Equal(WatchedTaskReport.HealthRecovering, report.Health);
+        Assert.Contains("ERROR_PROCESS_ABORTED", report.Explanation);
+        Assert.Contains("something stopped the run rather than the run crashing", report.Explanation);
+    }
+
+    // The claim the old copy made is a fair one once it has actually been seen.
+    [Fact]
+    public void ASecondFailureInARowEarnsTheClaimThatItWillKeepFailing()
+    {
+        var escalated = WatchedTaskEvaluator.EscalateToFailing(
+            Evaluate(since: TimeSpan.FromMinutes(1), lastResult: 2), consecutiveFailures: 2);
+
+        Assert.Equal(WatchedTaskReport.HealthFailing, escalated.Health);
+        Assert.Contains("last 2 runs in a row", escalated.Explanation);
+        Assert.Contains("will keep failing", escalated.Explanation);
     }
 
     [Fact]

@@ -126,6 +126,10 @@ body{background:var(--wt-bg);color:var(--wt-ink);
   border:1px solid var(--wt-line-soft);background:var(--wt-panel-2)}
 .wt-item.sev-attention{background:linear-gradient(90deg,rgba(240,185,79,.07),transparent 40%),var(--wt-panel-2)}
 .wt-item.sev-down{background:linear-gradient(90deg,rgba(240,138,138,.07),transparent 40%),var(--wt-panel-2)}
+/* Recovering is neither green nor amber: nothing is required of the reader, and
+   nothing is fine either. Accent rather than a warning colour, so a self-clearing
+   pause does not sit in the same visual class as a decision. */
+.wt-item.sev-recovering{background:linear-gradient(90deg,rgba(111,211,224,.06),transparent 40%),var(--wt-panel-2)}
 .wt-badge{flex:none;display:inline-flex;align-items:center;justify-content:center;text-align:center;
   font-size:10.5px;font-weight:700;letter-spacing:.09em;padding:6px 9px;border-radius:7px;
   border:1px solid var(--wt-line);color:var(--wt-ink-3);background:rgba(255,255,255,.03)}
@@ -133,6 +137,7 @@ body{background:var(--wt-bg);color:var(--wt-ink);
 .wt-badge.sev-attention{border-color:var(--wt-attn-line);background:var(--wt-attn-bg);color:var(--wt-attn)}
 .wt-badge.sev-down{border-color:rgba(240,138,138,.5);background:var(--wt-bad-bg);color:var(--wt-bad)}
 .wt-badge.sev-ok{border-color:rgba(67,217,163,.5);background:var(--wt-ok-bg);color:var(--wt-ok)}
+.wt-badge.sev-recovering{border-color:rgba(111,211,224,.45);background:rgba(111,211,224,.1);color:var(--wt-accent)}
 .wt-item.is-tight{padding:7px 12px}
 /* One line, ellipsised. The full text is on the row's tooltip and printed in
    full in the queue panel, so clipping here hides nothing. */
@@ -169,6 +174,7 @@ body{background:var(--wt-bg);color:var(--wt-ink);
 .wt-sched-state.is-ok{color:var(--wt-ok)}
 .wt-sched-state.is-run{color:var(--wt-accent)}
 .wt-sched-state.is-bad{color:var(--wt-bad)}
+.wt-sched-state.is-recovering{color:var(--wt-accent)}
 .wt-sched-every{font-size:11.5px;color:var(--wt-ink-3)}
 
 /* ---------- team table ---------- */

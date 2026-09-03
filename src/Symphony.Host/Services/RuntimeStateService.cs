@@ -322,7 +322,11 @@ public sealed class RuntimeStateService(
             configuredRunners, runningRuns, recentRuns, generatedAt,
             schedulers: watchedTasks,
             sessions: agentActivity,
-            decisionsWaitingOnOwner: attention.Items.Count,
+            // Decisions only. An item the plane is already recovering from is not
+            // something the owner is holding up, and counting it as one is how a
+            // single rate-limit pause turned into a list of demands.
+            decisionsWaitingOnOwner: attention.Items.Count(
+                item => item.Severity != OwnerAttentionSummary.LevelRecovering),
             implementerRunner: configuredRunners.FirstOrDefault());
 
         return new
@@ -360,7 +364,13 @@ public sealed class RuntimeStateService(
                 last_success = trackerReachability.Current.LastSuccessUtc?.ToString("o"),
                 unreachable_since = trackerReachability.Current.UnreachableSinceUtc?.ToString("o"),
                 last_failure_reason = trackerReachability.Current.LastFailureReason,
-                last_failure_transient = trackerReachability.Current.LastFailureTransient
+                last_failure_transient = trackerReachability.Current.LastFailureTransient,
+                // A deliberate wait, not an outage. Without this field the footer
+                // strip can only say "GitHub API unreachable", which is wrong twice
+                // over during a rate-limit backoff: the API is reachable, and the
+                // plane chose to stop asking.
+                scan_paused_until = trackerReachability.Current.ScanPausedUntilUtc?.ToString("o"),
+                scan_pause_reason = trackerReachability.Current.ScanPauseReason
             },
             watched_tasks = watchedTasks.Select(task => new
             {

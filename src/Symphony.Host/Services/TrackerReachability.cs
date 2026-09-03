@@ -10,12 +10,21 @@ namespace Symphony.Host.Services;
 /// <param name="UnreachableSinceUtc">When the current failure streak began, or null while healthy.</param>
 /// <param name="LastFailureReason">The innermost cause, in the words the network gave us.</param>
 /// <param name="LastFailureTransient">Whether that cause looked like connectivity rather than a real refusal.</param>
+/// <param name="ScanPausedUntilUtc">
+/// When the engine has deliberately stopped scanning until a clock runs out, and
+/// null when it has not. This is the difference between "cannot see" and "has
+/// chosen to wait", which look identical in every other field here and are
+/// opposite answers to "does this need a person".
+/// </param>
+/// <param name="ScanPauseReason">Why the pause was taken, in GitHub's own words.</param>
 public sealed record TrackerReachabilitySnapshot(
     int ConsecutiveFailures,
     DateTimeOffset? LastSuccessUtc,
     DateTimeOffset? UnreachableSinceUtc,
     string? LastFailureReason,
-    bool LastFailureTransient);
+    bool LastFailureTransient,
+    DateTimeOffset? ScanPausedUntilUtc = null,
+    string? ScanPauseReason = null);
 
 /// <summary>
 /// Tracks whether the engine can reach its issue tracker.
@@ -51,12 +60,30 @@ public sealed class TrackerReachability(TimeProvider timeProvider)
     /// </summary>
     public static readonly TimeSpan UnreachableGrace = TimeSpan.FromMinutes(10);
 
+    /// <summary>
+    /// How long a self-clearing pause may keep recurring before it stops being
+    /// described as self-clearing.
+    ///
+    /// A rate limit is a pause the plane recovers from without anyone: it backs
+    /// off, the window resets, scanning resumes. Reporting that to the owner as a
+    /// standing demand is the defect this exists to prevent. But "it will recover"
+    /// is an observation with an expiry date - a token refused for an hour is no
+    /// longer recovering, it is stuck, and calling that self-clearing would be the
+    /// same over-claim pointing the other way.
+    ///
+    /// An hour, because that is GitHub's own primary window: past it, waiting is
+    /// no longer the explanation.
+    /// </summary>
+    public static readonly TimeSpan SelfRecoveryLimit = TimeSpan.FromHours(1);
+
     private readonly object _gate = new();
     private int _consecutiveFailures;
     private DateTimeOffset? _lastSuccessUtc;
     private DateTimeOffset? _unreachableSinceUtc;
     private string? _lastFailureReason;
     private bool _lastFailureTransient;
+    private DateTimeOffset? _scanPausedUntilUtc;
+    private string? _scanPauseReason;
 
     public void RecordSuccess()
     {
@@ -65,7 +92,34 @@ public sealed class TrackerReachability(TimeProvider timeProvider)
             _consecutiveFailures = 0;
             _unreachableSinceUtc = null;
             _lastFailureReason = null;
+            _scanPausedUntilUtc = null;
+            _scanPauseReason = null;
             _lastSuccessUtc = timeProvider.GetUtcNow();
+        }
+    }
+
+    /// <summary>
+    /// The engine has stopped asking on purpose, until <paramref name="resumeAtUtc"/>.
+    ///
+    /// Recorded apart from the failure that caused it because the two say
+    /// different things to a reader. A failure says the plane cannot see. A pause
+    /// says it has stopped looking deliberately and knows when it starts again.
+    /// Only the first is a fault, and conflating them is how a ten-minute backoff
+    /// was presented to the owner as an outage.
+    ///
+    /// Monotonic, so a pause restored from a row written by a previous process
+    /// cannot cut short one the running process has already decided on.
+    /// </summary>
+    public void RecordScanPause(DateTimeOffset resumeAtUtc, string? reason)
+    {
+        lock (_gate)
+        {
+            if (_scanPausedUntilUtc is null || resumeAtUtc > _scanPausedUntilUtc)
+            {
+                _scanPausedUntilUtc = resumeAtUtc;
+            }
+
+            _scanPauseReason = reason;
         }
     }
 
@@ -94,7 +148,9 @@ public sealed class TrackerReachability(TimeProvider timeProvider)
                     _lastSuccessUtc,
                     _unreachableSinceUtc,
                     _lastFailureReason,
-                    _lastFailureTransient);
+                    _lastFailureTransient,
+                    _scanPausedUntilUtc,
+                    _scanPauseReason);
             }
         }
     }

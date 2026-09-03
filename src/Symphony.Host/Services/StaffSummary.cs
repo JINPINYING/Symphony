@@ -170,6 +170,11 @@ public static class StaffSummary
                 : task.Health switch
                 {
                     WatchedTaskReport.HealthOk => StateIdle,
+                    // One run that did not succeed on a task that is still
+                    // scheduled. "Late" is the wrong word and the wrong colour for
+                    // it - it ran exactly on time, and the next run is what decides
+                    // whether anything is actually wrong.
+                    WatchedTaskReport.HealthRecovering => StateWaiting,
                     _ => StateLate
                 },
             IssueIdentifier: null,

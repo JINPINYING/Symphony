@@ -2932,6 +2932,125 @@ public sealed class OrchestrationTickServiceTests
     }
 
     [Fact]
+    public async Task RunTickAsync_ShouldTellTheOwnerPanelThatARateLimitIsAPauseAndNotAnOutage()
+    {
+        // The engine already backed off correctly; what it did not do was say so
+        // anywhere the owner-facing panel could see. All the panel had was a
+        // failure streak, which looks the same whether the plane cannot reach
+        // GitHub or has deliberately stopped asking - so a ten-minute self-clearing
+        // wait was published under "something is wrong and it will not clear
+        // itself", with nine consequences of it counted as nine owner decisions.
+        var clock = new MutableTimeProvider(DateTimeOffset.Parse("2026-09-02T20:06:00Z"));
+        var tracker = new FakeTrackerClient([]) { RateLimitOnFetchCandidates = true };
+
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning),
+            timeProvider: clock);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var snapshot = harness.Reachability.Current;
+        Assert.Equal(clock.GetUtcNow().AddMinutes(10), snapshot.ScanPausedUntilUtc);
+        Assert.Contains("rate limit", snapshot.ScanPauseReason, StringComparison.OrdinalIgnoreCase);
+
+        // Which the panel then reports as a wait rather than as a demand.
+        var summary = OwnerAttentionSummary.Build(
+            engineHealthy: true, escalatedRuns: [], runningCount: 0, retryQueueCount: 0,
+            phases: [], openPullRequests: [], agentActivity: [], watchedTasks: [],
+            tracker: snapshot, lastEventAtUtc: null, now: clock.GetUtcNow());
+
+        Assert.Equal(OwnerAttentionSummary.LevelRecovering, summary.Level);
+        Assert.Equal("GitHub scanning is paused", Assert.Single(summary.Items).Label);
+        Assert.DoesNotContain("running normally", summary.Detail);
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldBackOffWhenOnlySomeRepositoriesAreRateLimited()
+    {
+        // The budget belongs to the token, not to a repository, so one repository
+        // answering says nothing about whether the next one will. The backoff was
+        // conditional on EVERY repository failing, which meant the ordinary partial
+        // case took the sixty-second interval and asked the refused repositories
+        // again a minute later - the "retries at the same cadence" that keeps a
+        // burst limit engaged in the first place.
+        var clock = new MutableTimeProvider(DateTimeOffset.Parse("2026-09-02T20:06:00Z"));
+        var tracker = new FakeTrackerClient([]);
+        tracker.IssuesByRepository["JINPINYING/Product"] =
+            [BuildIssue("issue-p", "#1", "Open", null, repository: "JINPINYING/Product")];
+        tracker.RepositoriesThatRateLimit.Add("JINPINYING/Symphony");
+
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(
+                maxConcurrentAgents: 1,
+                repositories: [("JINPINYING", "Product"), ("JINPINYING", "Symphony")]),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning),
+            timeProvider: clock);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        // The repository that answered is still dispatched; backing off is not a
+        // reason to stop working on what was found.
+        Assert.Equal("issue-p", Assert.Single(harness.Coordinator.StartRequests).Issue.Id);
+        Assert.Equal(clock.GetUtcNow().AddMinutes(10), harness.Reachability.Current.ScanPausedUntilUtc);
+
+        // A minute later - past the ordinary scan interval, inside the pause -
+        // GitHub is not asked again.
+        tracker.CandidateFetchRepositories.Clear();
+        clock.Advance(TimeSpan.FromMinutes(1));
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        Assert.Empty(tracker.CandidateFetchRepositories);
+
+        // And the pause ends on its own clock, without anyone doing anything.
+        clock.Advance(TimeSpan.FromMinutes(10));
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        Assert.Equal(2, tracker.CandidateFetchRepositories.Distinct().Count());
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldNotForgetARefusedRepositorysWorkWhileItBacksOff()
+    {
+        // Backing off means "we did not ask", which must not be published as "there
+        // is no work". The candidate cache is replaced by whatever the scan
+        // returned, so a partial scan would drop the refused repository's issues for
+        // the whole ten-minute pause - a queue silently emptied by a rate limit is
+        // the same shape of lie as a panel that calls the pause an outage.
+        var clock = new MutableTimeProvider(DateTimeOffset.Parse("2026-09-02T20:06:00Z"));
+        var tracker = new FakeTrackerClient([]);
+        tracker.IssuesByRepository["JINPINYING/Product"] =
+            [BuildIssue("issue-p", "#1", "Open", null, repository: "JINPINYING/Product")];
+        tracker.IssuesByRepository["JINPINYING/Symphony"] =
+            [BuildIssue("issue-s", "#2", "Open", null, repository: "JINPINYING/Symphony")];
+
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(
+                maxConcurrentAgents: 5,
+                repositories: [("JINPINYING", "Product"), ("JINPINYING", "Symphony")]),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning),
+            timeProvider: clock);
+
+        // A clean scan first, so both repositories are known.
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        Assert.Equal(2, await harness.DbContext.IssueCache.CountAsync());
+
+        // Now Symphony starts being refused, on the next due scan.
+        tracker.RepositoriesThatRateLimit.Add("JINPINYING/Symphony");
+        clock.Advance(TimeSpan.FromMinutes(2));
+        var secondTickUtc = clock.GetUtcNow();
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        // The refused repository's issue is still in the working candidate set, so
+        // the tick carried it through and refreshed it. Row COUNT cannot show this -
+        // the cache is upsert-only and never prunes - so the freshness stamp is what
+        // distinguishes "still a candidate" from "silently forgotten".
+        var refused = await harness.DbContext.IssueCache.SingleAsync(entity => entity.IssueId == "issue-s");
+        Assert.Equal(secondTickUtc, refused.CachedAtUtc);
+    }
+
+    [Fact]
     public async Task RunTickAsync_ShouldEscalateRetryThatStaysDueAndUndispatchedPastTheWedgeThreshold()
     {
         var now = DateTimeOffset.Parse("2026-09-01T10:00:00Z");
@@ -3120,7 +3239,8 @@ public sealed class OrchestrationTickServiceTests
             FakeTrackerClient tracker,
             FakeWorkspaceManager workspaceManager,
             FakeIssueExecutionCoordinator coordinator,
-            OrchestrationTickService service)
+            OrchestrationTickService service,
+            TrackerReachability reachability)
         {
             this.dbPath = dbPath;
             DbContext = dbContext;
@@ -3128,6 +3248,7 @@ public sealed class OrchestrationTickServiceTests
             WorkspaceManager = workspaceManager;
             Coordinator = coordinator;
             Service = service;
+            Reachability = reachability;
         }
 
         public string DbPath => dbPath;
@@ -3137,6 +3258,11 @@ public sealed class OrchestrationTickServiceTests
         public FakeWorkspaceManager WorkspaceManager { get; }
         public FakeIssueExecutionCoordinator Coordinator { get; }
         public OrchestrationTickService Service { get; }
+
+        // What the owner-facing panel reads. Exposed because "the tick backed off"
+        // and "the page can tell that it backed off" are separate claims, and only
+        // the second one is the defect this issue is about.
+        public TrackerReachability Reachability { get; }
 
         public static async Task<TestHarness> CreateAsync(
             WorkflowDefinition workflowDefinition,
@@ -3166,6 +3292,7 @@ public sealed class OrchestrationTickServiceTests
             var workspaceManager = new FakeWorkspaceManager();
             coordinator.Attach(dbContext, dbPath);
             var clock = timeProvider ?? TimeProvider.System;
+            var reachability = new TrackerReachability(clock);
 
             var service = new OrchestrationTickService(
                 new FakeWorkflowDefinitionProvider(workflowDefinition),
@@ -3193,7 +3320,7 @@ public sealed class OrchestrationTickServiceTests
                     dbContext,
                     clock,
                     NullLogger<EventLogRetentionService>.Instance),
-                new TrackerReachability(clock),
+                reachability,
                 Options.Create(new OrchestrationOptions
                 {
                     InstanceId = "instance-1",
@@ -3203,7 +3330,7 @@ public sealed class OrchestrationTickServiceTests
                 clock,
                 NullLogger<OrchestrationTickService>.Instance);
 
-            return new TestHarness(dbPath, dbContext, tracker, workspaceManager, coordinator, service);
+            return new TestHarness(dbPath, dbContext, tracker, workspaceManager, coordinator, service, reachability);
         }
 
         public async Task InsertRunningRunAsync(
@@ -3476,12 +3603,19 @@ public sealed class OrchestrationTickServiceTests
         /// <summary>Fail candidate fetch the way a real rate limit does.</summary>
         public bool RateLimitOnFetchCandidates { get; set; }
 
+        /// <summary>
+        /// Rate-limit only some repositories. The budget belongs to the token, so a
+        /// scan where one repository answers and another is refused is the ordinary
+        /// case - and it was the one that did not back off.
+        /// </summary>
+        public HashSet<string> RepositoriesThatRateLimit { get; } = new(StringComparer.OrdinalIgnoreCase);
+
         public Task<IReadOnlyList<NormalizedIssue>> FetchCandidateIssuesAsync(TrackerQuery query, CancellationToken cancellationToken = default)
         {
             var repository = $"{query.Owner}/{query.Repo}";
             CandidateFetchRepositories.Add(repository);
 
-            if (RateLimitOnFetchCandidates)
+            if (RateLimitOnFetchCandidates || RepositoriesThatRateLimit.Contains(repository))
             {
                 // The distinction under test. A generic outage retries next tick; a
                 // rate limit must pause, because the limit is on the token and asking

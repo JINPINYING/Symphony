@@ -819,6 +819,14 @@ function icon(name, size = 15) {
 
 const WT_HEALTHY = new Set(["ok", "healthy", "green"]);
 
+/* Not healthy, and not a fault either: one run that did not succeed on a task
+   that is still scheduled. Kept out of WT_HEALTHY so the page does not claim it
+   is fine, and kept out of the red tier so a single killed run does not read as
+   "will not clear itself" - which is exactly what it did on 2026-09-02, for a
+   task that ran clean six minutes later without anyone touching it. */
+const WT_RECOVERING = new Set(["recovering"]);
+const isRecovering = value => WT_RECOVERING.has(String(value || "").toLowerCase());
+
 /* Owner-qualified repository names are long and the owner is always the same
    person, so the prefix carries no information on this page. */
 function shortRepo(value) {
@@ -918,25 +926,39 @@ function renderAttentionPanel() {
   const attention = state.snapshot?.attention;
   const items = attention?.items || [];
   const level = String(attention?.level || "").toLowerCase();
+  /* Only items that need a person set the panel's tone. A pause the plane is
+     already backing off from is shown, but it does not turn the panel amber -
+     the question this panel answers is "does this need me", and the answer to
+     that is no. */
+  const decisions = items.filter(i => !isRecovering(i.severity));
   const sev = blind || level === "down" || level === "critical"
     ? "down"
-    : items.length ? "attention" : "ok";
+    : decisions.length ? "attention" : "ok";
+  const recoveringOnly = !blind && decisions.length === 0 && items.length > 0;
 
   host.classList.toggle("is-attn", sev === "attention");
   host.classList.toggle("is-bad", sev === "down");
-  host.classList.toggle("is-ok", sev === "ok");
+  host.classList.toggle("is-ok", sev === "ok" && !recoveringOnly);
 
-  const tone = sev === "down" ? "var(--wt-bad)" : sev === "attention" ? "var(--wt-attn)" : "var(--wt-ok)";
+  const tone = sev === "down" ? "var(--wt-bad)"
+    : sev === "attention" ? "var(--wt-attn)"
+    : recoveringOnly ? "var(--wt-accent)"
+    : "var(--wt-ok)";
 
   const rows = items.map(i => {
-    const s = String(i.severity || "").toLowerCase() === "down" ? "down" : "attention";
+    const raw = String(i.severity || "").toLowerCase();
+    /* Three tiers, not two. A row the plane is already recovering from is not
+       an item of attention, and stamping it ATTENTION alongside real decisions
+       is how one rate-limit pause was counted as nine things the owner owed. */
+    const s = raw === "down" ? "down" : raw === "recovering" ? "recovering" : "attention";
+    const badge = s === "recovering" ? "RECOVERING" : "ATTENTION";
     const isPr = /\bPR\b|pull request/i.test(`${i.label || ""} ${i.url || ""}`);
     /* One line per item. The "why" is a hover tooltip here rather than a
        paragraph: this panel exists to be counted at a glance, and the same
        detail is printed in full in the queue panel below, so nothing is lost. */
     return `
       <div class="wt-item is-tight sev-${s}" title="${escapeAttribute(i.detail || "")}">
-        <span class="wt-badge sev-${s}">ATTENTION</span>
+        <span class="wt-badge sev-${s}">${badge}</span>
         <div class="wt-item-body">
           <div class="wt-item-title wt-clip">${escapeHtml(i.label || "")}</div>
         </div>
@@ -951,7 +973,7 @@ function renderAttentionPanel() {
     <div class="wt-attn-top">
       <span class="wt-attn-glyph" style="color:${tone}" aria-hidden="true">
         ${sev === "ok"
-          ? icon("shield", 28)
+          ? icon(recoveringOnly ? "clock" : "shield", 28)
           : `<span style="font-size:30px;font-weight:700;line-height:1">${sevGlyph(sev)}</span>`}
       </span>
       <div style="min-width:0">
@@ -978,6 +1000,10 @@ function renderHealthPanel() {
   /* Positive evidence only. Before the first load every field is empty, and
      "no failures reported" would otherwise render as a clean bill of health. */
   const blind = !state.snapshot;
+  /* Paused is not unreachable. During a rate-limit backoff the API answers fine
+     and the plane has chosen to stop asking, so reporting it as an outage names
+     the wrong fault and points the reader at the network. */
+  const paused = !blind && !!reach.scan_paused_until && new Date(reach.scan_paused_until) > new Date();
   const trackerOk = !blind && !reach.unreachable_since;
   const engineOk = state.health?.ok === true;
   /* The engine reports "ok" here, not "healthy" - matching only "healthy"
@@ -989,8 +1015,9 @@ function renderHealthPanel() {
     const status = String(t.status || t.state || "").toLowerCase();
     const running = status.includes("running");
     const healthy = WT_HEALTHY.has(String(t.health || "").toLowerCase());
-    const word = running ? "Running" : healthy ? "Ready" : (t.health || "Unknown");
-    const cls = running ? "is-run" : healthy ? "is-ok" : "is-bad";
+    const recovering = isRecovering(t.health);
+    const word = running ? "Running" : healthy ? "Ready" : recovering ? "Recovering" : (t.health || "Unknown");
+    const cls = running ? "is-run" : healthy ? "is-ok" : recovering ? "is-recovering" : "is-bad";
     return `
       <div class="wt-sched-row">
         <span class="wt-sched-ico" aria-hidden="true">${icon(running ? "radar" : "calendar", 16)}</span>
@@ -1011,8 +1038,8 @@ function renderHealthPanel() {
   host.innerHTML = `
     ${panelHead("Health & freshness", "shield", `
       <div class="wt-headmeta">
-        <span class="wt-svc-item">Tracker <span class="wt-dot ${blind ? "" : trackerOk ? "is-ok" : "is-bad"}" aria-hidden="true"></span>
-          <b>${blind ? "Unknown" : trackerOk ? "Reachable" : "Unreachable"}</b></span>
+        <span class="wt-svc-item">Tracker <span class="wt-dot ${blind ? "" : trackerOk ? "is-ok" : paused ? "is-attn" : "is-bad"}" aria-hidden="true"></span>
+          <b>${blind ? "Unknown" : trackerOk ? "Reachable" : paused ? "Paused" : "Unreachable"}</b></span>
         <span>Consecutive failures <b>${blind ? "&mdash;" : escapeHtml(String(reach.consecutive_failures ?? 0))}</b></span>
       </div>`)}
 
@@ -1146,6 +1173,9 @@ function renderQueuePanel() {
   }
 
   for (const item of state.snapshot?.attention?.items || []) {
+    /* The queue is work waiting on somebody. Something the plane is already
+       recovering from is waiting on a clock, and belongs in neither column. */
+    if (isRecovering(item.severity)) continue;
     const label = item.label || "";
     /* A PR that fell out of the pipeline is a fault to repair, not a decision
        to make - the engine's own detail text says so. Filing it under "your
@@ -1229,7 +1259,9 @@ function renderRoadmapPanel() {
 
   /* The per-project tallies come from work already on the page, so a project
      line and the queue above it can never disagree. */
-  const attentionItems = state.snapshot?.attention?.items || [];
+  /* Decisions only - a project tally that counts a rate-limit pause as an issue
+     awaiting decision disagrees with the panel above it. */
+  const attentionItems = (state.snapshot?.attention?.items || []).filter(i => !isRecovering(i.severity));
   const failingPrs = (state.snapshot?.open_pull_requests || [])
     .filter(p => ["FAILURE", "ERROR"].includes(String(p.checks_state || "").toUpperCase()));
 
@@ -1326,17 +1358,30 @@ function renderUtilityStrip() {
   const snap = state.snapshot || {};
   const reach = snap.tracker_reachability || {};
   const tasks = snap.watched_tasks || [];
-  const lateTasks = tasks.filter(t => !WT_HEALTHY.has(String(t.health || "").toLowerCase()));
+  /* A task that ran exactly on time and exited non-zero is not late, and calling
+     it that sends the reader looking for a scheduler problem that is not there. */
+  const recoveringTasks = tasks.filter(t => isRecovering(t.health));
+  const lateTasks = tasks.filter(t =>
+    !WT_HEALTHY.has(String(t.health || "").toLowerCase()) && !isRecovering(t.health));
 
   const blind = !state.snapshot;
+  /* Three states, because "unreachable" was being printed for a backoff the
+     plane chose itself while the API was answering normally. */
+  const paused = !blind && !!reach.scan_paused_until && new Date(reach.scan_paused_until) > new Date();
   const services = [
     blind
       ? dotLabel("down", "GitHub API unknown")
-      : dotLabel(reach.unreachable_since ? "down" : "ok", `GitHub API ${reach.unreachable_since ? "unreachable" : "reachable"}`),
+      : paused
+        ? dotLabel("attention", "GitHub API paused, backing off")
+        : dotLabel(reach.unreachable_since ? "down" : "ok", `GitHub API ${reach.unreachable_since ? "unreachable" : "reachable"}`),
     blind
       ? dotLabel("down", "Windows Task Scheduler unknown")
-      : dotLabel(lateTasks.length ? "attention" : "ok",
-          `Windows Task Scheduler ${lateTasks.length ? `${lateTasks.length} late` : `${tasks.length} on schedule`}`),
+      : dotLabel(lateTasks.length || recoveringTasks.length ? "attention" : "ok",
+          `Windows Task Scheduler ${lateTasks.length
+            ? `${lateTasks.length} late`
+            : recoveringTasks.length
+              ? `${recoveringTasks.length} recovering`
+              : `${tasks.length} on schedule`}`),
     dotLabel(state.health?.ok === true ? "ok" : "down", `Engine ${state.health?.label || "unknown"}`)
   ].join("");
 

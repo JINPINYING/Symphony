@@ -125,4 +125,45 @@ public sealed class TrackerReachabilityTests
         Assert.False(TrackerReachability.IsTransientConnectivity(
             new InvalidOperationException("GraphQL: Field 'nope' doesn't exist")));
     }
+
+    // "Cannot see" and "has stopped looking on purpose" produce identical failure
+    // streaks and opposite answers to "does this need a person", so the pause is
+    // recorded as its own fact rather than inferred from the streak.
+    [Fact]
+    public void APauseIsRecordedSeparatelyFromTheFailureThatCausedIt()
+    {
+        var (reachability, _) = Create();
+        reachability.RecordFailure("API rate limit already exceeded", transient: false);
+        reachability.RecordScanPause(Start.AddMinutes(10), "API rate limit already exceeded");
+
+        var snapshot = reachability.Current;
+        Assert.Equal(Start.AddMinutes(10), snapshot.ScanPausedUntilUtc);
+        Assert.Equal("API rate limit already exceeded", snapshot.ScanPauseReason);
+        Assert.Equal(Start, snapshot.UnreachableSinceUtc);
+    }
+
+    // A pause restored from a row a previous process wrote must not be able to cut
+    // short one the running process has already decided on.
+    [Fact]
+    public void APauseIsNeverShortenedByALaterSmallerOne()
+    {
+        var (reachability, _) = Create();
+        reachability.RecordScanPause(Start.AddMinutes(10), "first");
+        reachability.RecordScanPause(Start.AddMinutes(2), "second");
+
+        Assert.Equal(Start.AddMinutes(10), reachability.Current.ScanPausedUntilUtc);
+    }
+
+    // A successful scan is proof the pause is over. Leaving it set would keep the
+    // page reporting a wait that has already ended.
+    [Fact]
+    public void ASuccessfulScanClearsThePause()
+    {
+        var (reachability, _) = Create();
+        reachability.RecordScanPause(Start.AddMinutes(10), "API rate limit already exceeded");
+        reachability.RecordSuccess();
+
+        Assert.Null(reachability.Current.ScanPausedUntilUtc);
+        Assert.Null(reachability.Current.ScanPauseReason);
+    }
 }

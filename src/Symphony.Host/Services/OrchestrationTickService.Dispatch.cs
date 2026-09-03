@@ -98,8 +98,43 @@ public sealed partial class OrchestrationTickService
         }
         else if (reachedAnyRepository)
         {
+            // Ordered before the pause below, because RecordSuccess clears one.
             trackerReachability.RecordSuccess();
-            nextCandidateScanUtc = now + CandidateScanInterval;
+
+            // A rate limit is on the TOKEN, not on the repository. One repository
+            // answering does not mean the budget is there for the others, so the
+            // backoff has to be taken on any refusal - not only when every
+            // repository fails.
+            //
+            // Without this, a scan where one of three repositories answered took
+            // the ordinary interval and asked the other two again a minute later,
+            // over and over, which is precisely the "retries at the same cadence"
+            // that keeps a burst limit engaged.
+            if (rateLimited)
+            {
+                nextCandidateScanUtc = now + RateLimitBackoff;
+                trackerReachability.RecordScanPause(nextCandidateScanUtc, lastFailureCause);
+
+                logger.LogWarning(
+                    "GitHub rate limit reached for some tracked repositories; candidate scanning pauses until {ResumeAtUtc:u}.",
+                    nextCandidateScanUtc);
+
+                RecordCandidateScanPause(nextCandidateScanUtc, lastFailureCause);
+                await dbContext.SaveChangesAsync(cancellationToken);
+
+                // Keep what the refused repositories last told us. Backing off
+                // must not also empty their queue for the length of the pause -
+                // that would turn "we did not ask" into "there is no work", which
+                // is the same category of lie this issue is about. Identical to
+                // what a tick between scans already does with lastCandidates.
+                var fresh = issues.Select(issue => issue.Id).ToHashSet(StringComparer.OrdinalIgnoreCase);
+                issues.AddRange(lastCandidates.Where(candidate => !fresh.Contains(candidate.Id)));
+            }
+            else
+            {
+                nextCandidateScanUtc = now + CandidateScanInterval;
+            }
+
             lastCandidates = issues;
         }
         else
@@ -114,6 +149,14 @@ public sealed partial class OrchestrationTickService
             if (rateLimited)
             {
                 nextCandidateScanUtc = now + RateLimitBackoff;
+
+                // Tell the owner-facing summary that this is a WAIT, not a blind
+                // plane. Without this the panel sees only the failure streak, and a
+                // ten-minute backoff the engine chose for itself was reported as
+                // "something is wrong and it will not clear itself" - a standing
+                // demand on the owner for a state that clears on a clock.
+                trackerReachability.RecordScanPause(nextCandidateScanUtc, lastFailureCause);
+
                 logger.LogWarning(
                     "GitHub rate limit reached; candidate scanning pauses until {ResumeAtUtc:u}.",
                     nextCandidateScanUtc);

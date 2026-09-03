@@ -138,6 +138,9 @@ internal static class SymphonyHostApplication
         services.AddSingleton<RefreshSignalService>();
         // Singleton: a failure streak only means anything across ticks.
         services.AddSingleton<TrackerReachability>();
+        // Same reason. Task Scheduler reports one sample, so "this keeps failing"
+        // is only sayable by remembering the previous one.
+        services.AddSingleton<WatchedTaskHistory>();
         services.AddScoped<EscalationPublisher>();
         services.AddScoped<DirectiveProcessor>();
         services.AddScoped<PhaseOrchestrator>();
