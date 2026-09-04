@@ -891,6 +891,41 @@ public sealed class OwnerAttentionSummaryTests
         // The cause must travel with the alarm. Reporting only that a scan failed
         // is what sent the real answer to a 64 MB log file in the first place.
         Assert.Contains("api.github.com", item.Detail);
+        // And whether it clears by itself, because that decides whether anyone has
+        // to do anything. A rate limit was being reported as permanent.
+        Assert.Contains("clears on its own", item.Detail);
+    }
+
+    // A blind plane must say it cannot see, not serve what it last saw as what is
+    // true now. On 2026-09-03 the panel listed two already-merged pull requests as
+    // still needing a decision, and each was chased as its own fault before anyone
+    // noticed the tracker had been blind for half an hour.
+    [Fact]
+    public void WhileBlindTheTrackerDerivedItemsAreMarkedUnverified()
+    {
+        var tracker = new TrackerReachabilitySnapshot(
+            ConsecutiveFailures: 90,
+            LastSuccessUtc: Now.AddMinutes(-40),
+            UnreachableSinceUtc: Now.AddMinutes(-40),
+            LastFailureReason: "GitHub GraphQL: API rate limit already exceeded",
+            LastFailureTransient: true);
+
+        var result = Build(tracker: tracker, openPullRequests: [Pr(105, "SUCCESS")]);
+
+        var pullRequestItem = Assert.Single(result.Items, item => item.Label.Contains("PR #105", StringComparison.Ordinal));
+        Assert.Contains("Unverified", pullRequestItem.Detail, StringComparison.Ordinal);
+        Assert.Contains("may already be resolved", pullRequestItem.Detail, StringComparison.Ordinal);
+    }
+
+    // The counterpart: with the tracker healthy, nothing is hedged. A page that
+    // qualifies everything is as useless as one that qualifies nothing.
+    [Fact]
+    public void AReachableTrackerHedgesNothing()
+    {
+        var result = Build(openPullRequests: [Pr(105, "SUCCESS")]);
+
+        var pullRequestItem = Assert.Single(result.Items, item => item.Label.Contains("PR #105", StringComparison.Ordinal));
+        Assert.DoesNotContain("Unverified", pullRequestItem.Detail, StringComparison.Ordinal);
     }
 
     // The point of the whole feature is that silence is legible - which means a

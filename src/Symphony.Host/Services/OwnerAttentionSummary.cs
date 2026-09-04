@@ -192,17 +192,36 @@ public static class OwnerAttentionSummary
         // firing. Reported only once it has lasted, because the observed failures
         // were DNS blips that cleared within a tick, and a page that flags each of
         // those is one that trains its reader to ignore red.
-        if (tracker?.UnreachableSinceUtc is { } blindSince &&
-            now - blindSince > TrackerReachability.UnreachableGrace)
+        var trackerBlindFor = tracker?.UnreachableSinceUtc is { } blindSince &&
+                              now - blindSince > TrackerReachability.UnreachableGrace
+            ? now - blindSince
+            : (TimeSpan?)null;
+
+        if (trackerBlindFor is { } blindDuration)
         {
             items.Add(new AttentionItem(
                 "The issue tracker cannot be reached",
-                $"No candidate scan has succeeded for {Humanise(now - blindSince)}, so nothing new will be picked up. Last cause: {tracker.LastFailureReason}",
+                $"No candidate scan has succeeded for {Humanise(blindDuration)}, so nothing new will be picked up, " +
+                $"and everything below that came from the tracker is the last thing the plane saw rather than what is true now. " +
+                $"Last cause: {tracker!.LastFailureReason}" +
+                (tracker.LastFailureTransient
+                    ? " This kind of failure clears on its own."
+                    : " This kind of failure will not clear on its own."),
                 LevelDown,
                 Actor: AttentionActors.Operator,
                 Action: new AttentionAction("command", "Check connectivity",
                     Command: "gh api rate_limit")));
         }
+
+        // Said on every item the tracker supplied, not only in the banner above.
+        // On 2026-09-03 the panel listed two merged pull requests as still needing
+        // a decision and a task that had exited 0 as failed, and each was chased as
+        // its own fault before anyone noticed the tracker had been blind for half
+        // an hour. A stale item presented as a live one is worse than no item: it
+        // spends the reader's trust on work that is already done.
+        var unverified = trackerBlindFor is { } staleFor
+            ? $" Unverified: the tracker has been unreachable for {Humanise(staleFor)}, so this may already be resolved."
+            : string.Empty;
 
         if (!engineHealthy)
         {
@@ -487,11 +506,12 @@ public static class OwnerAttentionSummary
                     : tracked
                         ? $"{prLabel} is waiting on you"
                         : $"{prLabel} fell out of the pipeline",
-                failing
+                (failing
                     ? $"{pr.Title} - CI is red, so the merge gate will not take it.{waited}"
                     : tracked
                         ? $"{pr.Title} - open and not blocked by CI. Nothing will merge it without you.{waited}"
-                        : $"{pr.Title} - open and green, but the plane is not tracking it, so no review or merge will ever run. This is a fault to repair, not a decision to make.{waited}",
+                        : $"{pr.Title} - open and green, but the plane is not tracking it, so no review or merge will ever run. This is a fault to repair, not a decision to make.{waited}")
+                    + unverified,
                 LevelAttention,
                 prUrl,
                 Actor: actor,

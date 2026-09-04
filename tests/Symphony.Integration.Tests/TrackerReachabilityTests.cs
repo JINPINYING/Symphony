@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Sockets;
 using Symphony.Host.Services;
+using Symphony.Infrastructure.Tracker.GitHub;
 
 namespace Symphony.Integration.Tests;
 
@@ -124,5 +125,41 @@ public sealed class TrackerReachabilityTests
     {
         Assert.False(TrackerReachability.IsTransientConnectivity(
             new InvalidOperationException("GraphQL: Field 'nope' doesn't exist")));
+    }
+
+    // A rate limit clears on a clock, within the hour, with nobody doing anything -
+    // the clearest transient failure there is. It was being recorded as permanent,
+    // so the page told the owner an outage "will not clear on its own" about the
+    // one cause that always does.
+    [Fact]
+    public void ARateLimitIsTransient()
+    {
+        var ex = new GitHubTrackerException(
+            GitHubTrackerException.RateLimitedCode,
+            "GitHub GraphQL: API rate limit already exceeded");
+
+        Assert.True(TrackerReachability.IsTransientConnectivity(ex));
+    }
+
+    [Fact]
+    public void ARateLimitWrappedInAnotherFailureIsStillTransient()
+    {
+        var ex = new InvalidOperationException(
+            "candidate scan failed",
+            new GitHubTrackerException(
+                GitHubTrackerException.RateLimitedCode,
+                "GitHub REST: API rate limit exceeded for user ID 1."));
+
+        Assert.True(TrackerReachability.IsTransientConnectivity(ex));
+    }
+
+    // But an ordinary GitHub refusal must not be swept in with it: a bad token
+    // fails identically forever and no amount of waiting helps.
+    [Fact]
+    public void AnOrdinaryTrackerRefusalIsNotTransient()
+    {
+        var ex = new GitHubTrackerException("github_api_status", "GitHub REST returned HTTP 401.");
+
+        Assert.False(TrackerReachability.IsTransientConnectivity(ex));
     }
 }

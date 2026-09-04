@@ -1,5 +1,6 @@
 using System.Net.Http;
 using System.Net.Sockets;
+using Symphony.Infrastructure.Tracker.GitHub;
 
 namespace Symphony.Host.Services;
 
@@ -128,6 +129,17 @@ public sealed class TrackerReachability(TimeProvider timeProvider)
     /// </summary>
     public static bool IsTransientConnectivity(Exception ex)
     {
+        // A rate limit is the clearest transient failure there is: it clears on a
+        // clock, within the hour, with nobody doing anything. It was being recorded
+        // as non-transient, so the page told the owner an outage "will not clear on
+        // its own" about the one cause that always does - and each of the two
+        // exhaustions on 2026-09-03 was chased as a different fault before the
+        // cause was found.
+        if (GitHubTrackerException.IsRateLimit(ex))
+        {
+            return true;
+        }
+
         for (var current = ex; current is not null; current = current.InnerException)
         {
             switch (current)

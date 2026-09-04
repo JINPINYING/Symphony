@@ -1206,6 +1206,8 @@ GitHub-specific requirements for `tracker.kind == "github"`:
 
 - `tracker.kind == "github"`
 - GraphQL endpoint (default `https://api.github.com/graphql`)
+- REST root derived from the configured GraphQL endpoint (`https://api.github.com`;
+  `https://<host>/api/graphql` pairs with `https://<host>/api/v3`)
 - Auth token sent as `Authorization: Bearer <token>`
 - `tracker.owner` and `tracker.repo` scope candidate and reconciliation queries to one repository
 - `tracker.milestone`, when configured, scopes candidate issue queries to that milestone
@@ -1214,6 +1216,32 @@ GitHub-specific requirements for `tracker.kind == "github"`:
 - Pagination required for candidate issues
 - Page size default: `50`
 - Network timeout: `30000 ms`
+
+Transport split (required):
+
+- Reads use REST (`/repos/...`): candidate issues, state-filtered issues, issue state, issue
+  comments, pull requests, changed files and check state.
+- Writes use GraphQL mutations, keyed by the GitHub node id, which REST returns as `node_id`.
+- The GraphQL-only issue fields - `linkedBranches`, `blockedBy` and
+  `closedByPullRequestsReferences` - are fetched as a separate best-effort enrichment step.
+  Enrichment failure MUST NOT fail the read: the issue is returned with those fields empty
+  and marked as having degraded enrichment, and the orchestrator restores the last known
+  values from its cache rather than reading the absence as "none exist".
+- Rationale: the candidate scan decides whether the plane can work at all, and GraphQL is
+  the budget a single token exhausts first. A GraphQL exhaustion must cost detail, not
+  dispatch.
+
+Rate limits:
+
+- A rate-limited response MUST be classified as `github_rate_limited` and treated as
+  TRANSIENT: it clears on a clock without intervention.
+  - REST: HTTP 403/429 with `x-ratelimit-remaining: 0`, a `Retry-After` header, or a
+    rate-limit message body. A 403 with budget remaining is a refusal, not a limit.
+  - GraphQL: a top-level error of type `RATE_LIMITED`, or HTTP 403/429.
+- The wait GitHub names (`Retry-After`, else `x-ratelimit-reset`) MUST be honoured when
+  present; otherwise the pause backs off exponentially per consecutive rate-limited scan,
+  capped at one hour.
+- The pause MUST be durable, so restarting the process cannot shorten it.
 
 Important:
 
@@ -1249,10 +1277,15 @@ Recommended error categories:
 - `github_graphql_errors`
 - `github_unknown_payload`
 - `github_missing_end_cursor` (pagination integrity error)
+- `github_rate_limited` (transient; carries the wait GitHub asked for when it named one)
 
 Orchestrator behavior on tracker errors:
 
 - Candidate fetch failure: log and skip dispatch for this tick.
+- Rate limit: pause candidate scanning for the resolved backoff, record the pause durably,
+  and report the tracker as unreachable for a TRANSIENT reason.
+- While the tracker has been unreachable past the reporting grace, tracker-derived items on
+  the owner attention panel MUST be marked unverified rather than presented as current.
 - Running-state refresh failure: log and keep active workers running.
 - Startup terminal cleanup failure: log warning and continue startup.
 

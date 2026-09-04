@@ -711,7 +711,7 @@ public sealed class CodexAgentRunnerTests
         public Task<IReadOnlyList<NormalizedIssue>> FetchIssuesByStatesAsync(TrackerQuery query, IReadOnlyList<string> states, CancellationToken cancellationToken = default)
             => Task.FromResult<IReadOnlyList<NormalizedIssue>>([]);
 
-        public Task<IReadOnlyList<IssueStateSnapshot>> FetchIssueStatesByIdsAsync(TrackerQuery query, IReadOnlyList<string> issueIds, CancellationToken cancellationToken = default)
+        public Task<IReadOnlyList<IssueStateSnapshot>> FetchIssueStatesByIdsAsync(TrackerQuery query, IReadOnlyList<string> issueIds, IReadOnlyDictionary<string, string>? identifiersByIssueId = null, CancellationToken cancellationToken = default)
         {
             RefreshCount++;
             var nextState = pendingStates.Count == 0 ? "Closed" : pendingStates.Dequeue();
@@ -723,16 +723,16 @@ public sealed class CodexAgentRunnerTests
             return Task.FromResult(configuredGraphQlResult);
         }
 
-        public Task<IssueCommentMarkerSnapshot?> FetchIssueCommentMarkerAsync(TrackerQuery query, string issueId, string marker, CancellationToken cancellationToken = default)
+        public Task<IssueCommentMarkerSnapshot?> FetchIssueCommentMarkerAsync(TrackerQuery query, string issueId, string marker, string? issueIdentifier = null, CancellationToken cancellationToken = default)
             => Task.FromResult<IssueCommentMarkerSnapshot?>(new IssueCommentMarkerSnapshot(issueId, "Open", null, MarkerFound: false));
 
         public Task<string?> PostIssueCommentAsync(TrackerQuery query, string issueId, string body, CancellationToken cancellationToken = default)
             => Task.FromResult<string?>(null);
 
-        public Task<IReadOnlyList<NormalizedIssueComment>> FetchIssueCommentsAsync(TrackerQuery query, string issueId, CancellationToken cancellationToken = default)
+        public Task<IReadOnlyList<NormalizedIssueComment>> FetchIssueCommentsAsync(TrackerQuery query, string issueId, string? issueIdentifier = null, CancellationToken cancellationToken = default)
             => Task.FromResult<IReadOnlyList<NormalizedIssueComment>>([]);
 
-        public Task<IReadOnlyList<NormalizedIssue>> FetchIssuesByIdsAsync(TrackerQuery query, IReadOnlyList<string> issueIds, CancellationToken cancellationToken = default)
+        public Task<IReadOnlyList<NormalizedIssue>> FetchIssuesByIdsAsync(TrackerQuery query, IReadOnlyList<string> issueIds, IReadOnlyDictionary<string, string>? identifiersByIssueId = null, CancellationToken cancellationToken = default)
             => Task.FromResult<IReadOnlyList<NormalizedIssue>>([]);
 
         public Task CloseIssueAsync(TrackerQuery query, string issueId, CancellationToken cancellationToken = default)

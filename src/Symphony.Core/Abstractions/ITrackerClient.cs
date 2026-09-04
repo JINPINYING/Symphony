@@ -13,9 +13,19 @@ public interface ITrackerClient
         IReadOnlyList<string> states,
         CancellationToken cancellationToken = default);
 
+    // Reads keyed by tracker id take the caller's identifier ("#115") alongside it
+    // wherever one is known.
+    //
+    // WHY. A tracker id is a GitHub GraphQL node id, and GraphQL is the budget this
+    // token exhausts - so an id-only read has to be answered on the transport that
+    // fails first. The identifier is what REST addresses an issue by, and every
+    // caller already carries it next to the id: runs, retries, ledger rows and
+    // cache rows all store both. Passing it moves the read onto the primary REST
+    // budget; omitting it is still correct and still works, on GraphQL.
     Task<IReadOnlyList<IssueStateSnapshot>> FetchIssueStatesByIdsAsync(
         TrackerQuery query,
         IReadOnlyList<string> issueIds,
+        IReadOnlyDictionary<string, string>? identifiersByIssueId = null,
         CancellationToken cancellationToken = default);
 
     Task<GitHubGraphQlExecutionResult> ExecuteGitHubGraphQlAsync(
@@ -28,6 +38,7 @@ public interface ITrackerClient
         TrackerQuery query,
         string issueId,
         string marker,
+        string? issueIdentifier = null,
         CancellationToken cancellationToken = default);
 
     Task<string?> PostIssueCommentAsync(
@@ -39,11 +50,13 @@ public interface ITrackerClient
     Task<IReadOnlyList<NormalizedIssueComment>> FetchIssueCommentsAsync(
         TrackerQuery query,
         string issueId,
+        string? issueIdentifier = null,
         CancellationToken cancellationToken = default);
 
     Task<IReadOnlyList<NormalizedIssue>> FetchIssuesByIdsAsync(
         TrackerQuery query,
         IReadOnlyList<string> issueIds,
+        IReadOnlyDictionary<string, string>? identifiersByIssueId = null,
         CancellationToken cancellationToken = default);
 
     Task CloseIssueAsync(

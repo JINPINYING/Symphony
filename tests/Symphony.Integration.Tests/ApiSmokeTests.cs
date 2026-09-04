@@ -1417,6 +1417,7 @@ public sealed class ApiSmokeTests
         public Task<IReadOnlyList<IssueStateSnapshot>> FetchIssueStatesByIdsAsync(
             TrackerQuery query,
             IReadOnlyList<string> issueIds,
+            IReadOnlyDictionary<string, string>? identifiersByIssueId = null,
             CancellationToken cancellationToken = default)
         {
             return Task.FromResult<IReadOnlyList<IssueStateSnapshot>>([]);
@@ -1435,6 +1436,7 @@ public sealed class ApiSmokeTests
             TrackerQuery query,
             string issueId,
             string marker,
+            string? issueIdentifier = null,
             CancellationToken cancellationToken = default)
         {
             return Task.FromResult<IssueCommentMarkerSnapshot?>(
@@ -1456,6 +1458,7 @@ public sealed class ApiSmokeTests
         public Task<IReadOnlyList<NormalizedIssueComment>> FetchIssueCommentsAsync(
             TrackerQuery query,
             string issueId,
+            string? issueIdentifier = null,
             CancellationToken cancellationToken = default)
         {
             return Task.FromResult<IReadOnlyList<NormalizedIssueComment>>([]);
@@ -1464,6 +1467,7 @@ public sealed class ApiSmokeTests
         public Task<IReadOnlyList<NormalizedIssue>> FetchIssuesByIdsAsync(
             TrackerQuery query,
             IReadOnlyList<string> issueIds,
+            IReadOnlyDictionary<string, string>? identifiersByIssueId = null,
             CancellationToken cancellationToken = default)
         {
             return Task.FromResult<IReadOnlyList<NormalizedIssue>>([]);
