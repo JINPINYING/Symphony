@@ -25,8 +25,14 @@ public static class AgentQuotaSignals
         "quota exceeded",
         "quota exhausted",
         "out of credits",
+        "out of quota",
         "insufficient_quota",
-        "429 too many requests"
+        "429 too many requests",
+
+        // The code a runner records when it recognised the refusal itself. Every
+        // other entry here is a guess at someone else's wording; this one is ours,
+        // so it is the only signal that cannot drift (ADCP#29).
+        AgentRunActivity.QuotaErrorCode
     ];
 
     public static bool IsQuotaExhaustion(string? text)

@@ -189,6 +189,8 @@ public sealed class SymphonyDbContext(DbContextOptions<SymphonyDbContext> option
             entity.Property(x => x.RejectedHeadSha).HasMaxLength(64);
             entity.Property(x => x.LastVerdict).HasMaxLength(50);
             entity.Property(x => x.LastVerdictHeadSha).HasMaxLength(64);
+            entity.Property(x => x.HoldReason).HasMaxLength(100);
+            entity.Property(x => x.HoldRunner).HasMaxLength(50);
             entity.Property(x => x.CreatedAtUtc).IsRequired();
             entity.Property(x => x.UpdatedAtUtc).IsRequired();
             entity.HasIndex(x => x.Stage);
