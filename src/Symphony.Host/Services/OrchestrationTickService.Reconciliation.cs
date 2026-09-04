@@ -250,7 +250,8 @@ public sealed partial class OrchestrationTickService
             cancellationToken,
             runningIssues
                 .GroupBy(run => run.IssueId, StringComparer.Ordinal)
-                .ToDictionary(group => group.Key, group => group.First().Repository, StringComparer.Ordinal));
+                .ToDictionary(group => group.Key, group => group.First().Repository, StringComparer.Ordinal),
+            IssueIdentifierMap.From(runningIssues, run => run.IssueId, run => run.IssueIdentifier));
         if (refreshedStates is null)
         {
             return;

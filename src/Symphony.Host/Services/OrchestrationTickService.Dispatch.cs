@@ -18,6 +18,31 @@ public sealed partial class OrchestrationTickService
     // backoff, after which the cause is not transient and a person should see it.
     private const int MaxRetryAttempts = 6;
 
+    /// <summary>
+    /// How long to stop asking after a rate-limited scan.
+    ///
+    /// GitHub's own clock wins when it named one: <c>Retry-After</c> on a secondary
+    /// limit and <c>x-ratelimit-reset</c> on a primary one are the actual answer,
+    /// and a fixed ten minutes either waits past a thirty-second secondary limit or
+    /// walks straight back into a primary one with fifty minutes left to run.
+    /// Otherwise the wait doubles per consecutive refusal, because a limit still
+    /// there after the last wait is one being walked back into.
+    ///
+    /// Capped at an hour: the primary budget refills hourly, so waiting longer only
+    /// postpones work that could already have run.
+    /// </summary>
+    internal static TimeSpan ResolveRateLimitBackoff(TimeSpan? retryAfter, int consecutiveRateLimits)
+    {
+        if (retryAfter is { } wait && wait > TimeSpan.Zero)
+        {
+            return wait > MaxRateLimitBackoff ? MaxRateLimitBackoff : wait;
+        }
+
+        var doublings = Math.Clamp(consecutiveRateLimits - 1, 0, 8);
+        var backoff = RateLimitBackoff * Math.Pow(2, doublings);
+        return backoff > MaxRateLimitBackoff ? MaxRateLimitBackoff : backoff;
+    }
+
     private async Task DispatchCandidatesAsync(
         WorkflowDefinition workflowDefinition,
         string apiKey,
@@ -44,6 +69,7 @@ public sealed partial class OrchestrationTickService
         string? lastFailureCause = null;
         var lastFailureTransient = false;
         var rateLimited = false;
+        TimeSpan? rateLimitRetryAfter = null;
 
         foreach (var repositoryQuery in dueForScan ? queries.All : [])
         {
@@ -65,6 +91,7 @@ public sealed partial class OrchestrationTickService
                 lastFailureTransient = TrackerReachability.IsTransientConnectivity(ex);
                 lastFailureCause = TrackerReachability.DescribeCause(ex);
                 rateLimited |= GitHubTrackerException.IsRateLimit(ex);
+                rateLimitRetryAfter ??= GitHubTrackerException.GetRetryAfter(ex);
 
                 // Connectivity blips recover within a tick or two and cost nothing;
                 // logging each at Error teaches the reader that red means nothing.
@@ -100,6 +127,14 @@ public sealed partial class OrchestrationTickService
         {
             trackerReachability.RecordSuccess();
             nextCandidateScanUtc = now + CandidateScanInterval;
+            candidateScanRateLimitStreak = 0;
+
+            // The scan is REST and succeeded; the GraphQL-only fields on some of
+            // these issues may not have. Empty blockers because they were not
+            // fetched must not read as "nothing blocks this" - that would dispatch
+            // over a blocker the plane knew about a minute ago. Keep what was last
+            // known instead.
+            issues = await RestoreDegradedEnrichmentAsync(issues, cancellationToken);
             lastCandidates = issues;
         }
         else
@@ -113,9 +148,13 @@ public sealed partial class OrchestrationTickService
             // would have worked later.
             if (rateLimited)
             {
-                nextCandidateScanUtc = now + RateLimitBackoff;
+                candidateScanRateLimitStreak++;
+                var backoff = ResolveRateLimitBackoff(rateLimitRetryAfter, candidateScanRateLimitStreak);
+                nextCandidateScanUtc = now + backoff;
                 logger.LogWarning(
-                    "GitHub rate limit reached; candidate scanning pauses until {ResumeAtUtc:u}.",
+                    "GitHub rate limit reached ({Streak} consecutive); candidate scanning pauses for {Backoff} until {ResumeAtUtc:u}.",
+                    candidateScanRateLimitStreak,
+                    backoff,
                     nextCandidateScanUtc);
 
                 // Record the pause durably. The field above is in-memory and starts at
@@ -1495,7 +1534,11 @@ public sealed partial class OrchestrationTickService
         IssueStateSnapshot? snapshot;
         try
         {
-            var snapshots = await trackerClient.FetchIssueStatesByIdsAsync(query, [retryEntry.IssueId], cancellationToken);
+            var snapshots = await trackerClient.FetchIssueStatesByIdsAsync(
+                query,
+                [retryEntry.IssueId],
+                IssueIdentifierMap.For(retryEntry.IssueId, retryEntry.IssueIdentifier),
+                cancellationToken);
             snapshot = snapshots.FirstOrDefault(item =>
                 string.Equals(item.Id, retryEntry.IssueId, StringComparison.OrdinalIgnoreCase));
         }
@@ -1732,6 +1775,7 @@ public sealed partial class OrchestrationTickService
             snapshots = await trackerClient.FetchIssueStatesByIdsAsync(
                 query,
                 toVerify.Select(run => run.IssueId).ToList(),
+                IssueIdentifierMap.From(toVerify, run => run.IssueId, run => run.IssueIdentifier),
                 cancellationToken);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)

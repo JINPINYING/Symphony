@@ -36,6 +36,58 @@ public sealed class OrchestrationTickServiceTests
         Assert.Equal(RunStatusNames.Succeeded, (await harness.DbContext.DispatchClaims.SingleAsync()).Status);
     }
 
+    // The scan is REST now, so it keeps working when GraphQL is exhausted - but
+    // blockers are a GraphQL-only field and come back empty. Empty means "not
+    // fetched", and reading it as "nothing blocks this" would dispatch over a
+    // blocker the plane knew about a minute earlier. What was last known is a far
+    // better answer than an absence, and it is already durable.
+    [Fact]
+    public async Task RunTickAsync_ShouldKeepTheLastKnownBlockersWhenGraphQlEnrichmentIsUnavailable()
+    {
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: new FakeTrackerClient(
+                [BuildIssue("issue-1", "#1", "Open", blockedBy: null, enrichmentDegraded: true)]),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success));
+
+        await harness.InsertIssueCacheAsync(
+            "issue-1",
+            "#1",
+            "Open",
+            blockedByJson: """[{"Id":"issue-9","Identifier":"#9","State":"Open"}]""");
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        // The issue the dispatch gates see still carries the blocker, rather than
+        // an empty list that reads as "nothing blocks this".
+        var dispatched = Assert.Single(harness.Coordinator.StartRequests);
+        var blocker = Assert.Single(dispatched.Issue.BlockedBy);
+        Assert.Equal("#9", blocker.Identifier);
+
+        // And the cache still holds it, so the next tick sees it too rather than
+        // forgetting it the moment it was not re-fetched.
+        var cached = await harness.DbContext.IssueCache.SingleAsync();
+        Assert.Contains("#9", cached.BlockedByJson);
+    }
+
+    // The counterpart: a degraded read with nothing remembered about it must still
+    // dispatch. Failing closed on every degraded scan would trade one silent stall
+    // for another, which is the outcome this issue exists to remove.
+    [Fact]
+    public async Task RunTickAsync_ShouldStillDispatchADegradedIssueWithNoKnownBlockers()
+    {
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: new FakeTrackerClient(
+                [BuildIssue("issue-1", "#1", "Open", blockedBy: null, enrichmentDegraded: true)]),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success));
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Equal(RunStatusNames.Succeeded, (await harness.DbContext.Runs.SingleAsync()).Status);
+        Assert.Empty(Assert.Single(harness.Coordinator.StartRequests).Issue.BlockedBy);
+    }
+
     [Fact]
     public async Task RunTickAsync_ShouldDrainLegacyContinuationEntriesWithoutRedispatching()
     {
@@ -3086,6 +3138,114 @@ public sealed class OrchestrationTickServiceTests
         Assert.DoesNotContain("JINPINYING/Product", tracker.IssueStateFetchRepositories);
     }
 
+    // A fixed ten-minute pause is wrong in both directions: it waits out a
+    // thirty-second secondary limit, and it walks straight back into a primary one
+    // with fifty minutes left on the clock. GitHub says which it is; when it does
+    // not, the wait doubles, because a limit still there after the last wait is one
+    // being walked back into.
+    [Theory]
+    [InlineData(1, 10)]
+    [InlineData(2, 20)]
+    [InlineData(3, 40)]
+    [InlineData(4, 60)]
+    [InlineData(50, 60)]
+    public void ResolveRateLimitBackoff_ShouldDoubleUpToTheHourlyCapWhenGitHubNamesNoClock(
+        int consecutiveRateLimits,
+        int expectedMinutes)
+    {
+        Assert.Equal(
+            TimeSpan.FromMinutes(expectedMinutes),
+            OrchestrationTickService.ResolveRateLimitBackoff(null, consecutiveRateLimits));
+    }
+
+    [Fact]
+    public void ResolveRateLimitBackoff_ShouldHonourTheWaitGitHubAskedFor()
+    {
+        // A secondary limit clears in seconds. Waiting ten minutes for it costs
+        // nine and a half minutes of a plane that could have been working.
+        Assert.Equal(
+            TimeSpan.FromSeconds(30),
+            OrchestrationTickService.ResolveRateLimitBackoff(TimeSpan.FromSeconds(30), 1));
+
+        // Even against an escalated streak: GitHub's number is the actual answer.
+        Assert.Equal(
+            TimeSpan.FromSeconds(30),
+            OrchestrationTickService.ResolveRateLimitBackoff(TimeSpan.FromSeconds(30), 5));
+
+        // But it is still capped, so a nonsense Retry-After cannot park the plane
+        // past the point where the budget has demonstrably refilled.
+        Assert.Equal(
+            TimeSpan.FromMinutes(60),
+            OrchestrationTickService.ResolveRateLimitBackoff(TimeSpan.FromHours(6), 1));
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldLengthenTheScanPauseWhileTheRateLimitPersists()
+    {
+        var now = DateTimeOffset.Parse("2026-09-03T11:50:00Z");
+        var clock = new MutableTimeProvider(now);
+        var tracker = new FakeTrackerClient([]) { RateLimitOnFetchCandidates = true };
+
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning),
+            timeProvider: clock);
+
+        // First refusal: ten minutes.
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        Assert.Single(tracker.CandidateFetchRepositories);
+
+        clock.Advance(TimeSpan.FromMinutes(10));
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        Assert.Equal(2, tracker.CandidateFetchRepositories.Count);
+
+        // Second refusal doubles it, so ten more minutes is NOT enough.
+        clock.Advance(TimeSpan.FromMinutes(10));
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        Assert.Equal(2, tracker.CandidateFetchRepositories.Count);
+
+        clock.Advance(TimeSpan.FromMinutes(10));
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        Assert.Equal(3, tracker.CandidateFetchRepositories.Count);
+
+        // And a recovery resets the ladder: the next failure is back to ten minutes.
+        tracker.RateLimitOnFetchCandidates = false;
+        clock.Advance(TimeSpan.FromMinutes(40));
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        Assert.Equal(4, tracker.CandidateFetchRepositories.Count);
+
+        tracker.RateLimitOnFetchCandidates = true;
+        clock.Advance(TimeSpan.FromMinutes(1));
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        Assert.Equal(5, tracker.CandidateFetchRepositories.Count);
+
+        clock.Advance(TimeSpan.FromMinutes(10));
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        Assert.Equal(6, tracker.CandidateFetchRepositories.Count);
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldRecordARateLimitedTrackerAsTransient()
+    {
+        var now = DateTimeOffset.Parse("2026-09-03T11:50:00Z");
+        var clock = new MutableTimeProvider(now);
+        var tracker = new FakeTrackerClient([]) { RateLimitOnFetchCandidates = true };
+
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning),
+            timeProvider: clock);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        // The page told the owner this "will not clear on its own" about the one
+        // cause that always does, and the owner spent the outage looking for a
+        // fault that was not there.
+        Assert.True(harness.TrackerReachability.Current.LastFailureTransient);
+    }
+
     [Fact]
     public async Task RunTickAsync_ShouldKeepAnActiveRateLimitPauseAcrossAProcessRestart()
     {
@@ -3315,7 +3475,8 @@ public sealed class OrchestrationTickServiceTests
         string state,
         IReadOnlyList<BlockerRef>? blockedBy,
         IReadOnlyList<PullRequestRef>? pullRequests = null,
-        string repository = "")
+        string repository = "",
+        bool enrichmentDegraded = false)
     {
         return new NormalizedIssue(
             id,
@@ -3332,7 +3493,8 @@ public sealed class OrchestrationTickServiceTests
             blockedBy ?? [],
             DateTimeOffset.UtcNow,
             DateTimeOffset.UtcNow,
-            repository);
+            repository,
+            enrichmentDegraded);
     }
 
     private sealed class TestHarness : IAsyncDisposable
@@ -3346,7 +3508,8 @@ public sealed class OrchestrationTickServiceTests
             FakeTrackerClient tracker,
             FakeWorkspaceManager workspaceManager,
             FakeIssueExecutionCoordinator coordinator,
-            OrchestrationTickService service)
+            OrchestrationTickService service,
+            TrackerReachability trackerReachability)
         {
             this.dbPath = dbPath;
             DbContext = dbContext;
@@ -3354,6 +3517,7 @@ public sealed class OrchestrationTickServiceTests
             WorkspaceManager = workspaceManager;
             Coordinator = coordinator;
             Service = service;
+            TrackerReachability = trackerReachability;
         }
 
         public string DbPath => dbPath;
@@ -3363,6 +3527,7 @@ public sealed class OrchestrationTickServiceTests
         public FakeWorkspaceManager WorkspaceManager { get; }
         public FakeIssueExecutionCoordinator Coordinator { get; }
         public OrchestrationTickService Service { get; }
+        public TrackerReachability TrackerReachability { get; }
 
         public static async Task<TestHarness> CreateAsync(
             WorkflowDefinition workflowDefinition,
@@ -3392,6 +3557,7 @@ public sealed class OrchestrationTickServiceTests
             var workspaceManager = new FakeWorkspaceManager();
             coordinator.Attach(dbContext, dbPath);
             var clock = timeProvider ?? TimeProvider.System;
+            var trackerReachability = new TrackerReachability(clock);
 
             var service = new OrchestrationTickService(
                 new FakeWorkflowDefinitionProvider(workflowDefinition),
@@ -3419,7 +3585,7 @@ public sealed class OrchestrationTickServiceTests
                     dbContext,
                     clock,
                     NullLogger<EventLogRetentionService>.Instance),
-                new TrackerReachability(clock),
+                trackerReachability,
                 Options.Create(new OrchestrationOptions
                 {
                     InstanceId = "instance-1",
@@ -3429,7 +3595,7 @@ public sealed class OrchestrationTickServiceTests
                 clock,
                 NullLogger<OrchestrationTickService>.Instance);
 
-            return new TestHarness(dbPath, dbContext, tracker, workspaceManager, coordinator, service);
+            return new TestHarness(dbPath, dbContext, tracker, workspaceManager, coordinator, service, trackerReachability);
         }
 
         public async Task InsertRunningRunAsync(
@@ -3497,7 +3663,8 @@ public sealed class OrchestrationTickServiceTests
             DateTimeOffset? cachedAtUtc = null,
             DateTimeOffset? eligibleSeenAtUtc = null,
             string pullRequestsJson = "[]",
-            string labelsJson = "[]")
+            string labelsJson = "[]",
+            string blockedByJson = "[]")
         {
             var nowUtc = cachedAtUtc ?? DateTimeOffset.UtcNow;
             DbContext.IssueCache.Add(new IssueCacheEntity
@@ -3508,7 +3675,7 @@ public sealed class OrchestrationTickServiceTests
                 State = state,
                 LabelsJson = labelsJson,
                 PullRequestsJson = pullRequestsJson,
-                BlockedByJson = "[]",
+                BlockedByJson = blockedByJson,
                 EligibleSeenAtUtc = eligibleSeenAtUtc,
                 CachedAtUtc = nowUtc,
                 UpdatedAtUtc = nowUtc
@@ -3775,7 +3942,7 @@ public sealed class OrchestrationTickServiceTests
         // `symphony-ready` in place forever.
         public Dictionary<string, IReadOnlyList<string>> IssueLabelsById { get; } = new(StringComparer.OrdinalIgnoreCase);
 
-        public Task<IReadOnlyList<IssueStateSnapshot>> FetchIssueStatesByIdsAsync(TrackerQuery query, IReadOnlyList<string> issueIds, CancellationToken cancellationToken = default)
+        public Task<IReadOnlyList<IssueStateSnapshot>> FetchIssueStatesByIdsAsync(TrackerQuery query, IReadOnlyList<string> issueIds, IReadOnlyDictionary<string, string>? identifiersByIssueId = null, CancellationToken cancellationToken = default)
         {
             IssueStateFetchRepositories.Add($"{query.Owner}/{query.Repo}");
 
@@ -3813,6 +3980,7 @@ public sealed class OrchestrationTickServiceTests
             TrackerQuery query,
             string issueId,
             string marker,
+            string? issueIdentifier = null,
             CancellationToken cancellationToken = default)
         {
             if (ThrowOnFetchCommentMarker)
@@ -3871,6 +4039,7 @@ public sealed class OrchestrationTickServiceTests
         public Task<IReadOnlyList<NormalizedIssueComment>> FetchIssueCommentsAsync(
             TrackerQuery query,
             string issueId,
+            string? issueIdentifier = null,
             CancellationToken cancellationToken = default)
         {
             return Task.FromResult<IReadOnlyList<NormalizedIssueComment>>(
@@ -3880,6 +4049,7 @@ public sealed class OrchestrationTickServiceTests
         public Task<IReadOnlyList<NormalizedIssue>> FetchIssuesByIdsAsync(
             TrackerQuery query,
             IReadOnlyList<string> issueIds,
+            IReadOnlyDictionary<string, string>? identifiersByIssueId = null,
             CancellationToken cancellationToken = default)
         {
             var result = issueIds

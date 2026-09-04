@@ -652,6 +652,10 @@ public sealed partial class CodexAgentRunner(
             var refreshedStates = await trackerClient.FetchIssueStatesByIdsAsync(
                 request.TrackerQuery,
                 [request.IssueId],
+                new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    [request.IssueId] = request.IssueIdentifier
+                },
                 cancellationToken);
 
             return refreshedStates.FirstOrDefault()?.State;

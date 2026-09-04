@@ -58,13 +58,36 @@ public sealed partial class OrchestrationTickService
     // every tick went on asking, 197 times per repository, until the window reset.
     // Ten minutes is short enough to recover well inside GitHub's hourly window and
     // long enough to stop hammering it.
+    // Ten minutes is the FIRST wait, not the only one. A limit that is still there
+    // ten minutes later is one the plane is walking back into, so each consecutive
+    // rate-limited scan doubles the pause, up to the cap below - which is the
+    // longest a wait can usefully be, because the primary budget refills hourly and
+    // waiting past the reset only postpones work that could already have run.
+    //
+    // Whenever GitHub names its own clock - Retry-After on a secondary limit, or
+    // x-ratelimit-reset on a primary one - that number wins over both. It is the
+    // real answer; these are the fallback for when it did not say.
     private static readonly TimeSpan RateLimitBackoff = TimeSpan.FromMinutes(10);
+    private static readonly TimeSpan MaxRateLimitBackoff = TimeSpan.FromMinutes(60);
     private static readonly TimeSpan CandidateScanInterval = TimeSpan.FromSeconds(60);
     private DateTimeOffset nextCandidateScanUtc = DateTimeOffset.MinValue;
+    // Consecutive rate-limited scans. In memory on purpose: a restart has observed
+    // nothing and should not inherit an escalated backoff, and the pause itself is
+    // durable (candidate_scan_pause) so restarting still cannot shorten the wait.
+    private int candidateScanRateLimitStreak;
     private IReadOnlyList<NormalizedIssue> lastCandidates = [];
     // Guards the one-time read of a pause recorded by a previous process.
     // Checked every tick, so it must cost nothing after the first.
     private bool candidateScanPauseRestored;
+
+    // The tracked-issue cache refresh asks GitHub about every issue it has ever
+    // seen, and it used to do that on every tick because one GraphQL query
+    // answered a hundred ids. It now runs on the same clock as the candidate scan
+    // it mirrors: a tick can be fifteen seconds, and refreshing a whole cache four
+    // times a minute spends the budget this change exists to protect. The
+    // dashboard is no staler for it - the scan beside it already moves at 60s.
+    private static readonly TimeSpan TrackedIssueRefreshInterval = TimeSpan.FromSeconds(60);
+    private DateTimeOffset nextTrackedIssueRefreshUtc = DateTimeOffset.MinValue;
 
     private static readonly TimeSpan OpenPullRequestPollInterval = TimeSpan.FromMinutes(2);
     private DateTimeOffset nextOpenPullRequestPollUtc = DateTimeOffset.MinValue;

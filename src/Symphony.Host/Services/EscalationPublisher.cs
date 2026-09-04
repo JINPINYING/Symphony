@@ -75,7 +75,12 @@ public sealed class EscalationPublisher(
     private async Task PublishOneAsync(TrackerQuery query, RunEntity run, CancellationToken cancellationToken)
     {
         var marker = MarkerFor(run.Id);
-        var snapshot = await trackerClient.FetchIssueCommentMarkerAsync(query, run.IssueId, marker, cancellationToken);
+        var snapshot = await trackerClient.FetchIssueCommentMarkerAsync(
+            query,
+            run.IssueId,
+            marker,
+            run.IssueIdentifier,
+            cancellationToken);
         if (snapshot is null)
         {
             logger.LogWarning(

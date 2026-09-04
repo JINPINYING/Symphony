@@ -150,7 +150,11 @@ public sealed class PhaseOrchestrator(
             // number means nothing without it: two repositories can each have a
             // PR #122, and everything after this point asks about one by number.
             var query = queries.For(latestRun.Repository);
-            var issues = await trackerClient.FetchIssuesByIdsAsync(query, [issueRuns.Key], cancellationToken);
+            var issues = await trackerClient.FetchIssuesByIdsAsync(
+                query,
+                [issueRuns.Key],
+                IssueIdentifierMap.For(issueRuns.Key, latestRun.IssueIdentifier),
+                cancellationToken);
             var issue = issues.FirstOrDefault();
 
             // A closed issue is a finished one; there is nothing to seed and nothing
@@ -211,7 +215,7 @@ public sealed class PhaseOrchestrator(
                     continue;
                 }
 
-                var comments = await trackerClient.FetchIssueCommentsAsync(query, issue.Id, cancellationToken);
+                var comments = await trackerClient.FetchIssueCommentsAsync(query, issue.Id, issue.Identifier, cancellationToken);
                 var noChangeMarker = NoChangeNeededMarker(issue.Id);
                 var declaredNoChange = comments.Any(
                     comment => comment.Body.Contains(noChangeMarker, StringComparison.Ordinal));
@@ -855,7 +859,11 @@ public sealed class PhaseOrchestrator(
             return; // No slot; retry next tick.
         }
 
-        var issues = await trackerClient.FetchIssuesByIdsAsync(query, [ledger.IssueId], cancellationToken);
+        var issues = await trackerClient.FetchIssuesByIdsAsync(
+            query,
+            [ledger.IssueId],
+            IssueIdentifierMap.For(ledger.IssueId, ledger.IssueIdentifier),
+            cancellationToken);
         var issue = issues.FirstOrDefault();
         if (issue is null)
         {
@@ -891,7 +899,7 @@ public sealed class PhaseOrchestrator(
         // The verdict is durable GitHub truth: an issue comment carrying the
         // exact-head marker. The review run's local output is not trusted alone.
         var marker = ReviewVerdictMarker(ledger.PrNumber, ledger.HeadSha ?? string.Empty);
-        var comments = await trackerClient.FetchIssueCommentsAsync(query, ledger.IssueId, cancellationToken);
+        var comments = await trackerClient.FetchIssueCommentsAsync(query, ledger.IssueId, ledger.IssueIdentifier, cancellationToken);
         var verdictComment = comments
             .Where(comment => comment.Body.Contains(marker, StringComparison.Ordinal))
             .OrderByDescending(comment => comment.CreatedAtUtc ?? DateTimeOffset.MinValue)
@@ -1037,7 +1045,11 @@ public sealed class PhaseOrchestrator(
             return; // No slot; the verdict comment stays and this retries next tick.
         }
 
-        var issues = await trackerClient.FetchIssuesByIdsAsync(query, [ledger.IssueId], cancellationToken);
+        var issues = await trackerClient.FetchIssuesByIdsAsync(
+            query,
+            [ledger.IssueId],
+            IssueIdentifierMap.For(ledger.IssueId, ledger.IssueIdentifier),
+            cancellationToken);
         var issue = issues.FirstOrDefault();
         if (issue is null)
         {

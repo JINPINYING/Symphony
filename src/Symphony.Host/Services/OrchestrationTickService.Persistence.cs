@@ -189,17 +189,98 @@ public sealed partial class OrchestrationTickService
         await dbContext.SaveChangesAsync(cancellationToken);
     }
 
+    /// <summary>
+    /// Restores the GraphQL-only fields on issues whose enrichment failed, from the
+    /// last values the cache holds for them.
+    ///
+    /// WHY. The candidate scan runs on REST and no longer stops when GraphQL is
+    /// exhausted - but linked branches, blockers and closing pull request
+    /// references have no REST equivalent, so they come back empty. Empty means
+    /// "not fetched" here, and the dispatch gates read it as "none exist": a
+    /// blocked issue would be dispatched, and a branch the plane already knew would
+    /// be forgotten. What was true a minute ago is a far better answer than an
+    /// absence, and it is already durable.
+    /// </summary>
+    private async Task<List<NormalizedIssue>> RestoreDegradedEnrichmentAsync(
+        List<NormalizedIssue> issues,
+        CancellationToken cancellationToken)
+    {
+        var degradedIds = issues
+            .Where(issue => issue.EnrichmentDegraded)
+            .Select(issue => issue.Id)
+            .ToList();
+        if (degradedIds.Count == 0)
+        {
+            return issues;
+        }
+
+        var cachedById = (await dbContext.IssueCache
+                .Where(entry => degradedIds.Contains(entry.IssueId))
+                .ToListAsync(cancellationToken))
+            .ToDictionary(entry => entry.IssueId, StringComparer.OrdinalIgnoreCase);
+
+        logger.LogWarning(
+            "GitHub GraphQL enrichment was unavailable for {Count} candidate issues; " +
+            "linked branches, blockers and pull request links fall back to the last known values.",
+            degradedIds.Count);
+
+        var restored = new List<NormalizedIssue>(issues.Count);
+        foreach (var issue in issues)
+        {
+            if (!issue.EnrichmentDegraded || !cachedById.TryGetValue(issue.Id, out var cached))
+            {
+                restored.Add(issue);
+                continue;
+            }
+
+            restored.Add(issue with
+            {
+                BranchName = issue.BranchName ?? cached.BranchName,
+                PullRequests = DeserializeOrEmpty<PullRequestRef>(cached.PullRequestsJson),
+                BlockedBy = DeserializeOrEmpty<BlockerRef>(cached.BlockedByJson)
+            });
+        }
+
+        return restored;
+    }
+
+    private static IReadOnlyList<T> DeserializeOrEmpty<T>(string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            return [];
+        }
+
+        try
+        {
+            return JsonSerializer.Deserialize<List<T>>(json) ?? [];
+        }
+        catch (JsonException)
+        {
+            // A cache row this process cannot read is not worth failing a scan over.
+            return [];
+        }
+    }
+
     private async Task RefreshTrackedIssueCacheStatesAsync(
         WorkflowDefinition workflowDefinition,
         string apiKey,
         string instanceId,
         CancellationToken cancellationToken)
     {
+        var nowUtc = timeProvider.GetUtcNow();
+        if (nowUtc < nextTrackedIssueRefreshUtc)
+        {
+            return;
+        }
+
         var cachedIssues = await dbContext.IssueCache.ToListAsync(cancellationToken);
         if (cachedIssues.Count == 0)
         {
             return;
         }
+
+        nextTrackedIssueRefreshUtc = nowUtc + TrackedIssueRefreshInterval;
 
         var refreshedStates = await TryFetchIssueStatesByIdsAsync(
             workflowDefinition,
@@ -209,7 +290,8 @@ public sealed partial class OrchestrationTickService
             cancellationToken,
             cachedIssues
                 .GroupBy(issue => issue.IssueId, StringComparer.Ordinal)
-                .ToDictionary(group => group.Key, group => group.First().Repository, StringComparer.Ordinal));
+                .ToDictionary(group => group.Key, group => group.First().Repository, StringComparer.Ordinal),
+            IssueIdentifierMap.From(cachedIssues, issue => issue.IssueId, issue => issue.Identifier));
         if (refreshedStates is null)
         {
             return;
@@ -399,7 +481,11 @@ public sealed partial class OrchestrationTickService
         IReadOnlyList<string> issueIds,
         string failureMessage,
         CancellationToken cancellationToken,
-        IReadOnlyDictionary<string, string>? repositoryByIssueId = null)
+        IReadOnlyDictionary<string, string>? repositoryByIssueId = null,
+        // "#115" per issue id. Supplying it moves this refresh onto REST, which is
+        // the point: this is the read that clears a resolved escalation and stops a
+        // run whose issue was closed, and it must not go dark with GraphQL.
+        IReadOnlyDictionary<string, string>? identifierByIssueId = null)
     {
         if (issueIds.Count == 0)
         {
@@ -414,6 +500,7 @@ public sealed partial class OrchestrationTickService
                 return await trackerClient.FetchIssueStatesByIdsAsync(
                     queries.Primary,
                     issueIds,
+                    identifierByIssueId,
                     cancellationToken);
             }
 
@@ -430,6 +517,7 @@ public sealed partial class OrchestrationTickService
                 var states = await trackerClient.FetchIssueStatesByIdsAsync(
                     queries.For(group.Key),
                     group.ToList(),
+                    identifierByIssueId,
                     cancellationToken);
                 combined.AddRange(states);
             }

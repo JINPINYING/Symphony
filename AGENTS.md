@@ -55,7 +55,14 @@ Locked on 2026-03-05:
 - Include DB-backed lease/claim semantics for multi-instance safety.
 
 4. GitHub integration:
-- Use GraphQL endpoint by default (`https://api.github.com/graphql`).
+- Configure the GraphQL endpoint (`https://api.github.com/graphql` by default); the REST
+  root is derived from it.
+- Read over REST (`/repos/...`). The candidate scan, issue state, comments, pull requests
+  and checks all use the primary REST budget, because a rate-limited tracker blinds the
+  whole plane and GraphQL is the budget that runs out.
+- Use GraphQL only for writes and for the fields REST cannot express (`linkedBranches`,
+  `blockedBy`, `closedByPullRequestsReferences`). Those are enrichment: they must degrade
+  without stopping a dispatch.
 - Normalize all tracker payloads to the spec domain model before use.
 - Use PAT auth for v1.
 - Filter candidates by configured state + label + milestone.

@@ -119,7 +119,7 @@ public sealed class DirectiveProcessor(
         var issueId = stuckRuns[0].IssueId;
         var issueIdentifier = stuckRuns[0].IssueIdentifier;
 
-        var comments = await trackerClient.FetchIssueCommentsAsync(query, issueId, cancellationToken);
+        var comments = await trackerClient.FetchIssueCommentsAsync(query, issueId, issueIdentifier, cancellationToken);
         if (comments.Count == 0)
         {
             return;
@@ -242,7 +242,11 @@ public sealed class DirectiveProcessor(
             return false;
         }
 
-        var issues = await trackerClient.FetchIssuesByIdsAsync(query, [issueId], cancellationToken);
+        var issues = await trackerClient.FetchIssuesByIdsAsync(
+            query,
+            [issueId],
+            IssueIdentifierMap.For(issueId, issueIdentifier),
+            cancellationToken);
         var issue = issues.FirstOrDefault();
         if (issue is null)
         {

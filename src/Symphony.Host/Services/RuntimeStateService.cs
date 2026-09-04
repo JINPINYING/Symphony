@@ -561,7 +561,13 @@ public sealed class RuntimeStateService(
                 last_success = trackerReachability.Current.LastSuccessUtc?.ToString("o"),
                 unreachable_since = trackerReachability.Current.UnreachableSinceUtc?.ToString("o"),
                 last_failure_reason = trackerReachability.Current.LastFailureReason,
-                last_failure_transient = trackerReachability.Current.LastFailureTransient
+                last_failure_transient = trackerReachability.Current.LastFailureTransient,
+                // Past the grace, so everything tracker-derived in this snapshot is
+                // a memory rather than a reading. Said as a field, not left to be
+                // inferred from unreachable_since: a consumer that has to derive
+                // "am I looking at stale data" will eventually forget to.
+                blind = trackerReachability.Current.UnreachableSinceUtc is { } blindSince &&
+                        generatedAt - blindSince > TrackerReachability.UnreachableGrace
             },
             watched_tasks = watchedTasks.Select(task => new
             {

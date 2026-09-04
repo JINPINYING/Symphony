@@ -11,9 +11,9 @@ namespace Symphony.Infrastructure.Tracker.GitHub;
 
 public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITrackerClient, IGitHubTrackerClient
 {
-    // Shared field selection for issue nodes; parsed by ParseIssue. Used by both
-    // the candidate-issues query and the by-ids query so the two paths cannot
-    // drift apart.
+    // Field selection for the by-ids fallback, which is the only issue read still
+    // served by GraphQL - and only when the caller cannot name the issue number
+    // REST addresses it by. The candidate scan is REST (GitHubTrackerClient.Rest.cs).
     private const string GraphQlIssueNodeFields = """
                 id
                 number
@@ -56,23 +56,6 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
                     state
                   }
                 }
-        """;
-
-    private const string GraphQlIssuesQuery = """
-        query($owner: String!, $repo: String!, $states: [IssueState!], $labels: [String!], $first: Int!, $after: String, $includePullRequests: Boolean!) {
-          repository(owner: $owner, name: $repo) {
-            issues(states: $states, labels: $labels, first: $first, after: $after, orderBy: { field: CREATED_AT, direction: ASC }) {
-              pageInfo {
-                hasNextPage
-                endCursor
-              }
-              nodes {
-        """ + GraphQlIssueNodeFields + """
-
-              }
-            }
-          }
-        }
         """;
 
     private const string GraphQlIssuesByIdsQuery = """
@@ -145,6 +128,7 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
     public async Task<IReadOnlyList<IssueStateSnapshot>> FetchIssueStatesByIdsAsync(
         TrackerQuery query,
         IReadOnlyList<string> issueIds,
+        IReadOnlyDictionary<string, string>? identifiersByIssueId = null,
         CancellationToken cancellationToken = default)
     {
         if (issueIds.Count == 0)
@@ -159,7 +143,44 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
             .ToList();
 
         var statesById = new Dictionary<string, IssueStateSnapshot>(StringComparer.OrdinalIgnoreCase);
-        foreach (var issueIdBatch in orderedIds.Chunk(100))
+
+        // This refresh is what clears a resolved escalation and what stops a run
+        // whose issue was closed under it. When it was GraphQL-only, a GraphQL
+        // exhaustion froze both: the attention list kept offering decisions the
+        // owner had already made. Every id the caller can also name by number is
+        // answered from REST, on the budget that was never touched.
+        var restResolvable = orderedIds
+            .Where(issueId => identifiersByIssueId is not null &&
+                              identifiersByIssueId.TryGetValue(issueId, out var identifier) &&
+                              ParseIssueNumber(identifier) is not null)
+            .ToList();
+        var unresolved = orderedIds.Except(restResolvable, StringComparer.OrdinalIgnoreCase).ToList();
+
+        if (restResolvable.Count > MaxIndividualIssueReads)
+        {
+            // One listing beats one GET each once the set is large - which is
+            // exactly the tracked-issue cache refresh, asking about every issue it
+            // has ever seen on every tick.
+            foreach (var (issueId, snapshot) in
+                     await FetchIssueStatesByListingRestAsync(query, restResolvable, cancellationToken))
+            {
+                statesById[issueId] = snapshot;
+            }
+        }
+        else
+        {
+            foreach (var issueId in restResolvable)
+            {
+                var number = ParseIssueNumber(identifiersByIssueId![issueId])!.Value;
+                var snapshot = await FetchIssueStateByNumberRestAsync(query, issueId, number, cancellationToken);
+                if (snapshot is not null)
+                {
+                    statesById[issueId] = snapshot;
+                }
+            }
+        }
+
+        foreach (var issueIdBatch in unresolved.Chunk(100))
         {
             using var request = BuildGraphQlRequest(
                 endpoint,
@@ -267,8 +288,14 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
         TrackerQuery query,
         string issueId,
         string marker,
+        string? issueIdentifier = null,
         CancellationToken cancellationToken = default)
     {
+        if (ParseIssueNumber(issueIdentifier) is { } issueNumber)
+        {
+            return await FetchIssueCommentMarkerRestAsync(query, issueId, issueNumber, marker, cancellationToken);
+        }
+
         var endpoint = string.IsNullOrWhiteSpace(query.Endpoint) ? "https://api.github.com/graphql" : query.Endpoint;
 
         string? state = null;
@@ -421,8 +448,17 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
     public async Task<IReadOnlyList<NormalizedIssueComment>> FetchIssueCommentsAsync(
         TrackerQuery query,
         string issueId,
+        string? issueIdentifier = null,
         CancellationToken cancellationToken = default)
     {
+        // Comments carry the command-center directives. A directive the plane
+        // cannot read is a directive that does not run, so this read belongs on
+        // the budget that does not run out.
+        if (ParseIssueNumber(issueIdentifier) is { } issueNumber)
+        {
+            return await FetchIssueCommentsRestAsync(query, issueNumber, cancellationToken);
+        }
+
         var endpoint = string.IsNullOrWhiteSpace(query.Endpoint) ? "https://api.github.com/graphql" : query.Endpoint;
         var comments = new List<NormalizedIssueComment>();
         string? after = null;
@@ -496,6 +532,7 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
     public async Task<IReadOnlyList<NormalizedIssue>> FetchIssuesByIdsAsync(
         TrackerQuery query,
         IReadOnlyList<string> issueIds,
+        IReadOnlyDictionary<string, string>? identifiersByIssueId = null,
         CancellationToken cancellationToken = default)
     {
         if (issueIds.Count == 0)
@@ -510,7 +547,29 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
             .ToList();
 
         var issuesById = new Dictionary<string, NormalizedIssue>(StringComparer.OrdinalIgnoreCase);
-        foreach (var issueIdBatch in orderedIds.Chunk(50))
+
+        var unresolved = new List<string>(orderedIds.Count);
+        foreach (var issueId in orderedIds)
+        {
+            var number = identifiersByIssueId is not null &&
+                         identifiersByIssueId.TryGetValue(issueId, out var identifier)
+                ? ParseIssueNumber(identifier)
+                : null;
+
+            if (number is null)
+            {
+                unresolved.Add(issueId);
+                continue;
+            }
+
+            var issue = await FetchIssueByNumberRestAsync(query, number.Value, cancellationToken);
+            if (issue is not null && string.Equals(issue.Id, issueId, StringComparison.OrdinalIgnoreCase))
+            {
+                issuesById[issue.Id] = (await TryEnrichIssuesAsync(query, [issue], cancellationToken))[0];
+            }
+        }
+
+        foreach (var issueIdBatch in unresolved.Chunk(50))
         {
             using var request = BuildGraphQlRequest(
                 endpoint,
@@ -567,81 +626,17 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
         return result;
     }
 
-    // Shared PR field selection so the by-number and by-branch queries parse
-    // through the same code path (ParsePullRequestNode).
-    private const string GraphQlPullRequestNodeFields = """
-              number
-              state
-              isDraft
-              mergeable
-              headRefName
-              headRefOid
-              commits(last: 1) {
-                nodes {
-                  commit {
-                    statusCheckRollup {
-                      state
-                    }
-                  }
-                }
-              }
-        """;
-
-    private const string GraphQlPullRequestStatusQuery = """
-        query($owner: String!, $repo: String!, $number: Int!) {
-          repository(owner: $owner, name: $repo) {
-            pullRequest(number: $number) {
-        """ + GraphQlPullRequestNodeFields + """
-
-            }
-          }
-        }
-        """;
-
-    private const string GraphQlOpenPullRequestByHeadBranchQuery = """
-        query($owner: String!, $repo: String!, $headRefName: String!) {
-          repository(owner: $owner, name: $repo) {
-            pullRequests(headRefName: $headRefName, states: OPEN, first: 5, orderBy: { field: CREATED_AT, direction: DESC }) {
-              nodes {
-        """ + GraphQlPullRequestNodeFields + """
-
-              }
-            }
-          }
-        }
-        """;
+    // Pull requests, checks and changed files are all /repos/... reads. They used
+    // to be GraphQL, which meant the merge gate, the verify gate and the status
+    // page all went dark on the same exhaustion that blinded the candidate scan -
+    // one budget, every question. The parsing lives in GitHubTrackerClient.Rest.cs.
 
     public async Task<PullRequestStatus?> FetchPullRequestStatusAsync(
         TrackerQuery query,
         int pullRequestNumber,
         CancellationToken cancellationToken = default)
     {
-        var endpoint = string.IsNullOrWhiteSpace(query.Endpoint) ? "https://api.github.com/graphql" : query.Endpoint;
-
-        using var request = BuildGraphQlRequest(
-            endpoint,
-            query.ApiKey,
-            GraphQlPullRequestStatusQuery,
-            new
-            {
-                owner = query.Owner,
-                repo = query.Repo,
-                number = pullRequestNumber
-            });
-
-        using var response = await SendAsync(request, cancellationToken);
-        using var document = await ParseGraphQlDocumentAsync(response, cancellationToken);
-
-        var dataElement = GetRequiredObject(document.RootElement, "data");
-        if (!dataElement.TryGetProperty("repository", out var repositoryNode) ||
-            repositoryNode.ValueKind != JsonValueKind.Object ||
-            !repositoryNode.TryGetProperty("pullRequest", out var prNode) ||
-            prNode.ValueKind != JsonValueKind.Object)
-        {
-            return null;
-        }
-
-        return ParsePullRequestNode(prNode);
+        return await FetchPullRequestStatusRestAsync(query, pullRequestNumber, cancellationToken);
     }
 
     public async Task<PullRequestStatus?> FetchOpenPullRequestByHeadBranchAsync(
@@ -654,155 +649,24 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
             return null;
         }
 
-        var endpoint = string.IsNullOrWhiteSpace(query.Endpoint) ? "https://api.github.com/graphql" : query.Endpoint;
-
-        using var request = BuildGraphQlRequest(
-            endpoint,
-            query.ApiKey,
-            GraphQlOpenPullRequestByHeadBranchQuery,
-            new
-            {
-                owner = query.Owner,
-                repo = query.Repo,
-                headRefName
-            });
-
-        using var response = await SendAsync(request, cancellationToken);
-        using var document = await ParseGraphQlDocumentAsync(response, cancellationToken);
-
-        var dataElement = GetRequiredObject(document.RootElement, "data");
-        if (!dataElement.TryGetProperty("repository", out var repositoryNode) ||
-            repositoryNode.ValueKind != JsonValueKind.Object ||
-            !repositoryNode.TryGetProperty("pullRequests", out var listNode) ||
-            listNode.ValueKind != JsonValueKind.Object)
-        {
-            return null;
-        }
-
-        foreach (var prNode in GetRequiredArray(listNode, "nodes").EnumerateArray())
-        {
-            if (prNode.ValueKind != JsonValueKind.Object)
-            {
-                continue;
-            }
-
-            var parsed = ParsePullRequestNode(prNode);
-            if (parsed is not null)
-            {
-                return parsed;
-            }
-        }
-
-        return null;
+        return await FetchOpenPullRequestByHeadBranchRestAsync(query, headRefName, cancellationToken);
     }
-
-    private const string GraphQlOpenPullRequestsQuery = """
-        query($owner: String!, $repo: String!, $limit: Int!) {
-          repository(owner: $owner, name: $repo) {
-            pullRequests(states: OPEN, first: $limit, orderBy: { field: UPDATED_AT, direction: DESC }) {
-              nodes {
-                title
-                url
-                updatedAt
-                author { login }
-        """ + GraphQlPullRequestNodeFields + """
-
-              }
-            }
-          }
-        }
-        """;
 
     public async Task<IReadOnlyList<OpenPullRequest>> FetchOpenPullRequestsAsync(
         TrackerQuery query,
         int limit,
         CancellationToken cancellationToken = default)
     {
-        // GitHub rejects first: 0 and caps a page at 100. Clamping here stops a
-        // misconfigured limit from turning the status page into an API error.
-        var pageSize = Math.Clamp(limit, 1, 100);
-        var endpoint = string.IsNullOrWhiteSpace(query.Endpoint) ? "https://api.github.com/graphql" : query.Endpoint;
-
-        using var request = BuildGraphQlRequest(
-            endpoint,
-            query.ApiKey,
-            GraphQlOpenPullRequestsQuery,
-            new
-            {
-                owner = query.Owner,
-                repo = query.Repo,
-                limit = pageSize
-            });
-
-        using var response = await SendAsync(request, cancellationToken);
-        using var document = await ParseGraphQlDocumentAsync(response, cancellationToken);
-
-        var dataElement = GetRequiredObject(document.RootElement, "data");
-        if (!dataElement.TryGetProperty("repository", out var repositoryNode) ||
-            repositoryNode.ValueKind != JsonValueKind.Object ||
-            !repositoryNode.TryGetProperty("pullRequests", out var listNode) ||
-            listNode.ValueKind != JsonValueKind.Object)
-        {
-            return [];
-        }
-
-        var results = new List<OpenPullRequest>();
-        foreach (var prNode in GetRequiredArray(listNode, "nodes").EnumerateArray())
-        {
-            if (prNode.ValueKind != JsonValueKind.Object)
-            {
-                continue;
-            }
-
-            // Reuse the shared parser for the fields the merge gate also reads, so
-            // the two views of a pull request cannot drift apart.
-            var status = ParsePullRequestNode(prNode);
-            if (status is null)
-            {
-                continue;
-            }
-
-            string? author = null;
-            if (prNode.TryGetProperty("author", out var authorNode) && authorNode.ValueKind == JsonValueKind.Object)
-            {
-                author = GetOptionalString(authorNode, "login");
-            }
-
-            var updatedAt = DateTimeOffset.MinValue;
-            if (DateTimeOffset.TryParse(GetOptionalString(prNode, "updatedAt"), out var parsedUpdatedAt))
-            {
-                updatedAt = parsedUpdatedAt.ToUniversalTime();
-            }
-
-            results.Add(new OpenPullRequest(
-                status.Number,
-                GetOptionalString(prNode, "title") ?? $"#{status.Number}",
-                GetOptionalString(prNode, "url") ?? string.Empty,
-                author,
-                status.IsDraft,
-                status.ChecksState,
-                status.Mergeable,
-                updatedAt,
-                $"{query.Owner}/{query.Repo}",
-                GetOptionalString(prNode, "headRefName"),
-                status.HeadSha));
-        }
-
-        return results;
+        return await FetchOpenPullRequestsRestAsync(query, limit, cancellationToken);
     }
 
-    private const string GraphQlPullRequestFilesQuery = """
-        query($owner: String!, $repo: String!, $number: Int!, $after: String) {
-          repository(owner: $owner, name: $repo) {
-            pullRequest(number: $number) {
-              files(first: 100, after: $after) {
-                pageInfo { hasNextPage endCursor }
-                nodes { path }
-              }
-            }
-          }
-        }
-        """;
+    public async Task<IReadOnlyList<string>> FetchPullRequestFilesAsync(
+        TrackerQuery query,
+        int pullRequestNumber,
+        CancellationToken cancellationToken = default)
+    {
+        return await FetchPullRequestFilesRestAsync(query, pullRequestNumber, cancellationToken);
+    }
 
     private const string GraphQlMergePullRequestMutation = """
         mutation($pullRequestId: ID!, $expectedHeadOid: GitObjectID!, $method: PullRequestMergeMethod!) {
@@ -819,62 +683,6 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
           }
         }
         """;
-
-    public async Task<IReadOnlyList<string>> FetchPullRequestFilesAsync(
-        TrackerQuery query,
-        int pullRequestNumber,
-        CancellationToken cancellationToken = default)
-    {
-        var endpoint = string.IsNullOrWhiteSpace(query.Endpoint) ? "https://api.github.com/graphql" : query.Endpoint;
-        var paths = new List<string>();
-        string? after = null;
-        var pages = 0;
-
-        while (true)
-        {
-            using var request = BuildGraphQlRequest(
-                endpoint,
-                query.ApiKey,
-                GraphQlPullRequestFilesQuery,
-                new { owner = query.Owner, repo = query.Repo, number = pullRequestNumber, after });
-
-            using var response = await SendAsync(request, cancellationToken);
-            using var document = await ParseGraphQlDocumentAsync(response, cancellationToken);
-
-            var dataElement = GetRequiredObject(document.RootElement, "data");
-            if (!dataElement.TryGetProperty("repository", out var repositoryNode) ||
-                repositoryNode.ValueKind != JsonValueKind.Object ||
-                !repositoryNode.TryGetProperty("pullRequest", out var prNode) ||
-                prNode.ValueKind != JsonValueKind.Object ||
-                !prNode.TryGetProperty("files", out var filesNode) ||
-                filesNode.ValueKind != JsonValueKind.Object)
-            {
-                return paths;
-            }
-
-            foreach (var fileNode in GetRequiredArray(filesNode, "nodes").EnumerateArray())
-            {
-                var path = GetOptionalString(fileNode, "path");
-                if (!string.IsNullOrWhiteSpace(path))
-                {
-                    paths.Add(path);
-                }
-            }
-
-            var pageInfo = GetRequiredObject(filesNode, "pageInfo");
-            pages++;
-            if (!GetRequiredBoolean(pageInfo, "hasNextPage") || pages >= 20)
-            {
-                return paths;
-            }
-
-            after = GetOptionalString(pageInfo, "endCursor");
-            if (string.IsNullOrWhiteSpace(after))
-            {
-                return paths;
-            }
-        }
-    }
 
     public async Task<string?> MergePullRequestAsync(
         TrackerQuery query,
@@ -1024,45 +832,6 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
         GetRequiredObject(document.RootElement, "data");
     }
 
-    private static PullRequestStatus? ParsePullRequestNode(JsonElement prNode)
-    {
-        var headSha = GetOptionalString(prNode, "headRefOid");
-        var state = GetOptionalString(prNode, "state");
-        var number = GetOptionalInt(prNode, "number");
-        if (string.IsNullOrWhiteSpace(headSha) || string.IsNullOrWhiteSpace(state) || number is null)
-        {
-            return null;
-        }
-
-        string? checksState = null;
-        if (prNode.TryGetProperty("commits", out var commitsNode) &&
-            commitsNode.ValueKind == JsonValueKind.Object &&
-            commitsNode.TryGetProperty("nodes", out var commitNodes) &&
-            commitNodes.ValueKind == JsonValueKind.Array)
-        {
-            foreach (var commitWrapper in commitNodes.EnumerateArray())
-            {
-                if (commitWrapper.ValueKind == JsonValueKind.Object &&
-                    commitWrapper.TryGetProperty("commit", out var commitNode) &&
-                    commitNode.ValueKind == JsonValueKind.Object &&
-                    commitNode.TryGetProperty("statusCheckRollup", out var rollupNode) &&
-                    rollupNode.ValueKind == JsonValueKind.Object)
-                {
-                    checksState = GetOptionalString(rollupNode, "state");
-                }
-            }
-        }
-
-        var isDraft = prNode.TryGetProperty("isDraft", out var draftNode) && draftNode.ValueKind == JsonValueKind.True;
-        return new PullRequestStatus(
-            number.Value,
-            state,
-            isDraft,
-            headSha,
-            checksState,
-            GetOptionalString(prNode, "mergeable"));
-    }
-
     public async Task CloseIssueAsync(
         TrackerQuery query,
         string issueId,
@@ -1204,93 +973,6 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
                 ErrorCode: "github_api_request",
                 ErrorMessage: ex.Message);
         }
-    }
-
-    private async Task<IReadOnlyList<NormalizedIssue>> FetchIssuesInternalAsync(
-        TrackerQuery query,
-        IReadOnlyList<string> states,
-        bool applyCandidateFilters,
-        CancellationToken cancellationToken)
-    {
-        var candidateIssues = new List<NormalizedIssue>();
-        var cursor = default(string);
-        var hasNextPage = true;
-
-        var issueStates = BuildIssueStates(states);
-        var endpoint = string.IsNullOrWhiteSpace(query.Endpoint) ? "https://api.github.com/graphql" : query.Endpoint;
-
-        while (hasNextPage)
-        {
-            using var request = BuildGraphQlRequest(
-                endpoint,
-                query.ApiKey,
-                GraphQlIssuesQuery,
-                new
-                {
-                    owner = query.Owner,
-                    repo = query.Repo,
-                    states = issueStates,
-                    labels = applyCandidateFilters && query.Labels.Count != 0 ? query.Labels : null,
-                    includePullRequests = query.IncludePullRequests,
-                    first = query.PageSize <= 0 ? 50 : query.PageSize,
-                    after = cursor
-                });
-
-            using var response = await SendAsync(request, cancellationToken);
-            using var document = await ParseGraphQlDocumentAsync(response, cancellationToken);
-
-            var dataElement = GetRequiredObject(document.RootElement, "data");
-            var repositoryElement = GetRequiredObject(dataElement, "repository");
-            var issuesElement = GetRequiredObject(repositoryElement, "issues");
-            var nodesElement = GetRequiredArray(issuesElement, "nodes");
-
-            foreach (var issueNode in nodesElement.EnumerateArray())
-            {
-                var issue = ParseIssue(issueNode, query.IncludePullRequests, $"{query.Owner}/{query.Repo}");
-
-                if (applyCandidateFilters && !MatchesMilestone(issue.Milestone, issueNode, query.Milestone))
-                {
-                    continue;
-                }
-
-                if (applyCandidateFilters && !MatchesLabels(issue.Labels, query.Labels))
-                {
-                    continue;
-                }
-
-                if (!MatchesActiveState(issue.State, states))
-                {
-                    continue;
-                }
-
-                candidateIssues.Add(issue);
-            }
-
-            var pageInfo = GetRequiredObject(issuesElement, "pageInfo");
-            hasNextPage = GetRequiredBoolean(pageInfo, "hasNextPage");
-            if (!hasNextPage)
-            {
-                cursor = null;
-                continue;
-            }
-
-            if (!pageInfo.TryGetProperty("endCursor", out var endCursor))
-            {
-                throw new GitHubTrackerException(
-                    "github_missing_end_cursor",
-                    "GitHub GraphQL pagination payload is missing endCursor.");
-            }
-
-            cursor = endCursor.GetString();
-            if (string.IsNullOrWhiteSpace(cursor))
-            {
-                throw new GitHubTrackerException(
-                    "github_missing_end_cursor",
-                    "GitHub GraphQL pagination payload contained an empty endCursor.");
-            }
-        }
-
-        return candidateIssues;
     }
 
     private static IReadOnlyList<string> ExtractLabelNames(JsonElement issueNode) =>
@@ -1661,10 +1343,25 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
             var response = await httpClient.SendAsync(request, cancellationToken);
             if (!response.IsSuccessStatusCode)
             {
+                // GraphQL usually reports exhaustion as a 200 with a RATE_LIMITED
+                // error (handled in ParseGraphQlDocumentAsync), but the secondary
+                // limit answers 403/429 like REST does. Both must be named a rate
+                // limit, or the caller retries into a clock it cannot move.
+                var statusCode = response.StatusCode;
+                var rateLimited = IsRateLimitedResponse(response, string.Empty);
+                var retryAfter = rateLimited ? ReadRetryAfter(response) : null;
                 response.Dispose();
-                throw new GitHubTrackerException(
-                    "github_api_status",
-                    $"GitHub GraphQL returned HTTP {(int)response.StatusCode}.");
+
+                throw rateLimited
+                    ? new GitHubTrackerException(
+                        GitHubTrackerException.RateLimitedCode,
+                        $"GitHub GraphQL: rate limit exceeded (HTTP {(int)statusCode}).",
+                        retryAfter: retryAfter,
+                        statusCode: (int)statusCode)
+                    : new GitHubTrackerException(
+                        "github_api_status",
+                        $"GitHub GraphQL returned HTTP {(int)statusCode}.",
+                        statusCode: (int)statusCode);
             }
 
             return response;
@@ -1713,7 +1410,11 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
                     rateLimited ? GitHubTrackerException.RateLimitedCode : "github_graphql_errors",
                     string.IsNullOrWhiteSpace(message)
                         ? "GitHub GraphQL returned errors."
-                        : $"GitHub GraphQL: {message}");
+                        : $"GitHub GraphQL: {message}",
+                    // A GraphQL rate limit answers 200 and puts the clock in the
+                    // response headers. Carry it: the pause that follows should be
+                    // the wait GitHub named, not a constant that guesses at it.
+                    retryAfter: rateLimited ? ReadRetryAfter(response) : null);
             }
 
             return document;
