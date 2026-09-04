@@ -177,6 +177,9 @@ body{background:var(--wt-bg);color:var(--wt-ink);
 .wt-sched-state.is-ok{color:var(--wt-ok)}
 .wt-sched-state.is-run{color:var(--wt-accent)}
 .wt-sched-state.is-bad{color:var(--wt-bad)}
+/* Unknown is not an alarm and must not be painted as one: a view too old to
+   judge a scheduler says so quietly and reads as absent, not as failing. */
+.wt-sched-state.is-unknown{color:var(--wt-ink-3)}
 .wt-sched-every{font-size:11.5px;color:var(--wt-ink-3)}
 
 /* ---------- team table ---------- */

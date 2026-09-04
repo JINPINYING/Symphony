@@ -22,7 +22,8 @@ One HTML fragment (no <!doctype>/<html>/<head>/<body> -- the artifact host wraps
 it) containing:
   * the engine's stylesheet and markup, inlined
   * one frozen capture of every endpoint the renderer reads
-  * a shim that answers the renderer's fetches from that capture
+  * a shim that answers the renderer's fetches from that capture, and stubs the
+    renderer's timers except the one that keeps the capture ageing on screen
   * a banner stamping the capture time, so the page cannot pretend to be live
 
 HOW IT FAILS
@@ -77,7 +78,15 @@ READ_ENDPOINTS = (
 # Endpoints that CHANGE something. A snapshot must never appear to accept one:
 # POST /refresh poking a machine the viewer is not on, or PUT /workflow editing
 # the contract, would both be worse than an honest refusal.
-CONTROL_ENDPOINTS = ("/api/v1/refresh", "/api/v1/workflow")
+# /api/v1/actions/directive posts a directive comment to the tracker on the
+# owner's behalf. It is the one control the live page can genuinely ACT with, so
+# a snapshot must refuse it rather than let a phone post into an issue from a
+# frozen page.
+CONTROL_ENDPOINTS = (
+    "/api/v1/refresh",
+    "/api/v1/workflow",
+    "/api/v1/actions/directive",
+)
 
 # Cap on per-issue detail requests, so a large backlog cannot turn one build
 # into hundreds of calls against the engine.
@@ -87,11 +96,54 @@ MAX_ISSUE_DETAILS = 60
 # renderer still emits it. A control that looks live but is inert is worse than
 # an absent one -- and if the renderer renames these, the build must fail rather
 # than quietly ship a page with a working-looking Refresh button.
-#   #workflow-editor  writes the workflow contract back to the engine (PUT)
-#   .ms-controls      the auto-refresh toggle and Refresh button
+#   #workflow-editor           writes the workflow contract back (PUT)
+#   .wt-switch                 the auto-refresh toggle
+#   [data-action=refresh]      "Refresh now", in the header and in the
+#                              staleness banner -- the banner's copy is
+#                              reachable here because that banner keeps running
+#   [data-action=post-directive]  posts a directive comment to the tracker,
+#                              the one control on the page that acts outward
 SNAPSHOT_HIDDEN = (
     ("#workflow-editor", 'id="workflow-editor"'),
-    (".ms-controls", 'class="ms-controls"'),
+    (".wt-switch", 'class="wt-switch"'),
+    ('[data-action="refresh"]', 'data-action="refresh"'),
+    ('[data-action="post-directive"]', 'data-action="post-directive"'),
+)
+
+# The renderer's timers, one entry each, and what a snapshot must do with them.
+#
+# The shim used to stub setInterval globally, which was safe only while the
+# refresh loop was the renderer's ONLY timer. It stopped being so, and the
+# check aborted every build for two days rather than guess - correctly, because
+# the two timers must NOT share a fate:
+#
+#   * the refresh loop has nothing to refresh from in a static capture, and
+#     re-rendering frozen data forever would look live on the viewer's phone;
+#   * the view-age repaint is the honesty mechanism the whole design rests on.
+#     A capture that stops ageing on screen stops being a capture and starts
+#     being a claim about now.
+#
+# So they are named rather than counted. A THIRD timer matches nothing here, the
+# build aborts the way this one did, and someone decides which of the two it is.
+# That abort is the feature: a timer nobody classified is a timer nobody
+# reasoned about, and this file cannot reason about it for them.
+#
+# `callback` is the function NAME the shim matches at runtime, and is required
+# for a timer that keeps running. Anything the shim does not recognise is
+# stubbed, so an unclassified timer fails safe as well as failing loud.
+SNAPSHOT_TIMERS = (
+    {
+        "name": "view-age repaint",
+        "callback": "renderViewAge",
+        "site": r"window\.setInterval\(\s*renderViewAge\s*,",
+        "keep_running": True,
+    },
+    {
+        "name": "auto-refresh loop",
+        "callback": None,
+        "site": r"refreshHandle\s*=\s*window\.setInterval\(",
+        "keep_running": False,
+    },
 )
 
 
@@ -191,17 +243,45 @@ def assert_couplings(index_html: str, dashboard_js: str) -> list[str]:
     """Verify every assumption the shim makes. Returns the checks that passed."""
     passed: list[str] = []
 
-    # 1. The shim stubs setInterval to stop a 15-second refresh loop from
-    #    re-rendering frozen data forever on someone's phone. That stub is only
-    #    safe while the refresh loop is the renderer's ONLY interval.
-    interval_count = len(re.findall(r"\bsetInterval\s*\(", dashboard_js))
-    if interval_count != 1:
-        raise BuildError(
-            f"dashboard.js now calls setInterval {interval_count} times, but the "
-            "snapshot stubs setInterval globally on the basis that the only one is "
-            "the refresh loop. Re-check what the new timer does before shipping."
+    # 1. The shim decides per timer whether it may keep running against frozen
+    #    data. Every call site must therefore be one of the timers named in
+    #    SNAPSHOT_TIMERS -- an unnamed one is an unmade decision.
+    for timer in SNAPSHOT_TIMERS:
+        if timer["keep_running"] and not timer["callback"]:
+            raise BuildError(
+                f"The {timer['name']} timer is meant to keep running in a snapshot, "
+                "but declares no callback name for the shim to match on. Name the "
+                "function in dashboard.js and put it in SNAPSHOT_TIMERS."
+            )
+        hits = len(re.findall(timer["site"], dashboard_js))
+        if hits != 1:
+            raise BuildError(
+                f"dashboard.js should contain exactly one {timer['name']} timer, but "
+                f"{hits} call sites match it. The shim identifies timers one by one, "
+                "so update SNAPSHOT_TIMERS to match what the renderer now does."
+            )
+
+    total = len(re.findall(r"\bsetInterval\s*\(", dashboard_js))
+    if total != len(SNAPSHOT_TIMERS):
+        known = "; ".join(
+            f"{timer['name']} ({'kept running' if timer['keep_running'] else 'stubbed'})"
+            for timer in SNAPSHOT_TIMERS
         )
-    passed.append("setInterval used exactly once (the refresh loop)")
+        raise BuildError(
+            f"dashboard.js calls setInterval {total} times, but the snapshot knows "
+            f"what to do with {len(SNAPSHOT_TIMERS)} of them: {known}. Decide whether "
+            "the new timer must keep running against a frozen capture or be stubbed, "
+            "then add it to SNAPSHOT_TIMERS. A timer nobody classified is a timer "
+            "nobody reasoned about, and this build will not guess."
+        )
+    passed.append(
+        f"all {total} setInterval call sites named and classified ("
+        + ", ".join(
+            f"{timer['name']}: {'live' if timer['keep_running'] else 'stubbed'}"
+            for timer in SNAPSHOT_TIMERS
+        )
+        + ")"
+    )
 
     # 2. Every API path the renderer names must be answerable from the capture,
     #    or the published page shows an error where content should be.
@@ -298,6 +378,10 @@ def render(
 
     hidden_rules = ",".join(selector for selector, _ in SNAPSHOT_HIDDEN) + "{display:none}"
 
+    # Callback names the shim lets through. Everything else is stubbed.
+    live_timers = json.dumps(
+        [timer["callback"] for timer in SNAPSHOT_TIMERS if timer["keep_running"]])
+
     return f"""<title>Symphony Watchtower</title>
 <style>
 {dashboard_css}
@@ -379,10 +463,25 @@ body{{background-color:{SNAPSHOT_GROUND}}}
     return refuse("Not captured in this snapshot: " + path + ".");
   }};
 
-  /* The renderer refreshes itself every 15 seconds. Against frozen data that
-     would re-render the same DOM forever on the viewer's device while looking
-     live. The build asserts this is the renderer's only interval. */
-  window.setInterval = function () {{ return 0; }};
+  /* The renderer has more than one timer and they must not share a fate.
+     The 15-second refresh loop has nothing to refresh from here, so it is
+     stubbed. The view-age repaint must keep running: it is what makes this
+     capture visibly age, and a capture that stops ageing on screen starts
+     reading as a claim about now.
+
+     Matched by callback NAME, which the build asserts still exists. Anything
+     unrecognised is stubbed, so a timer added without classifying it is inert
+     here rather than accidentally live -- though the build aborts first. */
+  var LIVE_TIMERS = {live_timers};
+  var nativeSetInterval = window.setInterval.bind(window);
+
+  window.setInterval = function (handler) {{
+    var name = typeof handler === "function" ? handler.name : "";
+    if (LIVE_TIMERS.indexOf(name) !== -1) {{
+      return nativeSetInterval.apply(null, arguments);
+    }}
+    return 0;
+  }};
 
   /* The honesty stamp: a snapshot that hides its own age is worse than no page. */
   document.addEventListener("DOMContentLoaded", function () {{
