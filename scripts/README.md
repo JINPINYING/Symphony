@@ -26,12 +26,28 @@ rather than a hand-written second page, and a copy step that lived in another
 repository would drift from the thing it copies. Here it moves with it.
 
 **It is designed to fail loudly.** `--check` asserts the couplings the shim
-depends on — that the refresh loop is still the only `setInterval`, that every
-API path the renderer names is captured, that no external assets crept in, and
-that the live controls it hides are still named what it expects. If you change
-the dashboard and this build fails, the failure is the point: read what it says
-and update the builder. A snapshot that publishes anyway would be a page that
-looks right and is not.
+depends on — that every `setInterval` in the renderer is one of the timers named
+in `SNAPSHOT_TIMERS`, that every API path the renderer names is captured, that no
+external assets crept in, and that the live controls it hides are still named
+what it expects. If you change the dashboard and this build fails, the failure is
+the point: read what it says and update the builder. A snapshot that publishes
+anyway would be a page that looks right and is not.
+
+The timers are **named, not counted**. They do not share a fate: the auto-refresh
+loop is stubbed, because a static capture has nothing to refresh from, while the
+view-age repaint stays alive, because a capture that stops ageing on screen stops
+being a capture and starts being a claim about now. A third timer matches neither
+and aborts the build until someone says which it is.
+
+`--check` and the builder's own tests run in CI:
+
+```
+python scripts/build_watchtower_snapshot.py --check
+python -m unittest discover -s scripts -p "test_*.py"
+```
+
+They ran nowhere for the two days this build was broken, and the only thing
+executing it was an unattended publisher whose silence looked like calm.
 
 **What the snapshot is not.** It is read-only by construction: control endpoints
 answer `503` with an explanation, and the workflow editor and refresh controls

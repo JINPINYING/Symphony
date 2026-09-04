@@ -203,9 +203,25 @@ function watchForFrozenTab() {
   window.addEventListener("pageshow", () => void loadDashboard());
   window.addEventListener("focus", () => void loadDashboard());
 
-  // Cheap, and deliberately not the poll: this only repaints the staleness
-  // banner, so it stays correct even when a fetch is what is broken.
-  window.setInterval(renderStalenessBanner, 5000);
+  // Cheap, and deliberately not the poll: this only repaints what depends on
+  // the clock, so it stays correct even when a fetch is what is broken.
+  window.setInterval(renderViewAge, 5000);
+}
+
+/* Everything on the page whose meaning changes purely because time passed, with
+   no new data. Kept separate from render() because it must keep working when
+   nothing is being fetched at all - a frozen tab, or a published snapshot,
+   where this is the only timer still alive.
+
+   The scheduler rows are in here for the same reason the staleness banner is.
+   Their verdicts were computed at capture time, and a verdict that stops being
+   repainted is a verdict that quietly outlives the moment it was true for. */
+function renderViewAge() {
+  renderLiveBadge();
+  renderStalenessBanner();
+  renderHealthPanel();
+  renderTeamPanel();
+  renderUtilityStrip();
 }
 
 // How far past the poll interval the view may drift before it stops being
@@ -218,6 +234,46 @@ function viewAgeMs() {
   if (!stamp) return null;
   const age = Date.now() - new Date(stamp).getTime();
   return Number.isNaN(age) ? null : age;
+}
+
+/* A view cannot know whether a scheduler ran after the data on it was captured.
+ *
+ * The engine decides late-or-not against its own clock, and that verdict is
+ * true for the instant it was made. On a page that has stopped fetching - a
+ * published snapshot, or a tab the browser froze - the verdict stays on screen
+ * while the world moves on, and the page keeps asserting it as if it were now.
+ * Left open long enough, a snapshot reports EVERY scheduler as late, because
+ * every captured last-run time keeps ageing and nothing ever refutes it.
+ *
+ * That is the same fault as the one this panel was built for, pointing the other
+ * way: a task that stops being started looks like a calm system from inside the
+ * engine, and a healthy engine looks like a dead one from inside a stale page.
+ * Both spend the same thing - an alarm that cannot be trusted is one that gets
+ * ignored, and the next one will be real.
+ *
+ * The honest third answer is "unknown". The threshold is the scheduler's OWN
+ * interval, not staleAfterMs: a ninety-second-old view still reports a
+ * fifteen-minute scheduler truthfully, because it cannot have been due since;
+ * a three-hour-old one cannot, because it has been due twelve times.
+ *
+ * Returns the view's age in ms when the scheduler's state can no longer be
+ * claimed, or null when it still can. */
+function schedulerAgedOutMs(task) {
+  const everyMinutes = Number(task?.expect_every_minutes);
+  if (!Number.isFinite(everyMinutes) || everyMinutes <= 0) return null;
+  const age = viewAgeMs();
+  if (age === null || age <= everyMinutes * 60000) return null;
+  return age;
+}
+
+/* Says which of the two it is, and never drops what the capture did report -
+   "unknown now" is not the same as "nothing was known". */
+function schedulerAgedOutWhy(task, ageMs) {
+  const name = task?.name || "This task";
+  const every = Number(task?.expect_every_minutes);
+  return `${name} runs about every ${every} minutes and this view is `
+    + `${formatDurationFromMilliseconds(ageMs)} old, so whether it has run since is unknown. `
+    + `As of the capture: ${task?.explanation || "no explanation was given."}`;
 }
 
 function renderStalenessBanner() {
@@ -891,7 +947,8 @@ function shortRepo(value) {
 }
 
 function sevGlyph(sev) {
-  return sev === "down" ? "&#10007;" : sev === "attention" ? "!" : "&#10003;";
+  return sev === "down" ? "&#10007;" : sev === "attention" ? "!"
+    : sev === "unknown" ? "?" : "&#10003;";
 }
 
 function panelHead(title, iconName, right) {
@@ -1094,21 +1151,33 @@ function renderHealthPanel() {
   const engineOk = state.health?.ok === true;
   /* The engine reports "ok" here, not "healthy" - matching only "healthy"
      painted two on-schedule tasks as late and the whole panel as degraded. */
-  const lateTasks = tasks.filter(t => !WT_HEALTHY.has(String(t.health || "").toLowerCase()));
-  const allOk = !blind && trackerOk && engineOk && lateTasks.length === 0;
+  /* A scheduler this view is too old to speak for is neither late nor on time.
+     Counting it as either is the wolf-cry: see schedulerAgedOutMs. */
+  const agedOut = tasks.filter(t => schedulerAgedOutMs(t) !== null);
+  const lateTasks = tasks.filter(t =>
+    schedulerAgedOutMs(t) === null && !WT_HEALTHY.has(String(t.health || "").toLowerCase()));
+  /* "All systems operational" over a capture too old to judge is the same lie
+     in the other direction, so unknown blocks the clean bill as well. */
+  const problems = !blind && (!trackerOk || !engineOk || lateTasks.length > 0);
+  const tooOld = !blind && !problems && agedOut.length > 0;
+  const allOk = !blind && !problems && !tooOld;
 
   const sched = tasks.map(t => {
+    const agedOutMs = schedulerAgedOutMs(t);
     const status = String(t.status || t.state || "").toLowerCase();
-    const running = status.includes("running");
-    const healthy = WT_HEALTHY.has(String(t.health || "").toLowerCase());
-    const word = running ? "Running" : healthy ? "Ready" : (t.health || "Unknown");
-    const cls = running ? "is-run" : healthy ? "is-ok" : "is-bad";
+    const running = agedOutMs === null && status.includes("running");
+    const healthy = agedOutMs === null && WT_HEALTHY.has(String(t.health || "").toLowerCase());
+    const word = agedOutMs !== null ? "Unknown"
+      : running ? "Running" : healthy ? "Ready" : (t.health || "Unknown");
+    const cls = agedOutMs !== null ? "is-unknown"
+      : running ? "is-run" : healthy ? "is-ok" : "is-bad";
+    const why = agedOutMs !== null ? schedulerAgedOutWhy(t, agedOutMs) : (t.explanation || "");
     return `
       <div class="wt-sched-row">
         <span class="wt-sched-ico" aria-hidden="true">${icon(running ? "radar" : "calendar", 16)}</span>
         <div class="wt-sched-main">
           <div class="wt-sched-name">${escapeHtml(t.name || "Scheduled task")}</div>
-          <div class="wt-sched-why">${escapeHtml(t.explanation || "")}</div>
+          <div class="wt-sched-why">${escapeHtml(why)}</div>
         </div>
         <div class="wt-sched-right">
           <div class="wt-sched-state ${cls}">${escapeHtml(word)}</div>
@@ -1129,9 +1198,13 @@ function renderHealthPanel() {
       </div>`)}
 
     <div class="wt-health-line">
-      <div class="wt-health-state" style="color:${allOk ? "var(--wt-ok)" : blind ? "var(--wt-bad)" : "var(--wt-attn)"}">
-        <span aria-hidden="true">${sevGlyph(allOk ? "clear" : blind ? "down" : "attention")}</span>
-        ${allOk ? "All systems operational" : blind ? "Cannot reach the engine" : "Something needs looking at"}
+      <div class="wt-health-state" style="color:${
+        blind ? "var(--wt-bad)" : problems ? "var(--wt-attn)" : tooOld ? "var(--wt-ink-3)" : "var(--wt-ok)"}">
+        <span aria-hidden="true">${sevGlyph(blind ? "down" : problems ? "attention" : tooOld ? "unknown" : "clear")}</span>
+        ${blind ? "Cannot reach the engine"
+          : problems ? "Something needs looking at"
+            : tooOld ? "Too old to say - the schedulers cannot be judged from this view"
+              : "All systems operational"}
       </div>
       <span class="wt-pill ${allOk ? "sev-ok" : "sev-attention"}">Updated ${escapeHtml(ageLabel)}</span>
     </div>
@@ -1163,14 +1236,27 @@ function renderTeamPanel() {
   const host = document.getElementById("panel-team");
   if (!host) return;
   const staff = state.snapshot?.staff || [];
+  /* Scheduler rows carry the same captured verdict the health panel shows, so
+     they have to age out with it - this is the row that read "ADCP Commander -
+     LATE" off a three-hour-old capture while the scheduler was running fine. */
+  const tasksByName = new Map(
+    (state.snapshot?.watched_tasks || []).map(t => [String(t.name || ""), t]));
 
   const rows = staff.map(m => {
-    const word = { working: "WORKING", idle: "IDLE", waiting: "WAITING", late: "LATE" }[m.state]
+    const task = m.role === "scheduler" ? tasksByName.get(String(m.runner || "")) : undefined;
+    const agedOutMs = task ? schedulerAgedOutMs(task) : null;
+    const word = agedOutMs !== null ? "UNKNOWN"
+      : { working: "WORKING", idle: "IDLE", waiting: "WAITING", late: "LATE" }[m.state]
       || String(m.state || "").toUpperCase();
     /* Idle is the normal, healthy resting state and is deliberately NOT styled
        as a problem - a page that flags calm teaches its reader to ignore it. */
-    const sev = m.state === "working" ? "ok" : m.state === "late" ? "down" : m.state === "waiting" ? "attention" : "";
-    const elapsed = m.elapsed_seconds != null ? formatDurationFromMilliseconds(m.elapsed_seconds * 1000) : "&mdash;";
+    const sev = agedOutMs !== null ? ""
+      : m.state === "working" ? "ok" : m.state === "late" ? "down" : m.state === "waiting" ? "attention" : "";
+    const activity = agedOutMs !== null ? schedulerAgedOutWhy(task, agedOutMs) : (m.activity || "");
+    /* The elapsed column is "how long since it last ran", frozen at capture. It
+       is not wrong so much as unanswerable once the capture has aged out. */
+    const elapsed = agedOutMs !== null ? "&mdash;"
+      : m.elapsed_seconds != null ? formatDurationFromMilliseconds(m.elapsed_seconds * 1000) : "&mdash;";
     return `
       <tr>
         <td>
@@ -1180,7 +1266,7 @@ function renderTeamPanel() {
           </div>
         </td>
         <td><span class="wt-badge ${sev ? "sev-" + sev : ""}">${word}</span></td>
-        <td class="wt-act">${escapeHtml(m.activity || "")}</td>
+        <td class="wt-act">${escapeHtml(activity)}</td>
         <td class="wt-num">${elapsed}</td>
       </tr>`;
   }).join("");
@@ -1438,7 +1524,11 @@ function renderUtilityStrip() {
   const snap = state.snapshot || {};
   const reach = snap.tracker_reachability || {};
   const tasks = snap.watched_tasks || [];
-  const lateTasks = tasks.filter(t => !WT_HEALTHY.has(String(t.health || "").toLowerCase()));
+  // Same three-way answer as the health panel: late, on schedule, or too old to
+  // tell. See schedulerAgedOutMs.
+  const agedOut = tasks.filter(t => schedulerAgedOutMs(t) !== null);
+  const lateTasks = tasks.filter(t =>
+    schedulerAgedOutMs(t) === null && !WT_HEALTHY.has(String(t.health || "").toLowerCase()));
 
   const blind = !state.snapshot;
   const services = [
@@ -1447,8 +1537,11 @@ function renderUtilityStrip() {
       : dotLabel(reach.unreachable_since ? "down" : "ok", `GitHub API ${reach.unreachable_since ? "unreachable" : "reachable"}`),
     blind
       ? dotLabel("down", "Windows Task Scheduler unknown")
-      : dotLabel(lateTasks.length ? "attention" : "ok",
-          `Windows Task Scheduler ${lateTasks.length ? `${lateTasks.length} late` : `${tasks.length} on schedule`}`),
+      : lateTasks.length
+        ? dotLabel("attention", `Windows Task Scheduler ${lateTasks.length} late`)
+        : agedOut.length
+          ? dotLabel("", `Windows Task Scheduler ${agedOut.length} unknown - this view is too old to say`)
+          : dotLabel("ok", `Windows Task Scheduler ${tasks.length} on schedule`),
     dotLabel(state.health?.ok === true ? "ok" : "down", `Engine ${state.health?.label || "unknown"}`)
   ].join("");
 

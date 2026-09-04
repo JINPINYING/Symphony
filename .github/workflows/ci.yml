@@ -36,3 +36,19 @@ jobs:
 
       - name: Test
         run: dotnet test Symphony.slnx --configuration Release --no-build
+
+      # The snapshot builder is coupled to the renderer on purpose and aborts
+      # when the coupling moves. It aborted for two days without anyone seeing
+      # it, because the only thing that ran it was an unattended publisher whose
+      # silence looked like calm. It runs here now, on the change that would
+      # break it, where the failure has a reader.
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Watchtower snapshot couplings
+        run: python scripts/build_watchtower_snapshot.py --check
+
+      - name: Watchtower snapshot builder tests
+        run: python -m unittest discover -s scripts -p "test_*.py" -v

@@ -564,6 +564,76 @@ public sealed class ApiSmokeTests
     }
 
     [Fact]
+    public async Task DashboardJavaScriptAsset_ShouldNotReportASchedulerAsLateFromAViewTooOldToJudgeIt()
+    {
+        // The engine decides late-or-not against its own clock, and that verdict
+        // is true for the instant it was made. A published snapshot keeps it on
+        // screen while the world moves on: the owner read "ADCP Commander -
+        // LATE - it has not run for 3 hours" off a three-hour-old capture of a
+        // scheduler that had in fact run every 15 minutes all day.
+        //
+        // A view that cannot know whether a scheduler ran since must say so.
+        // The threshold is the scheduler's OWN interval, not the generic
+        // staleness one - a 90-second-old view still reports a 15-minute
+        // scheduler truthfully, because it cannot have been due since.
+        var workflowPath = CreateValidWorkflowPath();
+        var dbPath = Path.Combine(Path.GetTempPath(), $"symphony-int-{Guid.NewGuid():N}.db");
+        var stderr = new StringWriter();
+        string? content = null;
+
+        try
+        {
+            var exitCode = await SymphonyHostApplication.RunCliAsync(
+                [workflowPath],
+                stderr,
+                configureBuilder: builder => ConfigureTestServer(builder, dbPath),
+                configureServices: services => RegisterFakeTracker(services),
+                runApplicationAsync: async (app, cancellationToken) =>
+                {
+                    await app.StartAsync(cancellationToken);
+                    using var client = app.GetTestClient();
+                    content = await client.GetStringAsync("/assets/dashboard.js", cancellationToken);
+                    await app.StopAsync(cancellationToken);
+                });
+
+            Assert.True(exitCode == 0, stderr.ToString());
+            Assert.NotNull(content);
+            var javascriptContent = content!;
+
+            // Judged against the scheduler's own interval, from the view's age.
+            Assert.Matches(@"function\s+schedulerAgedOutMs\(task\)", javascriptContent);
+            Assert.Matches(@"age\s*<=\s*everyMinutes\s*\*\s*60000", javascriptContent);
+            Assert.Matches(@"Number\(task\?\.expect_every_minutes\)", javascriptContent);
+
+            // Neither late nor on schedule: an aged-out scheduler is excluded
+            // from the late count, and blocks the clean bill of health as well,
+            // because "All systems operational" over a capture too old to judge
+            // is the same lie pointing the other way.
+            Assert.Matches(
+                @"schedulerAgedOutMs\(t\)\s*===\s*null\s*&&\s*!WT_HEALTHY", javascriptContent);
+            Assert.Matches(@"const\s+allOk\s*=\s*!blind\s*&&\s*!problems\s*&&\s*!tooOld;", javascriptContent);
+            Assert.Contains("Too old to say", javascriptContent, StringComparison.Ordinal);
+
+            // The row the owner actually read is the team table's scheduler row.
+            Assert.Contains("agedOutMs !== null ? \"UNKNOWN\"", javascriptContent, StringComparison.Ordinal);
+
+            // None of it means anything if it is painted once and never again:
+            // the whole failure is a verdict outliving the moment it was true
+            // for, so the age-dependent panels repaint on the clock.
+            Assert.Matches(@"window\.setInterval\(\s*renderViewAge\s*,", javascriptContent);
+            Assert.Matches(
+                @"function\s+renderViewAge\(\)\s*\{[^}]*renderHealthPanel\(\);[^}]*renderTeamPanel\(\);",
+                javascriptContent);
+        }
+        finally
+        {
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            TryDeleteFile(dbPath);
+            TryDeleteFile(workflowPath);
+        }
+    }
+
+    [Fact]
     public async Task DashboardJavaScriptAsset_ShouldIncludeWorkflowEditorActions()
     {
         var workflowPath = CreateValidWorkflowPath();
