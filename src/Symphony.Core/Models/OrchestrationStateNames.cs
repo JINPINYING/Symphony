@@ -23,6 +23,14 @@ public static class RunStatusNames
     // the record says HOW it ended - a person answering, or the question simply
     // going away - which is exactly the attribution this system keeps needing.
     public const string ResolvedByPhaseClear = "resolved_by_phase_clear";
+
+    // Terminal outcome for a run whose escalation could not be acted on because
+    // the source issue stopped being readable: a directive was posted and was
+    // valid, but every attempt to reload the issue from the repository the run
+    // records came back empty - deleted, transferred, or recorded against a
+    // repository it no longer lives in. Kept distinct from ResolvedByDirective
+    // because nothing was resolved: it says the plane stopped asking, and why.
+    public const string AbandonedUnreadableIssue = "abandoned_unreadable_issue";
 }
 
 public static class RunPhaseNames

@@ -487,6 +487,140 @@ public sealed class OrchestrationTickServiceTests
         Assert.Empty(await harness.DbContext.DirectiveLog.ToListAsync());
     }
 
+    // The retry above is the fix for reading a transient empty as a permanent
+    // absence. Unbounded, it is that fault inverted: FetchIssuesByIdsAsync takes
+    // the REST route when it has an issue number, and ReadRestObjectAsync turns a
+    // genuine 404 into the same null a rate limit produces - so a deleted,
+    // transferred or wrongly-recorded issue would be retried for ever, leaving a
+    // directive nobody ever answers and a run parked at needs_command_center being
+    // reprocessed on every tick.
+    //
+    // The bound is attempts AND elapsed time together: attempts alone are set by
+    // the tick interval, and elapsed alone is crossed by one retry after an
+    // overnight outage.
+    [Fact]
+    public async Task RunTickAsync_ShouldStopRetryingADirectiveWhoseIssueStaysUnreadable()
+    {
+        var clock = new MutableTimeProvider(DateTimeOffset.Parse("2026-09-01T10:00:00Z"));
+        var tracker = new FakeTrackerClient([]);
+        tracker.CommentsByIssueId["issue-1"] =
+        [
+            new NormalizedIssueComment(
+                "directive-1",
+                "symphony:directive\naction: resume",
+                "owner-login",
+                "OWNER",
+                DateTimeOffset.Parse("2026-09-01T09:59:00Z"))
+        ];
+
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success),
+            timeProvider: clock);
+
+        await harness.InsertRunAsync("issue-1", "#1", "Open", "instance-1", RunStatusNames.NeedsCommandCenter);
+
+        // Attempts 1 and 2, thirty-five minutes apart: inside the window, so the
+        // directive is still pending and the escalation is still the owner's.
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        clock.Advance(TimeSpan.FromMinutes(35));
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Empty(await harness.DbContext.DirectiveLog.ToListAsync());
+        Assert.Equal(
+            RunStatusNames.NeedsCommandCenter,
+            (await harness.DbContext.Runs.SingleAsync()).Status);
+
+        // Attempt 3 at seventy minutes: three attempts over more than an hour, so
+        // the plane stops asking.
+        clock.Advance(TimeSpan.FromMinutes(35));
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var ledger = Assert.Single(await harness.DbContext.DirectiveLog.ToListAsync());
+        Assert.Equal("consumed_unreadable", ledger.Outcome);
+        Assert.Contains("3 attempts", ledger.Detail);
+
+        var run = await harness.DbContext.Runs.SingleAsync();
+        Assert.Equal(RunStatusNames.AbandonedUnreadableIssue, run.Status);
+        Assert.NotEqual(RunStatusNames.NeedsCommandCenter, run.Status);
+        Assert.NotNull(run.CompletedAtUtc);
+        Assert.Empty(harness.Coordinator.StartRequests);
+
+        // The owner is told which of the three things happened: not "fix your
+        // comment", not "still trying", but how many times the plane asked and
+        // over how long before it gave up.
+        var abandonment = Assert.Single(
+            tracker.PostedComments.Where(comment =>
+                comment.Body.Contains(DirectiveProcessor.AckMarkerFor("directive-1"), StringComparison.Ordinal)));
+        Assert.Contains("Directive abandoned", abandonment.Body);
+        Assert.Contains("3 attempts", abandonment.Body);
+        Assert.Contains("1.2 hours", abandonment.Body);
+        Assert.DoesNotContain("Directive rejected", abandonment.Body);
+        Assert.DoesNotContain("not** been discarded", abandonment.Body);
+
+        // Consumed exactly once: later ticks neither re-answer nor re-count it.
+        clock.Advance(TimeSpan.FromMinutes(35));
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Single(await harness.DbContext.DirectiveLog.ToListAsync());
+        Assert.Single(
+            tracker.PostedComments.Where(comment =>
+                comment.Body.Contains(DirectiveProcessor.AckMarkerFor("directive-1"), StringComparison.Ordinal)));
+    }
+
+    // The bound must not end a retry that is merely slow to be reached. Three
+    // ticks in the same second are three attempts and no elapsed time, and a
+    // directive discarded there would be discarded for a tracker blip.
+    [Fact]
+    public async Task RunTickAsync_ShouldKeepRetryingAnUnreadableIssueInsideTheWindow()
+    {
+        var clock = new MutableTimeProvider(DateTimeOffset.Parse("2026-09-01T10:00:00Z"));
+        var tracker = new FakeTrackerClient([]);
+        tracker.CommentsByIssueId["issue-1"] =
+        [
+            new NormalizedIssueComment(
+                "directive-1",
+                "symphony:directive\naction: resume",
+                "owner-login",
+                "OWNER",
+                DateTimeOffset.Parse("2026-09-01T09:59:00Z"))
+        ];
+
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success),
+            timeProvider: clock);
+
+        await harness.InsertRunAsync("issue-1", "#1", "Open", "instance-1", RunStatusNames.NeedsCommandCenter);
+
+        for (var tick = 0; tick < 5; tick++)
+        {
+            await harness.Service.RunTickAsync(CancellationToken.None);
+            clock.Advance(TimeSpan.FromSeconds(30));
+        }
+
+        Assert.Empty(await harness.DbContext.DirectiveLog.ToListAsync());
+        Assert.Equal(
+            RunStatusNames.NeedsCommandCenter,
+            (await harness.DbContext.Runs.SingleAsync()).Status);
+
+        // One row for the whole outage, not one per tick.
+        var counted = Assert.Single(
+            (await harness.DbContext.EventLog.ToListAsync())
+                .Where(entry => entry.EventName == DirectiveProcessor.UnreadableDirectiveEvent));
+        Assert.Contains("5 attempts", counted.Message);
+
+        // And the read coming back inside the window still dispatches the same
+        // comment: the count is a bound, not a state the directive cannot leave.
+        tracker.IssuesById["issue-1"] = BuildIssue("issue-1", "#1", "Open", null);
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Single(harness.Coordinator.StartRequests);
+        Assert.Equal("consumed_dispatched", (await harness.DbContext.DirectiveLog.SingleAsync()).Outcome);
+    }
+
     // Symphony#50. A directive asked for `review`, the ack said `review`, and the
     // run that followed was `implementation` attempt 2 on an issue that already had
     // an open PR - the exact condition that had escalated it. The phase survived the
@@ -3745,10 +3879,13 @@ public sealed class OrchestrationTickServiceTests
                     tracker,
                     TimeProvider.System,
                     NullLogger<EscalationPublisher>.Instance),
+                // The test clock, not the wall clock: the directive processor's
+                // unreadable-reload bound is measured in elapsed time, and a test
+                // that has to wait an hour of real time is a test nobody runs.
                 new DirectiveProcessor(
                     dbContext,
                     tracker,
-                    TimeProvider.System,
+                    clock,
                     NullLogger<DirectiveProcessor>.Instance),
                 new PhaseOrchestrator(
                     dbContext,

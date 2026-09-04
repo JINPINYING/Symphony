@@ -24,7 +24,11 @@ public sealed record DirectiveDispatchContext(
 // between acting and recording. A malformed directive is answered with the parse
 // error and consumed — the processor never guesses. A directive that cannot be
 // acted on yet (no free agent slot, claim refused, tracker outage) stays
-// unconsumed and is retried by the ordinary tick loop.
+// unconsumed and is retried by the ordinary tick loop. The one retry that is
+// bounded is the issue reload: it cannot tell a rate limit from an issue that no
+// longer exists, so after UnreadableDirectiveMinimumAttempts attempts over
+// UnreadableDirectiveRetryWindow it is answered and consumed rather than retried
+// for ever.
 public sealed class DirectiveProcessor(
     SymphonyDbContext dbContext,
     IGitHubTrackerClient trackerClient,
@@ -58,6 +62,35 @@ public sealed class DirectiveProcessor(
     // Long enough that a directive parked behind a busy queue does not add a row
     // per tick, short enough that the marker stays well inside the window above.
     private static readonly TimeSpan PendingDirectiveRefresh = TimeSpan.FromMinutes(5);
+
+    /// <summary>
+    /// The event name the failed reloads of one directive's issue are counted
+    /// under. One row per directive comment, rewritten in place.
+    /// </summary>
+    public const string UnreadableDirectiveEvent = "directive_unreadable";
+
+    /// <summary>
+    /// How long the plane keeps re-reading an issue it cannot read before it stops
+    /// asking.
+    ///
+    /// An hour outlasts a GitHub REST rate-limit window, which is the longest
+    /// routine outage this read can hit; anything still empty after that is not
+    /// waiting on a quota.
+    /// </summary>
+    public static readonly TimeSpan UnreadableDirectiveRetryWindow = TimeSpan.FromHours(1);
+
+    /// <summary>
+    /// How many empty reloads must be seen before the window above can end the
+    /// retry.
+    ///
+    /// The window alone is crossed by a single retry after the plane has been down
+    /// overnight, which would abandon a directive on the strength of one failed
+    /// read. Attempts alone mean nothing, because the tick interval is
+    /// configuration - three of them is seconds in a test and half an hour in
+    /// production. Both together say what the abandonment notice claims: the plane
+    /// asked repeatedly, over a real stretch of time, and never got an answer.
+    /// </summary>
+    public const int UnreadableDirectiveMinimumAttempts = 3;
 
     public static string AckMarkerFor(string commentId) => $"<!-- symphony:directive-ack:{commentId} -->";
 
@@ -278,28 +311,8 @@ public sealed class DirectiveProcessor(
         var issue = issues.FirstOrDefault();
         if (issue is null)
         {
-            // NOT a consumption. A read that comes back empty says nothing about
-            // the directive: the tracker may be rate limited, flaky, or - as it was
-            // for every non-primary repository - being asked the wrong question.
-            // Discarding the directive here was permanent, and left the owner an
-            // ack saying the issue could not be reloaded and no way to retry except
-            // posting the comment again into the same discard.
-            //
-            // Only the comment text can make a directive invalid, and that is
-            // decided by the parser above, with no network call.
-            logger.LogWarning(
-                "Directive {CommentId} on {IssueIdentifier} could not reload the issue from {Repository}; " +
-                "it stays pending and will retry next tick.",
-                comment.Id, issueIdentifier, TrackerQuerySet.KeyOf(query));
-            await RecordPendingDirectiveAsync(
-                comment.Id, issueId, issueIdentifier, action,
-                $"the source issue could not be read back from {TrackerQuerySet.KeyOf(query)}",
-                cancellationToken);
-            await PostDeferralNoticeAsync(
-                query, comment, comments, issueId,
-                $"the plane could not read {issueIdentifier} back from `{TrackerQuerySet.KeyOf(query)}` to act on it",
-                cancellationToken);
-            return false;
+            return await HandleUnreadableIssueAsync(
+                query, comment, comments, parsed, stuckRuns, cancellationToken);
         }
 
         // A read that succeeded and says "Closed" is an answer, not a failure, so
@@ -337,29 +350,241 @@ public sealed class DirectiveProcessor(
         return true;
     }
 
+    /// <summary>
+    /// The reload came back empty: retry the directive, but not for ever.
+    /// </summary>
+    /// <remarks>
+    /// An empty read says nothing about the directive, so consuming it here was
+    /// the original defect - the tracker may be rate limited, flaky, or, as it was
+    /// for every non-primary repository, being asked the wrong question. Only the
+    /// comment text can make a directive invalid, and the parser decides that with
+    /// no network call.
+    ///
+    /// But an empty read says nothing about the ISSUE either, and this one cannot
+    /// tell the two apart: <c>ReadRestObjectAsync</c> turns a genuine 404 into the
+    /// same null a rate limit produces. Retrying for ever is the first defect
+    /// inverted - a permanent absence read as a transient empty - and leaves a
+    /// directive that is never answered and a run parked at
+    /// <see cref="RunStatusNames.NeedsCommandCenter"/>, reprocessed every tick,
+    /// for good.
+    ///
+    /// So the retry is bounded by
+    /// <see cref="UnreadableDirectiveMinimumAttempts"/> attempts AND
+    /// <see cref="UnreadableDirectiveRetryWindow"/> of elapsed time, and when the
+    /// bound is spent the directive IS consumed - with its own wording, which says
+    /// how many times the plane asked and over how long, and which is neither the
+    /// rejection ("fix your comment") nor the deferral ("still trying").
+    /// </remarks>
+    private async Task<bool> HandleUnreadableIssueAsync(
+        TrackerQuery query,
+        NormalizedIssueComment comment,
+        IReadOnlyList<NormalizedIssueComment> comments,
+        DirectiveParseResult parsed,
+        List<RunEntity> stuckRuns,
+        CancellationToken cancellationToken)
+    {
+        var issueId = stuckRuns[0].IssueId;
+        var issueIdentifier = stuckRuns[0].IssueIdentifier;
+        var action = parsed.Action!;
+        var repositoryKey = TrackerQuerySet.KeyOf(query);
+
+        var reload = await RecordUnreadableReloadAsync(
+            comment.Id, issueId, issueIdentifier, action, repositoryKey, cancellationToken);
+
+        if (!reload.Exhausted)
+        {
+            logger.LogWarning(
+                "Directive {CommentId} on {IssueIdentifier} could not reload the issue from {Repository} " +
+                "(attempt {Attempts}); it stays pending and will retry next tick.",
+                comment.Id, issueIdentifier, repositoryKey, reload.Attempts);
+            await RecordPendingDirectiveAsync(
+                comment.Id, issueId, issueIdentifier, action,
+                $"the source issue could not be read back from {repositoryKey}",
+                cancellationToken);
+            await PostDeferralNoticeAsync(
+                query, comment, comments, issueId,
+                $"the plane could not read {issueIdentifier} back from `{repositoryKey}` to act on it",
+                cancellationToken);
+            return false;
+        }
+
+        var attemptSummary = $"{reload.Attempts} attempts over {DescribeElapsed(reload.Elapsed)}";
+        logger.LogWarning(
+            "Directive {CommentId} on {IssueIdentifier} is abandoned: the issue could not be read from " +
+            "{Repository} in {AttemptSummary}. The escalated run(s) are recorded as {Status}.",
+            comment.Id, issueIdentifier, repositoryKey, attemptSummary, RunStatusNames.AbandonedUnreadableIssue);
+
+        SettleStuckRuns(
+            stuckRuns,
+            RunStatusNames.AbandonedUnreadableIssue,
+            "abandoned_unreadable_issue",
+            $"Directive comment {comment.Id} was abandoned: {issueIdentifier} could not be read from " +
+            $"{repositoryKey} in {attemptSummary}.");
+        await AckAsync(
+            query, comment, issueId,
+            $"**Directive abandoned:** the plane could not read {issueIdentifier} back from " +
+            $"`{repositoryKey}` in {attemptSummary}, so it has stopped retrying and consumed this directive.\n\n" +
+            "Your comment parsed correctly — this is not a rejection, and nothing was dispatched. A read that " +
+            "never succeeds usually means the issue was deleted, transferred, or is recorded against a " +
+            $"repository it no longer lives in. Check that {issueIdentifier} is visible in `{repositoryKey}`, " +
+            "then post a fresh `symphony:directive` block. The escalated run(s) are recorded as " +
+            $"`{RunStatusNames.AbandonedUnreadableIssue}` rather than left parked for ever.",
+            cancellationToken);
+        await RecordConsumptionAsync(
+            comment.Id, issueId, issueIdentifier, action, parsed.Phase,
+            "consumed_unreadable",
+            $"the source issue could not be read from {repositoryKey} in {attemptSummary}",
+            cancellationToken);
+        return true;
+    }
+
+    /// <summary>
+    /// Count this failed reload against the bound, durably, and say whether the
+    /// bound is now spent.
+    /// </summary>
+    /// <remarks>
+    /// One row per directive comment, rewritten rather than appended - the tick
+    /// runs every few seconds and an hour of it must not be an hour of rows. The
+    /// count and the first-attempt time live in DataJson rather than in the
+    /// message, for the same reason the pending marker's comment id does: a value
+    /// recovered by parsing prose breaks the next time somebody improves the
+    /// wording. A pruned or lost row only restarts the count, which lengthens the
+    /// retry rather than shortening it.
+    /// </remarks>
+    private async Task<UnreadableReloadOutcome> RecordUnreadableReloadAsync(
+        string commentId,
+        string issueId,
+        string issueIdentifier,
+        string action,
+        string repositoryKey,
+        CancellationToken cancellationToken)
+    {
+        var nowUtc = timeProvider.GetUtcNow();
+
+        // Matched on the deserialized comment id rather than on the serialized
+        // payload, because the payload changes on every attempt.
+        var recorded = await dbContext.EventLog
+            .Where(entry => entry.EventName == UnreadableDirectiveEvent && entry.IssueId == issueId)
+            .OrderByDescending(entry => entry.Id)
+            .ToListAsync(cancellationToken);
+
+        EventLogEntity? existing = null;
+        UnreadableDirectiveState? state = null;
+        foreach (var entry in recorded)
+        {
+            var candidate = ReadUnreadableDirectiveState(entry.DataJson);
+            if (candidate is not null && string.Equals(candidate.CommentId, commentId, StringComparison.Ordinal))
+            {
+                existing = entry;
+                state = candidate;
+                break;
+            }
+        }
+
+        var attempts = (state?.Attempts ?? 0) + 1;
+        var firstAttemptAtUtc = state?.FirstAttemptAtUtc ?? nowUtc;
+        var elapsed = nowUtc - firstAttemptAtUtc;
+        var exhausted = attempts >= UnreadableDirectiveMinimumAttempts && elapsed >= UnreadableDirectiveRetryWindow;
+
+        var payload = JsonSerializer.Serialize(
+            new UnreadableDirectiveState(commentId, attempts, firstAttemptAtUtc));
+        var message =
+            $"Directive comment {commentId} ({action}): {issueIdentifier} could not be read from {repositoryKey} " +
+            $"on {attempts} attempts over {DescribeElapsed(elapsed)}" +
+            (exhausted ? "; the retry bound is spent and the directive is being consumed." : "; retrying next tick.");
+
+        if (existing is not null)
+        {
+            existing.Message = message;
+            existing.OccurredAtUtc = nowUtc;
+            existing.DataJson = payload;
+        }
+        else
+        {
+            dbContext.EventLog.Add(new EventLogEntity
+            {
+                IssueId = issueId,
+                IssueIdentifier = issueIdentifier,
+                EventName = UnreadableDirectiveEvent,
+                Level = LogLevel.Warning.ToString(),
+                Message = message,
+                DataJson = payload,
+                OccurredAtUtc = nowUtc
+            });
+        }
+
+        await dbContext.SaveChangesAsync(cancellationToken);
+        return new UnreadableReloadOutcome(attempts, elapsed, exhausted);
+    }
+
+    private static UnreadableDirectiveState? ReadUnreadableDirectiveState(string? dataJson)
+    {
+        if (string.IsNullOrWhiteSpace(dataJson))
+        {
+            return null;
+        }
+
+        try
+        {
+            return JsonSerializer.Deserialize<UnreadableDirectiveState>(dataJson);
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>How many times a directive's issue has failed to reload, and since when.</summary>
+    public sealed record UnreadableDirectiveState(string CommentId, int Attempts, DateTimeOffset FirstAttemptAtUtc);
+
+    private sealed record UnreadableReloadOutcome(int Attempts, TimeSpan Elapsed, bool Exhausted);
+
+    // Reported to the owner, so it reads as a person would say it rather than as
+    // "01:04:37.2190000".
+    private static string DescribeElapsed(TimeSpan elapsed) => elapsed switch
+    {
+        { TotalMinutes: < 1 } => "under a minute",
+        { TotalHours: < 1 } => DescribeQuantity(elapsed.TotalMinutes, "minute"),
+        { TotalDays: < 1 } => DescribeQuantity(elapsed.TotalHours, "hour"),
+        _ => DescribeQuantity(elapsed.TotalDays, "day")
+    };
+
+    private static string DescribeQuantity(double value, string unit)
+    {
+        var rounded = Math.Round(value, 1);
+        return $"{rounded:0.#} {unit}{(rounded == 1 ? string.Empty : "s")}";
+    }
+
     // The run that last said anything about this issue. Its phase is where a
     // `resume` picks up, and its repository is the one every tracker call for this
     // issue has to be aimed at.
     private static RunEntity LatestRun(List<RunEntity> stuckRuns) =>
         stuckRuns.OrderByDescending(run => run.LastEventAtUtc ?? run.StartedAtUtc).First();
 
-    private void ResolveStuckRuns(List<RunEntity> stuckRuns, string reason)
+    private void ResolveStuckRuns(List<RunEntity> stuckRuns, string reason) =>
+        SettleStuckRuns(stuckRuns, RunStatusNames.ResolvedByDirective, "resolved_by_directive", reason);
+
+    // Move the escalated runs off needs_command_center. The status is a parameter
+    // because an answered escalation and an abandoned one are not the same record:
+    // one was resolved, the other only stopped being asked about.
+    private void SettleStuckRuns(List<RunEntity> stuckRuns, string status, string lastEvent, string reason)
     {
         var nowUtc = timeProvider.GetUtcNow();
         foreach (var run in stuckRuns)
         {
-            run.Status = RunStatusNames.ResolvedByDirective;
+            run.Status = status;
             run.CompletedAtUtc ??= nowUtc;
-            run.LastEvent = "resolved_by_directive";
+            run.LastEvent = lastEvent;
             run.LastMessage = reason;
             run.LastEventAtUtc = nowUtc;
         }
     }
 
     // Consumption is permanent, so it is reserved for directives the plane can
-    // answer for good: a comment the parser refuses, or an issue GitHub says is
-    // closed. Anything that only means "not right now" defers instead - see
-    // PostDeferralNoticeAsync.
+    // answer for good: a comment the parser refuses, an issue GitHub says is
+    // closed, or - through HandleUnreadableIssueAsync - one whose issue stayed
+    // unreadable past the retry bound. Anything that only means "not right now"
+    // defers instead - see PostDeferralNoticeAsync.
     private async Task ConsumeInvalidDirectiveAsync(
         TrackerQuery query,
         NormalizedIssueComment comment,
@@ -421,8 +646,10 @@ public sealed class DirectiveProcessor(
 
         var body =
             $"{marker}\n**Directive accepted, not yet executed:** {reason}.\n\n" +
-            "The directive has **not** been discarded — the plane retries it on every tick until the read succeeds. " +
-            "Nothing needs reposting.\n\n— Symphony directive processor";
+            "The directive has **not** been discarded — the plane retries it on every tick. Nothing needs " +
+            $"reposting. If the read has still not succeeded after {DescribeElapsed(UnreadableDirectiveRetryWindow)} " +
+            "the plane stops asking and says so in a separate comment; until then this is the only notice.\n\n" +
+            "— Symphony directive processor";
 
         try
         {
