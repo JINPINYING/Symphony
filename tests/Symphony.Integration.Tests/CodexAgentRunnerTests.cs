@@ -478,6 +478,106 @@ public sealed class CodexAgentRunnerTests
         Assert.Contains(updates, update => update.EventType == "turn_completed");
     }
 
+    // ADCP#29, the regression this issue exists for. On 2026-09-04 the Codex
+    // account was out of quota; the app-server returned cleanly carrying the
+    // usage-limit error, so four reviews were recorded `Succeeded` with 0/0/0
+    // tokens and no verdict comment - and the phase machine escalated the
+    // reviewer for a contract violation it was never given the chance to break.
+    [Fact]
+    public async Task RunIssueAsync_ShouldNotSucceedWhenTheAppServerReturnsAUsageLimit()
+    {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            return;
+        }
+
+        var runner = CreateRunner();
+        using var harness = CreateAppServerHarness(UsageLimitScript());
+
+        var result = await runner.RunIssueAsync(
+            CreateRequest("id-10", "#10", harness.WorkspacePath, harness.Command, TurnTimeoutMs));
+
+        Assert.False(result.Success, "a runner that refused on quota did not run");
+        Assert.Equal("runner_quota_exhausted", result.ErrorCode);
+
+        // The cause has to survive into the run record, because that is what the
+        // phase machine reads to decide "hold and retry" instead of "escalate".
+        Assert.Contains("usage limit", result.Stderr, StringComparison.OrdinalIgnoreCase);
+        Assert.True(AgentQuotaSignals.IsQuotaExhaustion(result.Stderr));
+    }
+
+    // The floor beneath the case above: whatever shape a refusal arrives in, a
+    // session that consumed no tokens and produced no output did not run.
+    [Fact]
+    public async Task RunIssueAsync_ShouldNotSucceedWhenTheAppServerProducedNothingAtAll()
+    {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            return;
+        }
+
+        var runner = CreateRunner();
+        using var harness = CreateAppServerHarness(SilentCompletionScript());
+
+        var result = await runner.RunIssueAsync(
+            CreateRequest("id-11", "#11", harness.WorkspacePath, harness.Command, TurnTimeoutMs));
+
+        Assert.False(result.Success, "0 tokens and no assistant output is not a success");
+        Assert.Equal("no_agent_activity", result.ErrorCode);
+        Assert.Contains("no_agent_activity", result.Stderr, StringComparison.Ordinal);
+    }
+
+    // The CLI path exits 1 on a usage limit, so it already failed - but under the
+    // generic code, which reads as an ordinary defect to repair rather than a
+    // refusal to wait out.
+    [Fact]
+    public async Task RunIssueAsync_ShouldClassifyAShellUsageLimitAsAQuotaRefusal()
+    {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            return;
+        }
+
+        var workspace = Directory.CreateDirectory(Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid():N}-runner"));
+        var runner = CreateRunner();
+
+        var result = await runner.RunIssueAsync(CreateRequest(
+            "id-12",
+            "#12",
+            workspace.FullName,
+            "echo ERROR: You've hit your usage limit. Try again at 7:24 PM. && exit /b 1",
+            30_000));
+
+        Assert.False(result.Success);
+        Assert.Equal("runner_quota_exhausted", result.ErrorCode);
+    }
+
+    // The quota signals are text matches, and an agent reviewing THIS issue writes
+    // "usage limit" a dozen times. A run that finished must not be re-read as a
+    // refusal because of what it said - only a run that already failed is
+    // re-classified.
+    [Fact]
+    public async Task RunIssueAsync_ShouldNotTreatAgentProseAboutUsageLimitsAsARefusal()
+    {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            return;
+        }
+
+        var workspace = Directory.CreateDirectory(Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid():N}-runner"));
+        var runner = CreateRunner();
+
+        var result = await runner.RunIssueAsync(CreateRequest(
+            "id-13",
+            "#13",
+            workspace.FullName,
+            "echo The reviewer must hold on a usage limit rather than escalate it.",
+            30_000));
+
+        Assert.True(result.Success, result.Stderr);
+        Assert.Null(result.ErrorCode);
+    }
+
     [Fact]
     public void CodexProtocolValueNormalizer_ShouldNormalizeSandboxValuesForCurrentAppServerProtocol()
     {
@@ -649,6 +749,41 @@ public sealed class CodexAgentRunnerTests
                 @{ id = $request.id; result = @{ turn = @{ id = 'turn-1' } } } | ConvertTo-Json -Compress
                 @{ method = 'thread/tokenUsage/updated'; params = @{ threadId = 'thread-1'; turnId = 'turn-1'; tokenUsage = @{ total = @{ inputTokens = 11; cachedInputTokens = 3; outputTokens = 7; reasoningOutputTokens = 2; totalTokens = 18 }; last = @{ inputTokens = 5; cachedInputTokens = 1; outputTokens = 3; reasoningOutputTokens = 1; totalTokens = 8 }; modelContextWindow = 258400 } } } | ConvertTo-Json -Depth 6 -Compress
                 @{ method = 'turn/completed'; params = @{ message = 'done' } } | ConvertTo-Json -Compress
+                continue
+            }
+            if ($request.method -eq 'shutdown') { @{ id = $request.id; result = @{ ok = $true } } | ConvertTo-Json -Compress; break }
+        }
+        """;
+
+    // The app-server behaviour that produced the incident: it accepts the turn,
+    // reports it complete, and carries the usage-limit refusal in the payload.
+    // Nothing about the exit code says anything went wrong.
+    private static string UsageLimitScript() => """
+        while (($line = [Console]::In.ReadLine()) -ne $null) {
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            $request = $line | ConvertFrom-Json
+            if ($request.method -eq 'initialize') { @{ id = $request.id; result = @{ serverInfo = @{ name = 'fake'; version = '1.0' } } } | ConvertTo-Json -Compress; continue }
+            if ($request.method -eq 'thread/start') { @{ id = $request.id; result = @{ thread = @{ id = 'thread-1' } } } | ConvertTo-Json -Compress; continue }
+            if ($request.method -eq 'turn/start') {
+                @{ id = $request.id; result = @{ turn = @{ id = 'turn-1' } } } | ConvertTo-Json -Compress
+                @{ method = 'turn/completed'; params = @{ turn = @{ id = 'turn-1' }; error = @{ type = 'usage_limit_reached'; message = "You've hit your usage limit. Upgrade to Pro or try again at 7:24 PM." } } } | ConvertTo-Json -Depth 6 -Compress
+                continue
+            }
+            if ($request.method -eq 'shutdown') { @{ id = $request.id; result = @{ ok = $true } } | ConvertTo-Json -Compress; break }
+        }
+        """;
+
+    // Completes the turn without saying anything and without reporting a token:
+    // no error to recognise, and still nothing that can be called a review.
+    private static string SilentCompletionScript() => """
+        while (($line = [Console]::In.ReadLine()) -ne $null) {
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            $request = $line | ConvertFrom-Json
+            if ($request.method -eq 'initialize') { @{ id = $request.id; result = @{ serverInfo = @{ name = 'fake'; version = '1.0' } } } | ConvertTo-Json -Compress; continue }
+            if ($request.method -eq 'thread/start') { @{ id = $request.id; result = @{ thread = @{ id = 'thread-1' } } } | ConvertTo-Json -Compress; continue }
+            if ($request.method -eq 'turn/start') {
+                @{ id = $request.id; result = @{ turn = @{ id = 'turn-1' } } } | ConvertTo-Json -Compress
+                @{ method = 'turn/completed'; params = @{ turn = @{ id = 'turn-1' } } } | ConvertTo-Json -Depth 6 -Compress
                 continue
             }
             if ($request.method -eq 'shutdown') { @{ id = $request.id; result = @{ ok = $true } } | ConvertTo-Json -Compress; break }

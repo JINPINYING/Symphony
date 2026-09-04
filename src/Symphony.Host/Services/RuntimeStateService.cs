@@ -710,7 +710,13 @@ public sealed class RuntimeStateService(
                     waiting_on = phaseRows.FirstOrDefault(p =>
                         string.Equals(p.IssueId, entry.IssueId, StringComparison.OrdinalIgnoreCase) &&
                         p.Stage != PhaseStages.Merged && p.Stage != PhaseStages.Closed) is { } phase
-                        ? $"in the pipeline at {phase.Stage.Replace('_', ' ')}"
+                        // A phase deliberately waiting out an exhausted runner is
+                        // not the same as one making progress, and reporting both
+                        // as "in the pipeline at awaiting review" is how a stopped
+                        // plane looked like a working one for an hour (ADCP#29).
+                        ? phase.HoldUntilUtc is { } holdUntil && holdUntil > generatedAt
+                            ? $"held until {holdUntil:u}: runner '{phase.HoldRunner ?? "unknown"}' is out of quota"
+                            : $"in the pipeline at {phase.Stage.Replace('_', ' ')}"
                         : runningRuns.Count > 0
                             ? "waiting for a free slot"
                             : "next to be picked up"

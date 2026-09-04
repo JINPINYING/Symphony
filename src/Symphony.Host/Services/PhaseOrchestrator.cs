@@ -59,6 +59,36 @@ public sealed class PhaseOrchestrator(
     public static readonly TimeSpan StuckStageTimeout = TimeSpan.FromHours(2);
 
     /// <summary>
+    /// How long one runner-quota cause may hold a phase before it stops being the
+    /// plane's problem and becomes the owner's.
+    ///
+    /// Six hours: every published usage window resets well inside it, so anything
+    /// still holding by then is not a window at all - it is an account with no
+    /// credit, and buying credit is an owner decision no directive can make.
+    /// </summary>
+    public static readonly TimeSpan RunnerQuotaHoldTimeout = TimeSpan.FromHours(6);
+
+    /// <summary>
+    /// Recorded on the ledger while a phase is waiting out a runner refusal.
+    /// Persisted, so renaming it silently turns every hold into a fresh one.
+    /// </summary>
+    public const string RunnerQuotaHoldReason = "runner_quota_exhausted";
+
+    /// <summary>The event a quota hold, and its expiry, are recorded under.</summary>
+    public const string RunnerQuotaHoldEventName = "phase_runner_quota_hold";
+
+    /// <summary>
+    /// The event that says a quota cause has already been raised with the owner.
+    ///
+    /// One exhausted account blocks every phase at once. On 2026-09-04 that
+    /// produced four escalations in fifty minutes for one cause, and a board that
+    /// reports one fact four times is a board people stop reading. Every later
+    /// ledger blocked by the same runner in the same window holds quietly against
+    /// this row instead of raising its own.
+    /// </summary>
+    public const string RunnerQuotaEscalatedEventName = "phase_runner_quota_escalated";
+
+    /// <summary>
     /// The event name a phase escalation and its reason are recorded under.
     ///
     /// Read back by the status page, so it is a persisted value and not just a log
@@ -651,6 +681,15 @@ public sealed class PhaseOrchestrator(
             return;
         }
 
+        // A phase that is deliberately waiting out a transient runner refusal is not
+        // stuck and must not be read as such, so this runs before the backstop
+        // below. ADCP#29: an exhausted vendor account is a clock, not a decision.
+        if (ledger.HoldUntilUtc is not null &&
+            !await ReleaseRunnerHoldIfDueAsync(ledger, cancellationToken))
+        {
+            return;
+        }
+
         // Backstop: a stage that has not moved in a long time is stuck, whatever it
         // believes it is waiting for.
         //
@@ -927,6 +966,18 @@ public sealed class PhaseOrchestrator(
                     $"No {reviewPhase} run found for PR #{ledger.PrNumber}; re-dispatching the review.");
                 await dbContext.SaveChangesAsync(cancellationToken);
             }
+            else if (IsRunnerQuotaRefusal(latestReview))
+            {
+                // ADCP#29. Nobody violated a contract and nothing needs repairing:
+                // the reviewer's account was out of quota and the run never
+                // started. That clears on a clock, so the phase waits for the clock
+                // rather than asking a person for a decision that does not exist.
+                await HoldForRunnerQuotaAsync(
+                    ledger,
+                    latestReview,
+                    $"the {reviewPhase} of PR #{ledger.PrNumber}",
+                    cancellationToken);
+            }
             else if (latestReview.Status is RunStatusNames.Running or RunStatusNames.Retrying)
             {
                 // Genuinely still working. This is the only reason to keep waiting.
@@ -978,6 +1029,11 @@ public sealed class PhaseOrchestrator(
 
         ledger.LastVerdict = verdict;
         ledger.LastVerdictHeadSha = ledger.HeadSha;
+
+        // A verdict is the phase moving, so whatever it was waiting out is over.
+        // Cleared here and only here: a dispatch that merely started again proves
+        // nothing, because the next run can refuse on the same empty account.
+        ClearRunnerHold(ledger);
 
         switch (verdict)
         {
@@ -1122,6 +1178,19 @@ public sealed class PhaseOrchestrator(
             .ToListAsync(cancellationToken);
         var latestRepair = repairRuns.OrderByDescending(run => run.StartedAtUtc).FirstOrDefault();
 
+        // ADCP#29, same rule as the reviewing stage: a repair that never ran
+        // because the implementer's account was out of quota is a wait, not a
+        // failure, and the single bounded repair has not been spent on it.
+        if (latestRepair is not null && IsRunnerQuotaRefusal(latestRepair))
+        {
+            await HoldForRunnerQuotaAsync(
+                ledger,
+                latestRepair,
+                $"the bounded repair of PR #{ledger.PrNumber}",
+                cancellationToken);
+            return;
+        }
+
         if (latestRepair is not null &&
             latestRepair.Status is RunStatusNames.Failed or RunStatusNames.TimedOut or RunStatusNames.Stalled or RunStatusNames.NeedsCommandCenter)
         {
@@ -1217,6 +1286,197 @@ public sealed class PhaseOrchestrator(
         await dbContext.SaveChangesAsync(cancellationToken);
     }
 
+    /// <summary>
+    /// Did this run end because its vendor account was out of quota?
+    /// </summary>
+    /// <remarks>
+    /// Read from what the runner recorded, not from the status: the whole point of
+    /// ADCP#29 is that the status was the thing lying. A refusal reaches here as
+    /// the run's last message, which is the runner's redacted stderr.
+    /// </remarks>
+    private static bool IsRunnerQuotaRefusal(RunEntity run) =>
+        run.Status is not RunStatusNames.Running &&
+        AgentQuotaSignals.IsQuotaExhaustion(run.LastMessage);
+
+    /// <summary>
+    /// Park the phase where it is until the refusal's own clock says to ask again.
+    /// </summary>
+    private async Task HoldForRunnerQuotaAsync(
+        PhaseLedgerEntity ledger,
+        RunEntity refusedRun,
+        string what,
+        CancellationToken cancellationToken)
+    {
+        var nowUtc = timeProvider.GetUtcNow();
+        var resumeAtUtc = AgentQuotaReset.Resolve(refusedRun.LastMessage, nowUtc);
+        var runner = string.IsNullOrWhiteSpace(refusedRun.Runner) ? "unknown" : refusedRun.Runner;
+
+        // Held since the FIRST refusal of this run of holds, not this one. A window
+        // that keeps being renewed is the signal that it is not a window.
+        ledger.HoldSinceUtc ??= nowUtc;
+        if (nowUtc - ledger.HoldSinceUtc.Value > RunnerQuotaHoldTimeout)
+        {
+            await EscalateRunnerQuotaAsync(ledger, runner, resumeAtUtc, what, cancellationToken);
+            return;
+        }
+
+        ledger.HoldUntilUtc = resumeAtUtc;
+        ledger.HoldReason = RunnerQuotaHoldReason;
+        ledger.HoldRunner = runner;
+
+        // Back to the stage that asks, so the hold expiring is all it takes to try
+        // again. Left at `reviewing` the ledger would wait on a run that is over.
+        if (ledger.Stage == PhaseStages.Reviewing)
+        {
+            ledger.Stage = PhaseStages.AwaitingReview;
+        }
+
+        ledger.UpdatedAtUtc = nowUtc;
+        AddPhaseEvent(ledger.IssueId, ledger.IssueIdentifier, RunnerQuotaHoldEventName,
+            $"Runner '{runner}' is out of quota, so {what} is held rather than escalated. " +
+            $"Retrying after {resumeAtUtc:u} (held since {ledger.HoldSinceUtc.Value:u}). " +
+            $"Recorded refusal: {Truncate(refusedRun.LastMessage, 300)}",
+            JsonSerializer.Serialize(new RunnerQuotaHoldState(runner, resumeAtUtc)));
+        await dbContext.SaveChangesAsync(cancellationToken);
+
+        logger.LogWarning(
+            "Runner {Runner} is out of quota; {IssueIdentifier} holds at phase '{Stage}' until {ResumeAtUtc:u}.",
+            runner,
+            ledger.IssueIdentifier,
+            ledger.Stage,
+            resumeAtUtc);
+    }
+
+    /// <summary>
+    /// True when the hold is over and the caller may go on advancing this ledger.
+    /// </summary>
+    private async Task<bool> ReleaseRunnerHoldIfDueAsync(PhaseLedgerEntity ledger, CancellationToken cancellationToken)
+    {
+        var nowUtc = timeProvider.GetUtcNow();
+        if (ledger.HoldUntilUtc > nowUtc)
+        {
+            return false;
+        }
+
+        var runner = ledger.HoldRunner ?? "unknown";
+        ledger.HoldUntilUtc = null;
+
+        // HoldSinceUtc deliberately survives. It measures how long this cause has
+        // been blocking, and a hold that expires straight into another refusal has
+        // not stopped blocking - clearing it here would make the six-hour bound
+        // unreachable and the escalation never fire.
+        ledger.UpdatedAtUtc = nowUtc;
+        AddPhaseEvent(ledger.IssueId, ledger.IssueIdentifier, "phase_runner_quota_hold_expired",
+            $"The hold on runner '{runner}' has expired; {ledger.IssueIdentifier} resumes at phase '{ledger.Stage}'.");
+        await dbContext.SaveChangesAsync(cancellationToken);
+        return true;
+    }
+
+    private static void ClearRunnerHold(PhaseLedgerEntity ledger)
+    {
+        ledger.HoldUntilUtc = null;
+        ledger.HoldSinceUtc = null;
+        ledger.HoldReason = null;
+        ledger.HoldRunner = null;
+    }
+
+    /// <summary>
+    /// Raise an exhausted runner with the owner - once per runner, per window.
+    /// </summary>
+    private async Task EscalateRunnerQuotaAsync(
+        PhaseLedgerEntity ledger,
+        string runner,
+        DateTimeOffset resumeAtUtc,
+        string what,
+        CancellationToken cancellationToken)
+    {
+        if (await IsRunnerQuotaAlreadyEscalatedAsync(runner, cancellationToken))
+        {
+            // Someone else already said it. Keep holding quietly rather than
+            // repeating one cause once per blocked issue.
+            ledger.HoldUntilUtc = resumeAtUtc;
+            ledger.HoldReason = RunnerQuotaHoldReason;
+            ledger.HoldRunner = runner;
+            ledger.UpdatedAtUtc = timeProvider.GetUtcNow();
+            AddPhaseEvent(ledger.IssueId, ledger.IssueIdentifier, RunnerQuotaHoldEventName,
+                $"Runner '{runner}' being out of quota is already with the command center; " +
+                $"{what} keeps holding until {resumeAtUtc:u} instead of raising the same cause again.",
+                JsonSerializer.Serialize(new RunnerQuotaHoldState(runner, resumeAtUtc)));
+            await dbContext.SaveChangesAsync(cancellationToken);
+            return;
+        }
+
+        // Recorded BEFORE the escalation, because EscalateAsync saves and the next
+        // ledger in this same pass has to be able to see that this cause is taken.
+        AddPhaseEvent(ledger.IssueId, ledger.IssueIdentifier, RunnerQuotaEscalatedEventName,
+            $"Runner '{runner}' is out of quota and has been raised with the command center.",
+            JsonSerializer.Serialize(new RunnerQuotaHoldState(runner, resumeAtUtc)));
+
+        await EscalateAsync(ledger,
+            $"Runner '{runner}' is out of quota, so {what} never ran. It has been held since " +
+            $"{ledger.HoldSinceUtc:u} — longer than {Humanise(RunnerQuotaHoldTimeout)} — and the account has not " +
+            $"recovered; the next reset it reported is {resumeAtUtc:u}. Nothing here is repairable by a directive: " +
+            "the account needs credit before any phase on this runner can move.",
+            cancellationToken);
+    }
+
+    private async Task<bool> IsRunnerQuotaAlreadyEscalatedAsync(string runner, CancellationToken cancellationToken)
+    {
+        // The most recent few, not just the last one: two runners can be exhausted
+        // at once, and reading only the newest row would let the older runner
+        // escalate a second time simply because the other one spoke after it.
+        //
+        // Ordered by Id, not by OccurredAtUtc: SQLite cannot ORDER BY a
+        // DateTimeOffset, and the identity column answers "written last" exactly.
+        var recent = await dbContext.EventLog
+            .Where(entry => entry.EventName == RunnerQuotaEscalatedEventName)
+            .OrderByDescending(entry => entry.Id)
+            .Select(entry => entry.DataJson)
+            .Take(RunnerQuotaEscalationScanLimit)
+            .ToListAsync(cancellationToken);
+
+        var nowUtc = timeProvider.GetUtcNow();
+        foreach (var dataJson in recent)
+        {
+            if (string.IsNullOrWhiteSpace(dataJson))
+            {
+                continue;
+            }
+
+            RunnerQuotaHoldState? state;
+            try
+            {
+                state = JsonSerializer.Deserialize<RunnerQuotaHoldState>(dataJson);
+            }
+            catch (JsonException)
+            {
+                // A row this cannot read is from a different shape of the world.
+                // Skipping it fails toward escalating, which is the safe direction:
+                // the worst case is the duplicate this exists to prevent, and the
+                // alternative is silence about a stopped plane.
+                continue;
+            }
+
+            if (state is not null &&
+                string.Equals(state.Runner, runner, StringComparison.OrdinalIgnoreCase) &&
+                state.ResumeAtUtc > nowUtc)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // Enough to cover every runner that could be exhausted at once several times
+    // over, without reading an event log that grows forever.
+    private const int RunnerQuotaEscalationScanLimit = 20;
+
+    private sealed record RunnerQuotaHoldState(string Runner, DateTimeOffset ResumeAtUtc);
+
+    private static string? Truncate(string? value, int maxLength) =>
+        value is not null && value.Length > maxLength ? value[..maxLength] + "…" : value;
+
     private async Task EscalateAsync(PhaseLedgerEntity ledger, string reason, CancellationToken cancellationToken)
     {
         ledger.Stage = PhaseStages.Escalated;
@@ -1274,7 +1534,12 @@ public sealed class PhaseOrchestrator(
         logger.LogError("Phase escalation for {IssueIdentifier}: {Reason}", issueIdentifier, reason);
     }
 
-    private void AddPhaseEvent(string issueId, string issueIdentifier, string eventName, string message)
+    private void AddPhaseEvent(
+        string issueId,
+        string issueIdentifier,
+        string eventName,
+        string message,
+        string? dataJson = null)
     {
         dbContext.EventLog.Add(new EventLogEntity
         {
@@ -1283,6 +1548,10 @@ public sealed class PhaseOrchestrator(
             EventName = eventName,
             Level = (eventName == EscalationEventName ? LogLevel.Error : LogLevel.Information).ToString(),
             Message = message,
+            // Machine-readable state goes here rather than being parsed back out of
+            // the message. A timestamp recovered by reading prose breaks the next
+            // time somebody improves the wording.
+            DataJson = dataJson,
             OccurredAtUtc = timeProvider.GetUtcNow()
         });
     }

@@ -186,7 +186,30 @@ public sealed partial class CodexAgentRunner(
                 ErrorCode: "turn_timeout");
         }
 
-        var success = process.ExitCode == 0;
+        // ADCP#29. The CLI path exits 1 on a usage limit, so it already fails - but
+        // it failed under the generic `process_failed` code, which reads as an
+        // ordinary defect. It is not one: nothing was wrong with the work, the
+        // account was out of quota, and only a run that says so can be held and
+        // retried at the reset instead of escalated at a person who cannot fix it.
+        //
+        // Only ever a re-classification of a run that already failed. The signals
+        // are text matches and an agent's own prose is not evidence about its
+        // account - a review of THIS issue would say "usage limit" a dozen times.
+        // A clean exit means the work happened, whatever it was about.
+        var quotaRefusal = process.ExitCode != 0 &&
+                           (AgentQuotaSignals.IsQuotaExhaustion(stderr) || AgentQuotaSignals.IsQuotaExhaustion(stdout));
+
+        // The floor: a command that exited cleanly having printed nothing at all did
+        // not run, whatever the exit code claims.
+        var activity = new AgentRunActivity();
+        activity.RecordAssistantOutput(stdout);
+
+        var success = process.ExitCode == 0 && !activity.ProducedNothing;
+        if (process.ExitCode == 0 && activity.ProducedNothing)
+        {
+            stderr = AppendLine(stderr, activity.FloorMessage(process.ExitCode));
+        }
+
         await ReportUpdateAsync(
             onUpdate,
             new AgentRunUpdate(
@@ -202,7 +225,13 @@ public sealed partial class CodexAgentRunner(
             Stdout: stdout,
             Stderr: stderr,
             Duration: startedAt.Elapsed,
-            ErrorCode: success ? null : "process_failed");
+            ErrorCode: success
+                ? null
+                : quotaRefusal
+                    ? AgentRunActivity.QuotaErrorCode
+                    : activity.ProducedNothing && process.ExitCode == 0
+                        ? AgentRunActivity.FloorErrorCode
+                        : "process_failed");
     }
 
     private async Task<AgentRunResult> RunAppServerCommandAsync(
@@ -214,6 +243,10 @@ public sealed partial class CodexAgentRunner(
         using var process = new Process { StartInfo = startInfo };
         var stdoutBuffer = new BoundedOutputBuffer(MaxCapturedOutputChars, "stdout");
         var stderrBuffer = new BoundedOutputBuffer(MaxCapturedOutputChars, "stderr");
+
+        // Everything the session actually consumed and produced, so the result can
+        // be decided on that rather than on the exit code alone (ADCP#29).
+        var activity = new AgentRunActivity();
 
         var startedAt = Stopwatch.StartNew();
         if (!process.Start())
@@ -257,9 +290,10 @@ public sealed partial class CodexAgentRunner(
                        expectedRequestId: 1,
                        onUpdate,
                        request.ReadTimeoutMs,
+                       activity,
                        cancellationToken))
             {
-                EnsureNoProtocolError(initializeResponse.RootElement, "initialize");
+                EnsureNoProtocolError(initializeResponse.RootElement, "initialize", request.TrackerQuery?.ApiKey);
             }
 
             await SendNotificationAsync(process.StandardInput, "initialized", new { }, cancellationToken);
@@ -283,9 +317,10 @@ public sealed partial class CodexAgentRunner(
                        expectedRequestId: 2,
                        onUpdate,
                        request.ReadTimeoutMs,
+                       activity,
                        cancellationToken))
             {
-                EnsureNoProtocolError(threadResponse.RootElement, "thread/start");
+                EnsureNoProtocolError(threadResponse.RootElement, "thread/start", request.TrackerQuery?.ApiKey);
                 threadId = GetRequiredString(threadResponse.RootElement, "result", "thread", "id");
             }
 
@@ -326,9 +361,10 @@ public sealed partial class CodexAgentRunner(
                            expectedRequestId: 3,
                            onUpdate,
                            request.ReadTimeoutMs,
+                           activity,
                            cancellationToken))
                 {
-                    EnsureNoProtocolError(turnResponse.RootElement, "turn/start");
+                    EnsureNoProtocolError(turnResponse.RootElement, "turn/start", request.TrackerQuery?.ApiKey);
                     turnId = GetOptionalString(turnResponse.RootElement, "result", "turn", "id");
                 }
 
@@ -351,6 +387,7 @@ public sealed partial class CodexAgentRunner(
                     turnId,
                     turnNumber,
                     onUpdate,
+                    activity,
                     cancellationToken);
 
                 if (turnNumber >= request.MaxTurns)
@@ -373,6 +410,7 @@ public sealed partial class CodexAgentRunner(
                 protocolReader,
                 onUpdate,
                 request.ReadTimeoutMs,
+                activity,
                 CancellationToken.None);
 
             sessionCts.Cancel();
@@ -430,10 +468,31 @@ public sealed partial class CodexAgentRunner(
         startedAt.Stop();
 
         var exitCode = process.HasExited ? process.ExitCode : -1;
-        var success = process.HasExited &&
-                      process.ExitCode == 0 &&
-                      string.IsNullOrWhiteSpace(termination.KillError) &&
-                      termination.ExitedAfterKillAttempt;
+        var exitedCleanly = process.HasExited &&
+                            process.ExitCode == 0 &&
+                            string.IsNullOrWhiteSpace(termination.KillError) &&
+                            termination.ExitedAfterKillAttempt;
+
+        // ADCP#29. Exiting cleanly was the whole test, and it is a proxy for the
+        // thing that matters rather than the thing itself. The app-server returns
+        // cleanly when the account is out of quota: on 2026-09-04 four reviews
+        // landed `Succeeded` with 0/0/0 tokens and no verdict, and the phase
+        // machine went on to escalate the reviewer for a contract violation.
+        //
+        // A run that consumed nothing and produced nothing did not run. That is
+        // decidable here, from what the session actually observed, without having
+        // to keep up with how each vendor spells its refusals.
+        var success = exitedCleanly && !activity.ProducedNothing;
+        var sessionStderr = AppendTerminationDetails(stderrBuffer.ToText(), termination);
+        if (exitedCleanly && activity.ProducedNothing)
+        {
+            sessionStderr = AppendLine(sessionStderr, activity.FloorMessage(exitCode));
+            logger.LogWarning(
+                "App-server run for {IssueIdentifier} exited with code {ExitCode} having produced no tokens and no "
+                + "assistant output; recording it as a failure rather than a success.",
+                request.IssueIdentifier,
+                exitCode);
+        }
 
         await ReportUpdateAsync(
             onUpdate,
@@ -448,9 +507,13 @@ public sealed partial class CodexAgentRunner(
             Success: success,
             ExitCode: exitCode,
             Stdout: stdoutBuffer.ToText(),
-            Stderr: AppendTerminationDetails(stderrBuffer.ToText(), termination),
+            Stderr: sessionStderr,
             Duration: startedAt.Elapsed,
-            ErrorCode: success ? null : "process_failed");
+            ErrorCode: success
+                ? null
+                : exitedCleanly
+                    ? AgentRunActivity.FloorErrorCode
+                    : "process_failed");
     }
 
     private async Task StreamTurnAsync(
@@ -461,6 +524,7 @@ public sealed partial class CodexAgentRunner(
         string? turnId,
         int turnNumber,
         Func<AgentRunUpdate, CancellationToken, Task>? onUpdate,
+        AgentRunActivity activity,
         CancellationToken cancellationToken)
     {
         using var turnCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -513,6 +577,7 @@ public sealed partial class CodexAgentRunner(
                     threadId,
                     turnId,
                     onUpdate,
+                    activity,
                     cancellationToken);
 
                 if (IsTurnCompletedEvent(GetEventName(protocolLine.Document.RootElement)))
@@ -530,10 +595,13 @@ public sealed partial class CodexAgentRunner(
         string threadId,
         string? turnId,
         Func<AgentRunUpdate, CancellationToken, Task>? onUpdate,
+        AgentRunActivity activity,
         CancellationToken cancellationToken)
     {
         var eventName = GetEventName(message);
         var update = CreateProtocolUpdate(message, eventName, threadId, turnId, request.TrackerQuery?.ApiKey);
+        RecordActivity(activity, message, update);
+        EnsureNotQuotaRefusal(message, request.TrackerQuery?.ApiKey);
 
         if (IsTurnCompletedEvent(eventName))
         {
@@ -833,12 +901,13 @@ public sealed partial class CodexAgentRunner(
         ProtocolReader protocolReader,
         Func<AgentRunUpdate, CancellationToken, Task>? onUpdate,
         int readTimeoutMs,
+        AgentRunActivity activity,
         CancellationToken cancellationToken)
     {
         try
         {
             await SendRequestAsync(stdin, 4, "shutdown", new { }, cancellationToken);
-            using var _ = await ReadResponseAsync(protocolReader, 4, onUpdate, readTimeoutMs, cancellationToken);
+            using var _ = await ReadResponseAsync(protocolReader, 4, onUpdate, readTimeoutMs, activity, cancellationToken);
         }
         catch
         {
@@ -1002,6 +1071,7 @@ public sealed partial class CodexAgentRunner(
         int expectedRequestId,
         Func<AgentRunUpdate, CancellationToken, Task>? onUpdate,
         int readTimeoutMs,
+        AgentRunActivity activity,
         CancellationToken cancellationToken)
     {
         while (true)
@@ -1048,10 +1118,10 @@ public sealed partial class CodexAgentRunner(
             using (protocolLine.Document)
             {
                 var eventName = GetEventName(protocolLine.Document.RootElement);
-                await ReportUpdateAsync(
-                    onUpdate,
-                    CreateProtocolUpdate(protocolLine.Document.RootElement, eventName, null, null, protocolReader.KnownSecret),
-                    cancellationToken);
+                var update = CreateProtocolUpdate(protocolLine.Document.RootElement, eventName, null, null, protocolReader.KnownSecret);
+                RecordActivity(activity, protocolLine.Document.RootElement, update);
+                await ReportUpdateAsync(onUpdate, update, cancellationToken);
+                EnsureNotQuotaRefusal(protocolLine.Document.RootElement, protocolReader.KnownSecret);
             }
         }
     }
@@ -1460,7 +1530,7 @@ public sealed partial class CodexAgentRunner(
         return false;
     }
 
-    private static void EnsureNoProtocolError(JsonElement response, string operationName)
+    private static void EnsureNoProtocolError(JsonElement response, string operationName, string? knownSecret)
     {
         if (!response.TryGetProperty("error", out var errorProperty) ||
             errorProperty.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
@@ -1468,7 +1538,109 @@ public sealed partial class CodexAgentRunner(
             return;
         }
 
+        var errorText = errorProperty.ToString();
+
+        // A refusal and a defect are not the same failure and must not carry the
+        // same code: one is repaired, the other is waited out (ADCP#29).
+        if (AgentQuotaSignals.IsQuotaExhaustion(errorText))
+        {
+            throw new RunnerFailureException(
+                AgentRunActivity.QuotaErrorCode,
+                $"The Codex runner refused {operationName}: {SecretRedactor.Redact(errorText, knownSecret)}");
+        }
+
         throw new RunnerFailureException("response_error", $"app_server_protocol_error:{operationName}:{errorProperty}");
+    }
+
+    /// <summary>
+    /// Everything this payload proves the session consumed or produced.
+    /// </summary>
+    /// <remarks>
+    /// A message extracted from an error node is the server explaining why nothing
+    /// happened, not the agent saying something, so it is deliberately not counted
+    /// as output. Otherwise the one payload that proves the run did nothing would
+    /// be the payload that convinced the floor it did something.
+    /// </remarks>
+    private static void RecordActivity(AgentRunActivity activity, JsonElement message, AgentRunUpdate update)
+    {
+        activity.RecordTokens(update);
+
+        if (!TryExtractErrorText(message, out _))
+        {
+            activity.RecordAssistantOutput(update.Message);
+        }
+    }
+
+    /// <summary>
+    /// Refuse to carry on through a vendor refusal that reported itself as an event.
+    /// </summary>
+    /// <remarks>
+    /// Scoped to error-bearing payloads on purpose. The quota signals are text
+    /// matches, and a reviewing agent discussing rate limits in its own prose is
+    /// not a runner that is out of quota - reading agent output for these phrases
+    /// would abort exactly the run that was working. An error node is the server
+    /// speaking about itself, so it is the only place this looks.
+    /// </remarks>
+    private static void EnsureNotQuotaRefusal(JsonElement message, string? knownSecret)
+    {
+        if (!TryExtractErrorText(message, out var errorText) ||
+            !AgentQuotaSignals.IsQuotaExhaustion(errorText))
+        {
+            return;
+        }
+
+        throw new RunnerFailureException(
+            AgentRunActivity.QuotaErrorCode,
+            $"The Codex runner is out of quota: {SecretRedactor.Redact(errorText, knownSecret)}");
+    }
+
+    private static bool TryExtractErrorText(JsonElement message, out string? errorText)
+    {
+        foreach (var path in new[]
+                 {
+                     new[] { "error" },
+                     new[] { "params", "error" },
+                     new[] { "result", "error" },
+                     new[] { "params", "turn", "error" },
+                     new[] { "params", "item", "error" }
+                 })
+        {
+            if (!TryGetElement(message, path, out var errorElement) ||
+                errorElement.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
+            {
+                continue;
+            }
+
+            errorText = errorElement.ValueKind == JsonValueKind.String
+                ? errorElement.GetString()
+                : errorElement.GetRawText();
+            if (!string.IsNullOrWhiteSpace(errorText))
+            {
+                return true;
+            }
+        }
+
+        errorText = null;
+        return false;
+    }
+
+    private static bool TryGetElement(JsonElement root, string[] path, out JsonElement found)
+    {
+        var current = root;
+        foreach (var segment in path)
+        {
+            if (current.ValueKind != JsonValueKind.Object ||
+                !current.TryGetProperty(segment, out var next))
+            {
+                found = default;
+                return false;
+            }
+
+            current = next;
+        }
+
+        found = current;
+        return true;
     }
 
     private static string GetRequiredString(JsonElement root, params string[] path)
