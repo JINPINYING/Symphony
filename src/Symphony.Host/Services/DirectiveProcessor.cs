@@ -61,9 +61,33 @@ public sealed class DirectiveProcessor(
 
     public static string AckMarkerFor(string commentId) => $"<!-- symphony:directive-ack:{commentId} -->";
 
+    /// <summary>
+    /// The marker on the notice that says a valid directive is understood but could
+    /// not be acted on yet.
+    ///
+    /// Deliberately NOT the ack marker: the ack marker means "this directive has
+    /// been dealt with" and is what the crash-window dedupe looks for, so posting
+    /// one for a deferral would consume the directive permanently - the exact
+    /// failure this class of notice exists to report.
+    /// </summary>
+    public static string DeferralMarkerFor(string commentId) => $"<!-- symphony:directive-deferred:{commentId} -->";
+
+    /// <summary>
+    /// Consume the pending directives on every escalated issue, reading each issue
+    /// through the query for the repository it belongs to.
+    /// </summary>
+    /// <remarks>
+    /// This used to take a single <see cref="TrackerQuery"/> - the PRIMARY
+    /// repository - whatever repository the escalated issue lived in. A node id is
+    /// global and an issue number is unique only within a repository, so the wrong
+    /// repository returns nothing rather than erroring; every directive on a
+    /// non-primary issue read as "the issue does not exist" and was discarded, and
+    /// the documented way to un-park an escalation did not work anywhere except
+    /// the primary repository.
+    /// </remarks>
     public async Task ProcessPendingDirectivesAsync(
         WorkflowDefinition workflowDefinition,
-        TrackerQuery query,
+        TrackerQuerySet queries,
         Func<NormalizedIssue, DirectiveDispatchContext, CancellationToken, Task<bool>> dispatchAsync,
         CancellationToken cancellationToken)
     {
@@ -90,7 +114,7 @@ public sealed class DirectiveProcessor(
             {
                 await ProcessIssueDirectivesAsync(
                     workflowDefinition,
-                    query,
+                    queries,
                     issueRuns.ToList(),
                     dispatchAsync,
                     cancellationToken);
@@ -111,13 +135,19 @@ public sealed class DirectiveProcessor(
 
     private async Task ProcessIssueDirectivesAsync(
         WorkflowDefinition workflowDefinition,
-        TrackerQuery query,
+        TrackerQuerySet queries,
         List<RunEntity> stuckRuns,
         Func<NormalizedIssue, DirectiveDispatchContext, CancellationToken, Task<bool>> dispatchAsync,
         CancellationToken cancellationToken)
     {
         var issueId = stuckRuns[0].IssueId;
         var issueIdentifier = stuckRuns[0].IssueIdentifier;
+
+        // The repository the escalated work actually ran in. Everything below -
+        // reading the comments, reloading the issue, posting the ack, closing the
+        // issue - asks GitHub about this issue by number or by node id, and both
+        // answers depend on which repository is asked.
+        var query = queries.For(LatestRun(stuckRuns).Repository);
 
         var comments = await trackerClient.FetchIssueCommentsAsync(query, issueId, issueIdentifier, cancellationToken);
         if (comments.Count == 0)
@@ -178,7 +208,7 @@ public sealed class DirectiveProcessor(
             }
 
             var handled = await ExecuteDirectiveAsync(
-                workflowDefinition, query, comment, parsed, stuckRuns, dispatchAsync, cancellationToken);
+                workflowDefinition, query, comment, comments, parsed, stuckRuns, dispatchAsync, cancellationToken);
             if (handled)
             {
                 // One dispatching directive per issue per tick; later directives wait
@@ -192,6 +222,7 @@ public sealed class DirectiveProcessor(
         WorkflowDefinition workflowDefinition,
         TrackerQuery query,
         NormalizedIssueComment comment,
+        IReadOnlyList<NormalizedIssueComment> comments,
         DirectiveParseResult parsed,
         List<RunEntity> stuckRuns,
         Func<NormalizedIssue, DirectiveDispatchContext, CancellationToken, Task<bool>> dispatchAsync,
@@ -216,10 +247,7 @@ public sealed class DirectiveProcessor(
         }
 
         // resume / reimplement / custom all re-dispatch the issue.
-        var recordedPhase = stuckRuns
-            .OrderByDescending(run => run.LastEventAtUtc ?? run.StartedAtUtc)
-            .First()
-            .Phase;
+        var recordedPhase = LatestRun(stuckRuns).Phase;
         var targetPhase = action switch
         {
             DirectiveActions.Reimplement => RunPhaseNames.Implementation,
@@ -250,12 +278,33 @@ public sealed class DirectiveProcessor(
         var issue = issues.FirstOrDefault();
         if (issue is null)
         {
-            await ConsumeInvalidDirectiveAsync(
-                query, comment, issueId, issueIdentifier,
-                "the source issue could not be reloaded from the tracker by id", cancellationToken);
-            return true;
+            // NOT a consumption. A read that comes back empty says nothing about
+            // the directive: the tracker may be rate limited, flaky, or - as it was
+            // for every non-primary repository - being asked the wrong question.
+            // Discarding the directive here was permanent, and left the owner an
+            // ack saying the issue could not be reloaded and no way to retry except
+            // posting the comment again into the same discard.
+            //
+            // Only the comment text can make a directive invalid, and that is
+            // decided by the parser above, with no network call.
+            logger.LogWarning(
+                "Directive {CommentId} on {IssueIdentifier} could not reload the issue from {Repository}; " +
+                "it stays pending and will retry next tick.",
+                comment.Id, issueIdentifier, TrackerQuerySet.KeyOf(query));
+            await RecordPendingDirectiveAsync(
+                comment.Id, issueId, issueIdentifier, action,
+                $"the source issue could not be read back from {TrackerQuerySet.KeyOf(query)}",
+                cancellationToken);
+            await PostDeferralNoticeAsync(
+                query, comment, comments, issueId,
+                $"the plane could not read {issueIdentifier} back from `{TrackerQuerySet.KeyOf(query)}` to act on it",
+                cancellationToken);
+            return false;
         }
 
+        // A read that succeeded and says "Closed" is an answer, not a failure, so
+        // it is consumed and answered - unlike the unreadable case above, retrying
+        // it would say the same thing on every tick for ever.
         if (IssueStateMatcherProxy.IsClosed(issue.State))
         {
             await ConsumeInvalidDirectiveAsync(
@@ -288,6 +337,12 @@ public sealed class DirectiveProcessor(
         return true;
     }
 
+    // The run that last said anything about this issue. Its phase is where a
+    // `resume` picks up, and its repository is the one every tracker call for this
+    // issue has to be aimed at.
+    private static RunEntity LatestRun(List<RunEntity> stuckRuns) =>
+        stuckRuns.OrderByDescending(run => run.LastEventAtUtc ?? run.StartedAtUtc).First();
+
     private void ResolveStuckRuns(List<RunEntity> stuckRuns, string reason)
     {
         var nowUtc = timeProvider.GetUtcNow();
@@ -301,6 +356,10 @@ public sealed class DirectiveProcessor(
         }
     }
 
+    // Consumption is permanent, so it is reserved for directives the plane can
+    // answer for good: a comment the parser refuses, or an issue GitHub says is
+    // closed. Anything that only means "not right now" defers instead - see
+    // PostDeferralNoticeAsync.
     private async Task ConsumeInvalidDirectiveAsync(
         TrackerQuery query,
         NormalizedIssueComment comment,
@@ -311,7 +370,7 @@ public sealed class DirectiveProcessor(
     {
         await AckAsync(
             query, comment, issueId,
-            $"**Directive could not be executed:** {error}.\n\nThe escalation remains open; post a corrected `symphony:directive` block. Nothing was dispatched — the control plane does not guess.",
+            $"**Directive rejected:** {error}.\n\nThis directive will not be retried. The escalation remains open; post a corrected `symphony:directive` block. Nothing was dispatched — the control plane does not guess.",
             cancellationToken);
         await RecordConsumptionAsync(
             comment.Id, issueId, issueIdentifier,
@@ -327,6 +386,63 @@ public sealed class DirectiveProcessor(
     {
         var body = $"{AckMarkerFor(comment.Id)}\n{message}\n\n— Symphony directive processor";
         await trackerClient.PostIssueCommentAsync(query, issueId, body, cancellationToken);
+    }
+
+    /// <summary>
+    /// Tell the owner, once, that a valid directive was understood but could not be
+    /// acted on yet — and that the plane will keep trying.
+    /// </summary>
+    /// <remarks>
+    /// The owner previously saw one wording for both outcomes: "the directive could
+    /// not be executed". One of those meant "fix the comment", the other meant "the
+    /// plane could not reach the tracker", and only the first was true of the
+    /// comment. Worse, both were final, so the second read as an instruction to
+    /// repost a directive that would be discarded the same way.
+    ///
+    /// The notice carries its own marker rather than the ack marker, because the
+    /// ack marker is the crash-window dedupe for a CONSUMED directive: posting one
+    /// here would make the next tick record the directive as already handled and
+    /// discard it — precisely the bug this path exists to avoid. The marker is only
+    /// used to keep a long outage from posting a notice per tick.
+    /// </remarks>
+    private async Task PostDeferralNoticeAsync(
+        TrackerQuery query,
+        NormalizedIssueComment comment,
+        IReadOnlyList<NormalizedIssueComment> comments,
+        string issueId,
+        string reason,
+        CancellationToken cancellationToken)
+    {
+        var marker = DeferralMarkerFor(comment.Id);
+        if (comments.Any(item => item.Body.Contains(marker, StringComparison.Ordinal)))
+        {
+            return;
+        }
+
+        var body =
+            $"{marker}\n**Directive accepted, not yet executed:** {reason}.\n\n" +
+            "The directive has **not** been discarded — the plane retries it on every tick until the read succeeds. " +
+            "Nothing needs reposting.\n\n— Symphony directive processor";
+
+        try
+        {
+            await trackerClient.PostIssueCommentAsync(query, issueId, body, cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // The notice is a courtesy; the retry is the guarantee. A tracker that
+            // cannot be read often cannot be written either, and failing to say so
+            // must not stop the directive from being tried again.
+            logger.LogWarning(
+                ex,
+                "Could not post the deferral notice for directive {CommentId} on issue {IssueId}; the directive still retries next tick.",
+                comment.Id,
+                issueId);
+        }
     }
 
     /// <summary>

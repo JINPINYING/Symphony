@@ -722,8 +722,9 @@ public sealed class IssueExecutionCoordinator(
             .ToList());
     }
 
-    private static TrackerQuery BuildTrackerQuery(WorkflowDefinition workflowDefinition, string apiKey) =>
-        BuildTrackerQueries(workflowDefinition, apiKey).Primary;
+    // No BuildTrackerQuery singular: it had no callers left here, and leaving a
+    // silent default-to-the-primary-repository helper in reach is how the same
+    // defect keeps being written. Pick with TrackerQuerySet.For(repository).
 
     private static string? Truncate(string? value, int maxLength)
     {
