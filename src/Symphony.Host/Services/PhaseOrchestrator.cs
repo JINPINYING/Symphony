@@ -115,6 +115,34 @@ public sealed class PhaseOrchestrator(
     /// </summary>
     public const string EscalationEventName = "needs_command_center";
 
+    /// <summary>
+    /// The event an automatic un-park of a LEDGERLESS parked run is recorded under.
+    ///
+    /// Durable, and load-bearing twice over: it is what the panel shows as the
+    /// reason the item went away, and it is the once-per-issue guard. A run that
+    /// escalated out of implementation has no pull request behind it, so nothing
+    /// external has to change for the sweep to reach the same verdict again -
+    /// un-park, re-dispatch, escalate, un-park - which is the loop the phase lane
+    /// and the reconciler already fell into once (see
+    /// `phase_implementation_no_pull_request`). One automatic attempt per issue is
+    /// self-healing; the second time the same issue comes back it is a person's,
+    /// and the panel already tells them to post a `symphony:directive`.
+    /// </summary>
+    public const string ParkedRunReconciledEventName = "phase_parked_run_reconciled";
+
+    /// <summary>
+    /// How long a parked run with no ledger row may sit before the sweep clears it
+    /// on its own evidence.
+    ///
+    /// Escalating is a genuine ask of a person, and clearing it on the next tick
+    /// would quietly turn every implementation escalation into one more silent
+    /// retry - the owner would never see the item at all. The same two hours
+    /// everything else in this file waits before something is called stuck: long
+    /// enough to be a real ask, short enough that #50's three days on the panel
+    /// cannot happen again.
+    /// </summary>
+    public static readonly TimeSpan ParkedRunReconcileDelay = StuckStageTimeout;
+
     private static string Humanise(TimeSpan span) =>
         span.TotalMinutes < 60 ? $"{(int)span.TotalMinutes} minutes"
         : span.TotalHours < 24 ? $"{(int)span.TotalHours} hours"
@@ -122,7 +150,11 @@ public sealed class PhaseOrchestrator(
 
     // Enough to cover every branch an issue could have open at once, without asking
     // the tracker for a page it will never read.
-    private const int OpenPullRequestScanLimit = 50;
+    //
+    // It is ONE page and there is no cursor behind it, so a result of exactly this
+    // many is "at least this many", not "this many". Anything deciding on the
+    // ABSENCE of a pull request has to treat a full page as truncated.
+    public const int OpenPullRequestScanLimit = 50;
 
     public static string ReviewVerdictMarker(int prNumber, string headSha) =>
         $"<!-- symphony:review-verdict:{prNumber}:{headSha} -->";
@@ -145,7 +177,7 @@ public sealed class PhaseOrchestrator(
         {
             await SeedLedgersForCompletedImplementationsAsync(queries, cancellationToken);
             await AdvanceLedgersAsync(workflowDefinition, queries, dispatchAsync, cancellationToken);
-            await ReconcileEscalatedLedgersAsync(queries, cancellationToken);
+            await ReconcileEscalatedLedgersAsync(workflowDefinition, queries, cancellationToken);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -444,6 +476,7 @@ public sealed class PhaseOrchestrator(
     // and if the snapshot was merely truncated that fetch answers OPEN and nothing
     // happens.
     private async Task ReconcileEscalatedLedgersAsync(
+        WorkflowDefinition workflowDefinition,
         TrackerQuerySet queries,
         CancellationToken cancellationToken)
     {
@@ -453,7 +486,16 @@ public sealed class PhaseOrchestrator(
         // that is precisely the state a stranded run is left in, since its ledger
         // has already moved on to closed or merged. Running the sweep after that
         // return meant it never executed in the only situation it exists for.
-        var cleared = await ResolveRunsStrandedAgainstSettledLedgersAsync(cancellationToken);
+        var clearedAgainstSettledLedgers = await ResolveRunsStrandedAgainstSettledLedgersAsync(cancellationToken);
+
+        // And the runs that never had a ledger to be stranded against. Same
+        // unconditional placement, for the same reason.
+        var clearedWithoutLedgers = await ResolveParkedRunsWithNoLedgerAsync(
+            workflowDefinition,
+            queries,
+            cancellationToken);
+
+        var cleared = clearedAgainstSettledLedgers || clearedWithoutLedgers;
 
         var escalated = await dbContext.PhaseLedger
             .Where(entry => entry.Stage == PhaseStages.Escalated)
@@ -594,6 +636,369 @@ public sealed class PhaseOrchestrator(
         }
 
         return repaired > 0;
+    }
+
+    /// <summary>
+    /// Resolves runs parked at needs_command_center whose issue has NO ledger row
+    /// at all.
+    ///
+    /// The sweep above repairs a run left behind by a ledger that moved on, so it
+    /// starts from the set of settled ledgers - and an issue with no ledger row is
+    /// never in that set. A run that escalated out of IMPLEMENTATION escalated
+    /// before any pull request existed, so no ledger was ever created for it, and
+    /// every other route out is closed too: the label cannot re-dispatch an issue
+    /// that already holds a live run, and restart reconciliation treats
+    /// needs_command_center as a deliberate park rather than a crash artifact. The
+    /// documented escape hatch is a directive, which leaves one hand-typed comment
+    /// as the only thing standing between the plane and a permanent attention item.
+    /// Symphony #50 sat on the owner's panel for three days, through several
+    /// restarts, because of exactly this (#87).
+    ///
+    /// So a ledgerless park is settled on the same evidence a ledgered one is: the
+    /// tracker's own answer. A closed issue is finished whatever the run says. An
+    /// open issue with no pull request of its own has nothing left to wait for
+    /// either - there is no PR to close, which is the manoeuvre that clears every
+    /// other parked run - so the run is resolved and the issue becomes dispatchable
+    /// from its label again.
+    ///
+    /// Fail closed throughout: a tracker read that does not answer leaves the item
+    /// up. Clearing an alarm we could not verify is worse than leaving one up a
+    /// little longer.
+    /// </summary>
+    private async Task<bool> ResolveParkedRunsWithNoLedgerAsync(
+        WorkflowDefinition workflowDefinition,
+        TrackerQuerySet queries,
+        CancellationToken cancellationToken)
+    {
+        var parked = await dbContext.Runs
+            .Where(run => run.Status == RunStatusNames.NeedsCommandCenter)
+            .ToListAsync(cancellationToken);
+        if (parked.Count == 0)
+        {
+            return false;
+        }
+
+        // ANY ledger row, at any stage - not just a settled one. A live ledger
+        // means the phase machine owns the issue and an escalated one is the
+        // reconciler's above; this sweep is only for issues neither of them can
+        // see.
+        var ledgeredIssueIds = (await dbContext.PhaseLedger
+                .Select(entry => entry.IssueId)
+                .ToListAsync(cancellationToken))
+            .ToHashSet(StringComparer.Ordinal);
+
+        var now = timeProvider.GetUtcNow();
+        var candidates = parked
+            .Where(run => !ledgeredIssueIds.Contains(run.IssueId))
+            .Where(run => now - ParkedSince(run) >= ParkedRunReconcileDelay)
+            .ToList();
+        if (candidates.Count == 0)
+        {
+            return false;
+        }
+
+        // One automatic un-park per issue, guarded on the event log the same way
+        // the implementation lane's escalation is. Nothing external has to change
+        // for this sweep to reach the same verdict on the next cycle, so without
+        // the guard an issue that escalates for a durable reason would be
+        // un-parked, re-dispatched and escalated again for ever.
+        var candidateIssueIds = candidates
+            .Select(run => run.IssueId)
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+        var alreadyUnparked = (await dbContext.EventLog
+                .Where(entry => entry.EventName == ParkedRunReconciledEventName &&
+                                entry.IssueId != null &&
+                                candidateIssueIds.Contains(entry.IssueId!))
+                .Select(entry => entry.IssueId!)
+                .ToListAsync(cancellationToken))
+            .ToHashSet(StringComparer.Ordinal);
+
+        candidates = candidates
+            .Where(run => !alreadyUnparked.Contains(run.IssueId))
+            .ToList();
+        if (candidates.Count == 0)
+        {
+            return false;
+        }
+
+        var branchByIssueId = (await dbContext.WorkspaceRecords
+                .Where(record => candidateIssueIds.Contains(record.IssueId))
+                .Select(record => new { record.IssueId, record.BranchName })
+                .ToListAsync(cancellationToken))
+            .Where(record => !string.IsNullOrWhiteSpace(record.BranchName))
+            .ToDictionary(record => record.IssueId, record => record.BranchName!, StringComparer.Ordinal);
+
+        var terminalStates = workflowDefinition.Runtime.Tracker.TerminalStates;
+        var repaired = false;
+
+        foreach (var perRepository in candidates.GroupBy(run => run.Repository ?? string.Empty, StringComparer.OrdinalIgnoreCase))
+        {
+            var query = queries.For(perRepository.Key);
+            var runs = perRepository.ToList();
+
+            IReadOnlyList<IssueStateSnapshot> snapshots;
+            IReadOnlyList<OpenPullRequest> openPullRequests;
+            try
+            {
+                snapshots = await trackerClient.FetchIssueStatesByIdsAsync(
+                    query,
+                    runs.Select(run => run.IssueId).Distinct(StringComparer.Ordinal).ToList(),
+                    IssueIdentifierMap.From(runs, run => run.IssueId, run => run.IssueIdentifier),
+                    cancellationToken);
+
+                // Scoped to this repository by the query, so a branch match needs no
+                // further repository test: "#45" exists in every repository the
+                // plane watches, and so does `symphony/45`.
+                //
+                // ONE page, newest-updated first, and there is no cursor to follow -
+                // so this list is a positive signal only. Absence from it is handled
+                // below, where it is the thing the decision turns on.
+                openPullRequests = await trackerClient.FetchOpenPullRequestsAsync(
+                    query,
+                    OpenPullRequestScanLimit,
+                    cancellationToken);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(
+                    ex,
+                    "Could not check whether the parked runs on {Repository} still need the command center; leaving them up.",
+                    TrackerQuerySet.KeyOf(query));
+                continue;
+            }
+
+            var stateByIssueId = snapshots.ToDictionary(
+                snapshot => snapshot.Id,
+                StringComparer.OrdinalIgnoreCase);
+
+            // A full page means there may be more open pull requests than were
+            // listed, and the scan is ordered by most-recently-updated, so the
+            // stale ones drop off first - which is exactly what a pull request
+            // belonging to a run parked for hours looks like. "Not in the first
+            // page" is not "does not exist", and this sweep un-parks on that
+            // answer once and only once per issue, so a wrong one is durable.
+            var scanMayBeTruncated = openPullRequests.Count >= OpenPullRequestScanLimit;
+
+            foreach (var run in runs)
+            {
+                if (!stateByIssueId.TryGetValue(run.IssueId, out var snapshot))
+                {
+                    // Asked and not answered. "The tracker did not mention it" is
+                    // not evidence that the work is finished.
+                    continue;
+                }
+
+                string reason;
+                if (MatchesTerminalState(snapshot.State, terminalStates))
+                {
+                    reason =
+                        $"{run.IssueIdentifier} is {snapshot.State} on the tracker and has no phase ledger row, " +
+                        "so nothing is left for the command center to decide. Resolved the parked run.";
+                }
+                else
+                {
+                    branchByIssueId.TryGetValue(run.IssueId, out var branchName);
+                    var families = BranchFamiliesFor(branchName, run.IssueIdentifier);
+                    if (families.Count == 0)
+                    {
+                        // No branch of its own and no issue number to derive one
+                        // from: this run cannot be told apart from one whose pull
+                        // request the scan simply did not list. Fail closed.
+                        continue;
+                    }
+
+                    if (FindOpenPullRequestForIssue(openPullRequests, families) is not null)
+                    {
+                        // There IS something to close, which is the route that
+                        // already works. Leave it to the person or to the escalated
+                        // ledger reconciler once a ledger exists.
+                        continue;
+                    }
+
+                    // Absence from that page is now the whole decision, so it has to
+                    // be confirmed rather than assumed. Ask the tracker for each of
+                    // this issue's branches by name - a head-scoped query, complete
+                    // by construction, and the same lookup ResolvePullRequestNumberAsync
+                    // trusts as definitive.
+                    bool confirmedAbsent;
+                    try
+                    {
+                        confirmedAbsent = await HasNoOpenPullRequestOnAnyBranchAsync(
+                            query,
+                            families,
+                            cancellationToken);
+                    }
+                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        // A read that did not answer is UNKNOWN, not "no pull
+                        // request". Leave the item up and try again next tick.
+                        logger.LogWarning(
+                            ex,
+                            "Could not confirm whether {IssueIdentifier} still has an open pull request; leaving the parked run up.",
+                            run.IssueIdentifier);
+                        continue;
+                    }
+
+                    if (!confirmedAbsent)
+                    {
+                        continue;
+                    }
+
+                    // The named branches are ruled out, but a pull request on a
+                    // SUFFIXED branch of the same family ("symphony/87-retry") can
+                    // only be seen in the scan, and a full page may have hidden one.
+                    // There is no cursor to follow and no exact-name query that
+                    // matches a prefix, so this is the truncation the sweep cannot
+                    // read past: say so and leave the item for a person.
+                    if (scanMayBeTruncated)
+                    {
+                        logger.LogWarning(
+                            "The open pull request scan on {Repository} returned a full page of {Count}, so a branch-family pull request for {IssueIdentifier} cannot be ruled out; leaving the parked run up.",
+                            TrackerQuerySet.KeyOf(query),
+                            openPullRequests.Count,
+                            run.IssueIdentifier);
+                        continue;
+                    }
+
+                    reason =
+                        $"{run.IssueIdentifier} has been parked for the command center for " +
+                        $"{Humanise(now - ParkedSince(run))} with no phase ledger row and no open pull request, " +
+                        "so no action available to anyone could have cleared it. Resolved the parked run; the " +
+                        "issue is dispatchable from its label again. A second escalation on this issue will stay " +
+                        "parked for a person.";
+                }
+
+                run.Status = RunStatusNames.ResolvedByPhaseClear;
+                run.CompletedAtUtc = now;
+                AddPhaseEvent(run.IssueId, run.IssueIdentifier, ParkedRunReconciledEventName, reason);
+                repaired = true;
+            }
+        }
+
+        return repaired;
+    }
+
+    // When the run stopped, as well as it can be known. CompletedAtUtc is set on
+    // every escalation path; the other two are fallbacks for a row written before
+    // it was, and StartedAtUtc always exists.
+    private static DateTimeOffset ParkedSince(RunEntity run) =>
+        run.CompletedAtUtc ?? run.LastEventAtUtc ?? run.StartedAtUtc;
+
+    /// <summary>
+    /// The branch names this issue's pull request could be on.
+    ///
+    /// Same two rules ResolvePullRequestNumberAsync uses: the branch the plane
+    /// prepared for the issue, and - without a workspace record - the branch
+    /// derived from the issue number, which is the convention the plane names
+    /// branches by and the same one the attention panel matches on.
+    /// </summary>
+    private static List<string> BranchFamiliesFor(string? branchName, string issueIdentifier)
+    {
+        var families = new List<string>();
+        if (!string.IsNullOrWhiteSpace(branchName))
+        {
+            families.Add(branchName);
+        }
+
+        if (TryReadIssueNumber(issueIdentifier, out var number))
+        {
+            var derived = $"symphony/{number}";
+            if (!families.Contains(derived, StringComparer.OrdinalIgnoreCase))
+            {
+                families.Add(derived);
+            }
+        }
+
+        return families;
+    }
+
+    /// <summary>
+    /// The open pull request belonging to this issue, if the scan listed one.
+    ///
+    /// A branch of the family counts too ("symphony/150" also owns
+    /// "symphony/150-toolcalls"), which is the only reason the scan is consulted
+    /// at all: an exact-name query cannot match a prefix.
+    /// </summary>
+    private static OpenPullRequest? FindOpenPullRequestForIssue(
+        IReadOnlyList<OpenPullRequest> openPullRequests,
+        IReadOnlyList<string> families)
+    {
+        if (families.Count == 0)
+        {
+            return null;
+        }
+
+        return openPullRequests.FirstOrDefault(pullRequest =>
+            pullRequest.HeadRefName is not null &&
+            families.Any(family =>
+                pullRequest.HeadRefName.Equals(family, StringComparison.OrdinalIgnoreCase) ||
+                // The separator is required so `symphony/15` cannot claim
+                // `symphony/150`.
+                pullRequest.HeadRefName.StartsWith($"{family}-", StringComparison.OrdinalIgnoreCase)));
+    }
+
+    /// <summary>
+    /// True when the tracker confirms there is no open pull request on ANY of
+    /// these branches.
+    ///
+    /// Head-scoped, one query per branch, so the answer is complete for the name
+    /// asked about rather than "whatever the first page happened to hold". Any
+    /// failure propagates: the caller has to be able to tell "no pull request"
+    /// apart from "could not ask".
+    /// </summary>
+    private async Task<bool> HasNoOpenPullRequestOnAnyBranchAsync(
+        TrackerQuery query,
+        IReadOnlyList<string> families,
+        CancellationToken cancellationToken)
+    {
+        foreach (var family in families)
+        {
+            var pullRequest = await trackerClient.FetchOpenPullRequestByHeadBranchAsync(
+                query,
+                family,
+                cancellationToken);
+            if (pullRequest is not null)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool TryReadIssueNumber(string issueIdentifier, out string number)
+    {
+        number = (issueIdentifier ?? string.Empty).Trim().TrimStart('#');
+        if (number.Length == 0 || !number.All(char.IsDigit))
+        {
+            number = string.Empty;
+            return false;
+        }
+
+        return true;
+    }
+
+    // The tracker's terminal states as configured, with the same fallback the
+    // dispatch lane uses when none are configured.
+    private static bool MatchesTerminalState(string state, IReadOnlyList<string> terminalStates)
+    {
+        if (terminalStates.Count == 0)
+        {
+            return IssueStateMatcher.IsClosedState(state);
+        }
+
+        return terminalStates.Any(terminalState =>
+            terminalState.Trim().Equals(state.Trim(), StringComparison.OrdinalIgnoreCase) ||
+            (IssueStateMatcher.IsClosedState(terminalState) && IssueStateMatcher.IsClosedState(state)));
     }
 
     private async Task<HashSet<int>> ReadOpenPullRequestNumbersAsync(CancellationToken cancellationToken)
