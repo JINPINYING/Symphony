@@ -1170,7 +1170,10 @@ Error mapping (recommended normalized categories):
 - `runner_quota_exhausted` — the vendor account is out of quota or rate limited.
   Distinct from an ordinary failure because it clears on a clock rather than on
   effort: the orchestrator holds the affected phase until the reset the refusal
-  named and retries, instead of escalating a decision nobody can make.
+  named and retries, instead of escalating a decision nobody can make. A hold ends
+  in an attempt: it parks the phase at a stage that dispatches, never at one that
+  waits on the run that already refused, or the reset would only ever be followed
+  by another hold.
 - `no_agent_activity` — the session ended without consuming a token or producing
   any assistant output. A run that produced nothing did not run, whatever exit
   code the process returned, and is never recorded as a success.
@@ -1639,8 +1642,11 @@ API design notes:
    - User input requested (hard fail)
    - Subprocess exit
    - Stalled session (no activity)
-   - Runner quota exhausted (transient: held and retried at the reset, and raised
-     with the command center at most once per runner per window)
+   - Runner quota exhausted (transient: every phase that can be refused for it
+     holds at a stage that can re-ask, and re-dispatches at the reset. Raised with
+     the command center at most once per runner for as long as that runner stays
+     exhausted, across however many reset windows the outage spans; the cause
+     closes when the runner is next observed producing work)
    - Session produced no tokens and no assistant output
 
 4. `Tracker Failures`

@@ -693,6 +693,7 @@ public static class OwnerAttentionSummary
         string.Equals(stage, PhaseStages.AwaitingVerify, StringComparison.Ordinal) ||
         string.Equals(stage, PhaseStages.AwaitingReview, StringComparison.Ordinal) ||
         string.Equals(stage, PhaseStages.Reviewing, StringComparison.Ordinal) ||
+        string.Equals(stage, PhaseStages.AwaitingRepair, StringComparison.Ordinal) ||
         string.Equals(stage, PhaseStages.WaitForRepair, StringComparison.Ordinal);
 
     /// <summary>

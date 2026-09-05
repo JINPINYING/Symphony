@@ -17,8 +17,9 @@ public sealed class PhaseLedgerEntity
     // PR #122, and two repositories can each have one.
     public string Repository { get; set; } = string.Empty;
 
-    // awaiting_verify | awaiting_review | reviewing | wait_for_repair |
-    // awaiting_final_review | final_reviewing | ready | escalated
+    // awaiting_verify | awaiting_review | reviewing | awaiting_repair |
+    // wait_for_repair | awaiting_final_review | final_reviewing | ready |
+    // escalated
     public string Stage { get; set; } = string.Empty;
 
     public int PrNumber { get; set; }

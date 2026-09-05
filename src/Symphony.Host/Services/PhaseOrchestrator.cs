@@ -20,6 +20,12 @@ public static class PhaseStages
     public const string AwaitingVerify = "awaiting_verify";
     public const string AwaitingReview = "awaiting_review";
     public const string Reviewing = "reviewing";
+
+    // The bounded repair has been ordered but not yet started. Distinct from
+    // `wait_for_repair`, which waits on a repair that IS running: a stage that
+    // waits cannot re-ask, and a repair refused for quota has to be asked again
+    // once the account's clock is out.
+    public const string AwaitingRepair = "awaiting_repair";
     public const string WaitForRepair = "wait_for_repair";
     public const string Ready = "ready";
     public const string Merged = "merged";
@@ -83,10 +89,21 @@ public sealed class PhaseOrchestrator(
     /// One exhausted account blocks every phase at once. On 2026-09-04 that
     /// produced four escalations in fifty minutes for one cause, and a board that
     /// reports one fact four times is a board people stop reading. Every later
-    /// ledger blocked by the same runner in the same window holds quietly against
-    /// this row instead of raising its own.
+    /// ledger blocked by the same runner holds quietly against this row instead of
+    /// raising its own, for as long as the runner stays exhausted.
     /// </summary>
     public const string RunnerQuotaEscalatedEventName = "phase_runner_quota_escalated";
+
+    /// <summary>
+    /// The event that closes a quota cause: this runner has been seen doing work.
+    ///
+    /// Suppression keyed on the reset the refusal named expires while the outage
+    /// does not - the 2026-09-04 outage spanned two windows, and the second one
+    /// would have raised the same dead account a second time. An exhausted runner
+    /// stops being an open attention item when it produces work again, and nothing
+    /// else is evidence of that, so nothing else clears it.
+    /// </summary>
+    public const string RunnerQuotaRecoveredEventName = "phase_runner_quota_recovered";
 
     /// <summary>
     /// The event name a phase escalation and its reason are recorded under.
@@ -729,6 +746,9 @@ public sealed class PhaseOrchestrator(
             case PhaseStages.Reviewing:
                 await HandleReviewVerdictAsync(workflowDefinition, query, ledger, pullRequest, dispatchAsync, cancellationToken);
                 break;
+            case PhaseStages.AwaitingRepair:
+                await HandleDispatchRepairAsync(workflowDefinition, query, ledger, pullRequest, dispatchAsync, cancellationToken);
+                break;
             case PhaseStages.WaitForRepair:
                 await HandleWaitForRepairAsync(query, ledger, pullRequest, cancellationToken);
                 break;
@@ -1070,6 +1090,74 @@ public sealed class PhaseOrchestrator(
         }
     }
 
+    /// <summary>
+    /// Ask for the bounded repair again, from a stage whose whole job is asking.
+    /// </summary>
+    /// <remarks>
+    /// A repair refused for quota used to hold at `wait_for_repair`, and that stage
+    /// waits on the latest repair run rather than starting one - so when the hold
+    /// expired the switch came straight back to the same dead run and renewed the
+    /// hold. The bounded repair waited out one window, then the next, until the
+    /// six-hour bound escalated it: the exact outcome the hold exists to prevent.
+    ///
+    /// The review path never had this fault because it rewinds to
+    /// `awaiting_review`, a stage that dispatches unconditionally. This is that
+    /// same shape for the repair.
+    ///
+    /// The findings are re-read from GitHub rather than carried on the ledger: the
+    /// verdict comment is the durable record of what the repair was asked to do,
+    /// and a copy of it in a database column is one more thing that can disagree
+    /// with the source of truth.
+    /// </remarks>
+    private async Task HandleDispatchRepairAsync(
+        WorkflowDefinition workflowDefinition,
+        TrackerQuery query,
+        PhaseLedgerEntity ledger,
+        PullRequestStatus pullRequest,
+        Func<NormalizedIssue, PhaseDispatchRequest, CancellationToken, Task<bool>> dispatchAsync,
+        CancellationToken cancellationToken)
+    {
+        // Nothing to ask for if it has already been done. A repair only reaches
+        // this stage without having run, but the head can still move while it waits
+        // - a hold can span a night, and someone can push during one.
+        if (!string.IsNullOrWhiteSpace(ledger.RejectedHeadSha) &&
+            !string.Equals(pullRequest.HeadSha, ledger.RejectedHeadSha, StringComparison.OrdinalIgnoreCase))
+        {
+            ledger.Stage = PhaseStages.AwaitingVerify;
+            ClearRunnerHold(ledger);
+            ledger.UpdatedAtUtc = timeProvider.GetUtcNow();
+            AddPhaseEvent(ledger.IssueId, ledger.IssueIdentifier, "phase_repair_head_moved",
+                $"PR #{ledger.PrNumber} moved to head {Short(pullRequest.HeadSha)} before its repair was re-dispatched; " +
+                "re-verifying instead of asking again for work that has landed.");
+            await dbContext.SaveChangesAsync(cancellationToken);
+            return;
+        }
+
+        var rejectedHead = string.IsNullOrWhiteSpace(ledger.RejectedHeadSha)
+            ? ledger.HeadSha ?? string.Empty
+            : ledger.RejectedHeadSha;
+        var marker = ReviewVerdictMarker(ledger.PrNumber, rejectedHead);
+        var comments = await trackerClient.FetchIssueCommentsAsync(query, ledger.IssueId, ledger.IssueIdentifier, cancellationToken);
+        var verdictComment = comments
+            .Where(comment => comment.Body.Contains(marker, StringComparison.Ordinal))
+            .OrderByDescending(comment => comment.CreatedAtUtc ?? DateTimeOffset.MinValue)
+            .FirstOrDefault();
+
+        if (verdictComment is null)
+        {
+            // The findings the repair is supposed to act on are gone. Dispatching
+            // an unbounded "fix it" in their place is worse than saying so.
+            await EscalateAsync(ledger,
+                $"PR #{ledger.PrNumber} is waiting to re-dispatch its bounded repair, but the review comment " +
+                $"carrying the exact-head marker for {Short(rejectedHead)} is no longer on the issue, so there are " +
+                "no findings to repair against.",
+                cancellationToken);
+            return;
+        }
+
+        await DispatchRepairAsync(workflowDefinition, query, ledger, verdictComment.Body, dispatchAsync, cancellationToken);
+    }
+
     private async Task DispatchRepairAsync(
         WorkflowDefinition workflowDefinition,
         TrackerQuery query,
@@ -1181,6 +1269,11 @@ public sealed class PhaseOrchestrator(
         // ADCP#29, same rule as the reviewing stage: a repair that never ran
         // because the implementer's account was out of quota is a wait, not a
         // failure, and the single bounded repair has not been spent on it.
+        //
+        // The hold is taken here even if the head has since moved by some other
+        // route: `awaiting_repair` checks that before it asks for anything, and
+        // paying one quota window to reach a check that already exists is cheaper
+        // than a second head test on the escalating side of this branch.
         if (latestRepair is not null && IsRunnerQuotaRefusal(latestRepair))
         {
             await HoldForRunnerQuotaAsync(
@@ -1262,6 +1355,7 @@ public sealed class PhaseOrchestrator(
                     !string.Equals(confirmed.HeadSha, ledger.RejectedHeadSha, StringComparison.OrdinalIgnoreCase))
                 {
                     ledger.Stage = PhaseStages.AwaitingVerify;
+                    ClearRunnerHold(ledger);
                     ledger.UpdatedAtUtc = timeProvider.GetUtcNow();
                     AddPhaseEvent(ledger.IssueId, ledger.IssueIdentifier, "phase_repair_head_moved",
                         $"Repair moved PR #{ledger.PrNumber} head to {Short(confirmed.HeadSha)} " +
@@ -1278,8 +1372,11 @@ public sealed class PhaseOrchestrator(
             return;
         }
 
-        // Head moved: re-verify CI at the new head, then final review follows.
+        // Head moved: re-verify CI at the new head, then final review follows. The
+        // repair ran, so an implementer that was out of quota is working again and
+        // the hold it was under - and the cause it was part of - is over.
         ledger.Stage = PhaseStages.AwaitingVerify;
+        ClearRunnerHold(ledger);
         ledger.UpdatedAtUtc = timeProvider.GetUtcNow();
         AddPhaseEvent(ledger.IssueId, ledger.IssueIdentifier, "phase_repair_head_moved",
             $"Repair moved PR #{ledger.PrNumber} head to {Short(pullRequest.HeadSha)}; re-verifying before the final review.");
@@ -1324,12 +1421,7 @@ public sealed class PhaseOrchestrator(
         ledger.HoldReason = RunnerQuotaHoldReason;
         ledger.HoldRunner = runner;
 
-        // Back to the stage that asks, so the hold expiring is all it takes to try
-        // again. Left at `reviewing` the ledger would wait on a run that is over.
-        if (ledger.Stage == PhaseStages.Reviewing)
-        {
-            ledger.Stage = PhaseStages.AwaitingReview;
-        }
+        RewindToAskingStage(ledger);
 
         ledger.UpdatedAtUtc = nowUtc;
         AddPhaseEvent(ledger.IssueId, ledger.IssueIdentifier, RunnerQuotaHoldEventName,
@@ -1346,6 +1438,26 @@ public sealed class PhaseOrchestrator(
             ledger.Stage,
             resumeAtUtc);
     }
+
+    /// <summary>
+    /// Put the ledger back at the stage that ASKS, so the hold expiring is all it
+    /// takes to try again.
+    /// </summary>
+    /// <remarks>
+    /// Every stage that can be refused for quota needs this, and each one needs its
+    /// own destination. Left where they are, `reviewing` and `wait_for_repair` both
+    /// wait on a run that is already over - and waiting is not asking, so the hold
+    /// expires, the switch finds the same dead run, and the hold is renewed. The
+    /// review path was rewound from the start; the repair path was not, and it sat
+    /// out one quota window after another until the six-hour bound escalated it.
+    /// </remarks>
+    private static void RewindToAskingStage(PhaseLedgerEntity ledger) =>
+        ledger.Stage = ledger.Stage switch
+        {
+            PhaseStages.Reviewing => PhaseStages.AwaitingReview,
+            PhaseStages.WaitForRepair => PhaseStages.AwaitingRepair,
+            _ => ledger.Stage
+        };
 
     /// <summary>
     /// True when the hold is over and the caller may go on advancing this ledger.
@@ -1372,12 +1484,36 @@ public sealed class PhaseOrchestrator(
         return true;
     }
 
-    private static void ClearRunnerHold(PhaseLedgerEntity ledger)
+    /// <summary>
+    /// The phase moved, so whatever it was waiting out is over.
+    /// </summary>
+    /// <remarks>
+    /// If it was waiting on an exhausted account, that account has just been
+    /// observed producing work, and that is the only honest evidence the outage
+    /// ended. Recorded, because the duplicate suppression has to tell "still
+    /// exhausted" from "exhausted again, later" and a reset timestamp cannot: it
+    /// expires on schedule whether or not anything was fixed.
+    ///
+    /// Callers save; this only stages the change alongside theirs.
+    /// </remarks>
+    private void ClearRunnerHold(PhaseLedgerEntity ledger)
     {
+        var wasQuotaHold = string.Equals(ledger.HoldReason, RunnerQuotaHoldReason, StringComparison.Ordinal);
+        var runner = ledger.HoldRunner;
+
         ledger.HoldUntilUtc = null;
         ledger.HoldSinceUtc = null;
         ledger.HoldReason = null;
         ledger.HoldRunner = null;
+
+        if (!wasQuotaHold || string.IsNullOrWhiteSpace(runner))
+        {
+            return;
+        }
+
+        AddPhaseEvent(ledger.IssueId, ledger.IssueIdentifier, RunnerQuotaRecoveredEventName,
+            $"Runner '{runner}' produced work again on {ledger.IssueIdentifier}, so it is no longer an open cause.",
+            JsonSerializer.Serialize(new RunnerQuotaEventState(runner)));
     }
 
     /// <summary>
@@ -1393,10 +1529,14 @@ public sealed class PhaseOrchestrator(
         if (await IsRunnerQuotaAlreadyEscalatedAsync(runner, cancellationToken))
         {
             // Someone else already said it. Keep holding quietly rather than
-            // repeating one cause once per blocked issue.
+            // repeating one cause once per blocked issue - but hold at the stage
+            // that asks, exactly as an unsuppressed hold does. A quiet hold that
+            // could never re-dispatch would be a silent park, which is the fault
+            // this whole path exists to remove.
             ledger.HoldUntilUtc = resumeAtUtc;
             ledger.HoldReason = RunnerQuotaHoldReason;
             ledger.HoldRunner = runner;
+            RewindToAskingStage(ledger);
             ledger.UpdatedAtUtc = timeProvider.GetUtcNow();
             AddPhaseEvent(ledger.IssueId, ledger.IssueIdentifier, RunnerQuotaHoldEventName,
                 $"Runner '{runner}' being out of quota is already with the command center; " +
@@ -1420,6 +1560,21 @@ public sealed class PhaseOrchestrator(
             cancellationToken);
     }
 
+    /// <summary>
+    /// Is this runner's exhaustion already an open attention item?
+    /// </summary>
+    /// <remarks>
+    /// Answered from the last thing recorded ABOUT the runner, not from a clock.
+    /// The first rule suppressed only while the escalation's own `ResumeAtUtc` was
+    /// still ahead - so the moment the reset it named passed, the cause it named
+    /// looked resolved and the next window raised the same empty account again.
+    /// The 2026-09-04 outage spanned two windows; the acceptance is one attention
+    /// item for as long as the runner stays exhausted, which is a condition, not a
+    /// duration.
+    ///
+    /// So the two events are read together and the newer one wins: an escalation
+    /// with no later recovery means the cause is still open.
+    /// </remarks>
     private async Task<bool> IsRunnerQuotaAlreadyEscalatedAsync(string runner, CancellationToken cancellationToken)
     {
         // The most recent few, not just the last one: two runners can be exhausted
@@ -1429,24 +1584,24 @@ public sealed class PhaseOrchestrator(
         // Ordered by Id, not by OccurredAtUtc: SQLite cannot ORDER BY a
         // DateTimeOffset, and the identity column answers "written last" exactly.
         var recent = await dbContext.EventLog
-            .Where(entry => entry.EventName == RunnerQuotaEscalatedEventName)
+            .Where(entry => entry.EventName == RunnerQuotaEscalatedEventName ||
+                            entry.EventName == RunnerQuotaRecoveredEventName)
             .OrderByDescending(entry => entry.Id)
-            .Select(entry => entry.DataJson)
+            .Select(entry => new { entry.EventName, entry.DataJson })
             .Take(RunnerQuotaEscalationScanLimit)
             .ToListAsync(cancellationToken);
 
-        var nowUtc = timeProvider.GetUtcNow();
-        foreach (var dataJson in recent)
+        foreach (var entry in recent)
         {
-            if (string.IsNullOrWhiteSpace(dataJson))
+            if (string.IsNullOrWhiteSpace(entry.DataJson))
             {
                 continue;
             }
 
-            RunnerQuotaHoldState? state;
+            RunnerQuotaEventState? state;
             try
             {
-                state = JsonSerializer.Deserialize<RunnerQuotaHoldState>(dataJson);
+                state = JsonSerializer.Deserialize<RunnerQuotaEventState>(entry.DataJson);
             }
             catch (JsonException)
             {
@@ -1457,22 +1612,32 @@ public sealed class PhaseOrchestrator(
                 continue;
             }
 
-            if (state is not null &&
-                string.Equals(state.Runner, runner, StringComparison.OrdinalIgnoreCase) &&
-                state.ResumeAtUtc > nowUtc)
+            if (state is null || !string.Equals(state.Runner, runner, StringComparison.OrdinalIgnoreCase))
             {
-                return true;
+                continue;
             }
+
+            // The newest row for this runner decides, and nothing older is read:
+            // an escalation means the cause is still open, a recovery means it was
+            // closed and anything after it is a new outage worth naming.
+            return entry.EventName == RunnerQuotaEscalatedEventName;
         }
 
         return false;
     }
 
     // Enough to cover every runner that could be exhausted at once several times
-    // over, without reading an event log that grows forever.
-    private const int RunnerQuotaEscalationScanLimit = 20;
+    // over, without reading an event log that grows forever. Raised when recoveries
+    // joined escalations in the same scan: both are written per runner per outage,
+    // so the window that has to hold them is twice what it was.
+    private const int RunnerQuotaEscalationScanLimit = 50;
 
     private sealed record RunnerQuotaHoldState(string Runner, DateTimeOffset ResumeAtUtc);
+
+    // The part of a quota event every reader needs. Escalations carry the reset
+    // they expected as well; recoveries have nothing to say about a reset, and the
+    // suppression rule no longer asks about one.
+    private sealed record RunnerQuotaEventState(string Runner);
 
     private static string? Truncate(string? value, int maxLength) =>
         value is not null && value.Length > maxLength ? value[..maxLength] + "…" : value;
