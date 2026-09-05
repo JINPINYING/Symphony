@@ -569,6 +569,69 @@ public sealed class OrchestrationTickServiceTests
                 comment.Body.Contains(DirectiveProcessor.AckMarkerFor("directive-1"), StringComparison.Ordinal)));
     }
 
+    // The bound is worth nothing if it depends on the tracker accepting a write.
+    // The permanent absences it exists for - deleted, transferred, or recorded
+    // against a repository the issue no longer lives in - are exactly the ones
+    // that cannot be commented on, and PostIssueCommentAsync throws on an HTTP or
+    // GraphQL error. If that throw escaped, the exhausted path would land in the
+    // outer "will retry next tick" handler with no ledger row and the run still
+    // parked: the unbounded retry back again, in the one case the bound was for.
+    [Fact]
+    public async Task RunTickAsync_ShouldAbandonAnUnreadableDirectiveEvenWhenTheAbandonmentCommentCannotBePosted()
+    {
+        var clock = new MutableTimeProvider(DateTimeOffset.Parse("2026-09-01T10:00:00Z"));
+        var tracker = new FakeTrackerClient([]) { ThrowOnPostComment = true };
+        tracker.CommentsByIssueId["issue-1"] =
+        [
+            new NormalizedIssueComment(
+                "directive-1",
+                "symphony:directive\naction: resume",
+                "owner-login",
+                "OWNER",
+                DateTimeOffset.Parse("2026-09-01T09:59:00Z"))
+        ];
+
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success),
+            timeProvider: clock);
+
+        await harness.InsertRunAsync("issue-1", "#1", "Open", "instance-1", RunStatusNames.NeedsCommandCenter);
+
+        // Three attempts over more than an hour, with every comment write - the
+        // deferral notices and then the abandonment - refused by the tracker.
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        clock.Advance(TimeSpan.FromMinutes(35));
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        clock.Advance(TimeSpan.FromMinutes(35));
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Empty(tracker.PostedComments);
+
+        var ledger = Assert.Single(await harness.DbContext.DirectiveLog.ToListAsync());
+        Assert.Equal("consumed_unreadable", ledger.Outcome);
+        Assert.Contains("3 attempts", ledger.Detail);
+
+        var run = await harness.DbContext.Runs.SingleAsync();
+        Assert.Equal(RunStatusNames.AbandonedUnreadableIssue, run.Status);
+        Assert.NotEqual(RunStatusNames.NeedsCommandCenter, run.Status);
+        Assert.NotNull(run.CompletedAtUtc);
+        Assert.Empty(harness.Coordinator.StartRequests);
+
+        // Consumed exactly once: a tracker that starts accepting writes again does
+        // not reopen a directive the plane already answered for good.
+        tracker.ThrowOnPostComment = false;
+        clock.Advance(TimeSpan.FromMinutes(35));
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Single(await harness.DbContext.DirectiveLog.ToListAsync());
+        Assert.Empty(tracker.PostedComments);
+        Assert.Equal(
+            RunStatusNames.AbandonedUnreadableIssue,
+            (await harness.DbContext.Runs.SingleAsync()).Status);
+    }
+
     // The bound must not end a retry that is merely slow to be reached. Three
     // ticks in the same second are three attempts and no elapsed time, and a
     // directive discarded there would be discarded for a tracker blip.

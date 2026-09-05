@@ -420,16 +420,43 @@ public sealed class DirectiveProcessor(
             "abandoned_unreadable_issue",
             $"Directive comment {comment.Id} was abandoned: {issueIdentifier} could not be read from " +
             $"{repositoryKey} in {attemptSummary}.");
-        await AckAsync(
-            query, comment, issueId,
-            $"**Directive abandoned:** the plane could not read {issueIdentifier} back from " +
-            $"`{repositoryKey}` in {attemptSummary}, so it has stopped retrying and consumed this directive.\n\n" +
-            "Your comment parsed correctly — this is not a rejection, and nothing was dispatched. A read that " +
-            "never succeeds usually means the issue was deleted, transferred, or is recorded against a " +
-            $"repository it no longer lives in. Check that {issueIdentifier} is visible in `{repositoryKey}`, " +
-            "then post a fresh `symphony:directive` block. The escalated run(s) are recorded as " +
-            $"`{RunStatusNames.AbandonedUnreadableIssue}` rather than left parked for ever.",
-            cancellationToken);
+        // The comment is the courtesy; the consumption is the guarantee. The
+        // permanent absences this branch exists for - an issue deleted,
+        // transferred, or recorded against a repository it no longer lives in -
+        // are precisely the ones that cannot be commented on either, and
+        // PostIssueCommentAsync throws on an HTTP or GraphQL error. Letting that
+        // throw propagate would carry the exhausted path back out through the
+        // outer "unconsumed directives will retry next tick" handler with no
+        // ledger row written and the runs still parked: the unbounded retry
+        // restored in the one case the bound was built for.
+        try
+        {
+            await AckAsync(
+                query, comment, issueId,
+                $"**Directive abandoned:** the plane could not read {issueIdentifier} back from " +
+                $"`{repositoryKey}` in {attemptSummary}, so it has stopped retrying and consumed this directive.\n\n" +
+                "Your comment parsed correctly — this is not a rejection, and nothing was dispatched. A read that " +
+                "never succeeds usually means the issue was deleted, transferred, or is recorded against a " +
+                $"repository it no longer lives in. Check that {issueIdentifier} is visible in `{repositoryKey}`, " +
+                "then post a fresh `symphony:directive` block. The escalated run(s) are recorded as " +
+                $"`{RunStatusNames.AbandonedUnreadableIssue}` rather than left parked for ever.",
+                cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(
+                ex,
+                "Could not post the abandonment comment for directive {CommentId} on {IssueIdentifier}; " +
+                "the directive is consumed and the escalated run(s) settled regardless.",
+                comment.Id, issueIdentifier);
+        }
+
+        // Written last, and in one SaveChanges: the ledger row and the settled
+        // run statuses land together whether or not the comment above posted.
         await RecordConsumptionAsync(
             comment.Id, issueId, issueIdentifier, action, parsed.Phase,
             "consumed_unreadable",
