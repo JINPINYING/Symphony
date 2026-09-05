@@ -26,7 +26,21 @@ public sealed class EscalationPublisher(
 
     public static string MarkerFor(string runId) => $"<!-- symphony:escalation:{runId} -->";
 
-    public async Task PublishPendingEscalationsAsync(TrackerQuery query, CancellationToken cancellationToken)
+    /// <summary>
+    /// Publish every pending escalation against the repository its own run belongs
+    /// to.
+    /// </summary>
+    /// <remarks>
+    /// This used to take a single <see cref="TrackerQuery"/> - the PRIMARY
+    /// repository - whatever repository the escalated run came from. An issue node
+    /// id is global and an issue number is unique only within a repository, so
+    /// asking the wrong repository returns nothing (or somebody else's issue #45)
+    /// rather than erroring, and every escalation outside the primary repository
+    /// stayed unpublished. Same shape as the by-id reload fix in
+    /// OrchestrationTickService.Persistence.cs: only the run row records which
+    /// repository the work came from, so the query has to be chosen per run.
+    /// </remarks>
+    public async Task PublishPendingEscalationsAsync(TrackerQuerySet queries, CancellationToken cancellationToken)
     {
         List<RunEntity> pending;
         try
@@ -52,7 +66,7 @@ public sealed class EscalationPublisher(
         {
             try
             {
-                await PublishOneAsync(query, run, cancellationToken);
+                await PublishOneAsync(queries.For(run.Repository), run, cancellationToken);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {

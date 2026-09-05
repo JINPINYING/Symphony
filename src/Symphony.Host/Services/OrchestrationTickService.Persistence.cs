@@ -718,6 +718,12 @@ public sealed partial class OrchestrationTickService
             .ToList());
     }
 
-    private static TrackerQuery BuildTrackerQuery(WorkflowDefinition workflowDefinition, string apiKey) =>
-        BuildTrackerQueries(workflowDefinition, apiKey).Primary;
+    // There is deliberately no BuildTrackerQuery singular here. It read as a
+    // convenience and behaved as a default-to-the-primary-repository, which is
+    // wrong for every caller that has an issue in hand: three separate defects
+    // (the tracked-issue cache, the running-run reconciliation, then the directive
+    // processor and escalation publisher) were all this one shape. Callers take
+    // the set and pick with TrackerQuerySet.For(repository); a caller that
+    // genuinely means "the primary repository" says .Primary at the call site,
+    // where a reviewer can see the claim.
 }

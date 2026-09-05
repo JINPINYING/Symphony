@@ -317,6 +317,524 @@ public sealed class OrchestrationTickServiceTests
         Assert.Equal("consumed_dispatched", ledger.Outcome);
     }
 
+    // Symphony#82. Every directive was read against the PRIMARY repository, whatever
+    // repository the escalated issue lived in. A node id is global and an issue
+    // number is unique only within a repository, so the wrong repository answers
+    // "nothing" rather than erroring - and the processor read that as "the issue
+    // does not exist" and discarded the directive permanently.
+    //
+    // Eight issues sat parked with no route back into review, and the status page's
+    // "Un-park it" button posted the comment correctly and then threw it away one
+    // tick later.
+    [Fact]
+    public async Task RunTickAsync_ShouldExecuteADirectiveOnAnIssueInANonPrimaryRepository()
+    {
+        var tracker = new FakeTrackerClient([]);
+        tracker.IssuesById["issue-s"] = BuildIssue("issue-s", "#45", "Open", null);
+        tracker.IssueRepositoryById["issue-s"] = "JINPINYING/Symphony";
+        tracker.CommentsByIssueId["issue-s"] =
+        [
+            new NormalizedIssueComment(
+                "directive-1",
+                "symphony:directive\naction: resume",
+                "owner-login",
+                "OWNER",
+                DateTimeOffset.UtcNow.AddMinutes(-1))
+        ];
+
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(
+                maxConcurrentAgents: 1,
+                repositories: [("JINPINYING", "Product"), ("JINPINYING", "Symphony")]),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success));
+
+        await harness.InsertRunAsync("issue-s", "#45", "Open", "instance-1", RunStatusNames.NeedsCommandCenter);
+
+        // The work belongs to Symphony, and only the run row records that.
+        var escalated = await harness.DbContext.Runs.SingleAsync();
+        escalated.Repository = "JINPINYING/Symphony";
+        await harness.DbContext.SaveChangesAsync();
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var request = Assert.Single(harness.Coordinator.StartRequests);
+        Assert.Equal(DirectiveActions.Resume, request.DirectiveAction);
+
+        var ledger = Assert.Single(await harness.DbContext.DirectiveLog.ToListAsync());
+        Assert.Equal("consumed_dispatched", ledger.Outcome);
+
+        // Read from, and answered on, the repository that owns the issue.
+        Assert.Contains("JINPINYING/Symphony", tracker.IssueCommentFetchRepositories);
+        Assert.Contains(
+            tracker.PostedComments,
+            comment => comment.Repository == "JINPINYING/Symphony" &&
+                comment.Body.Contains(DirectiveProcessor.AckMarkerFor("directive-1"), StringComparison.Ordinal));
+    }
+
+    // The other half of the same wedge: the escalation that parks a non-primary
+    // issue was published against the primary repository too, so it never reached
+    // the issue the owner was looking at.
+    [Fact]
+    public async Task RunTickAsync_ShouldPublishAnEscalationOnItsOwnRepository()
+    {
+        var tracker = new FakeTrackerClient([]);
+        tracker.IssueRepositoryById["issue-s"] = "JINPINYING/Symphony";
+
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(
+                maxConcurrentAgents: 1,
+                repositories: [("JINPINYING", "Product"), ("JINPINYING", "Symphony")]),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await harness.InsertRunAsync("issue-s", "#45", "Open", "instance-1", RunStatusNames.NeedsCommandCenter);
+
+        var escalated = await harness.DbContext.Runs.SingleAsync();
+        escalated.Repository = "JINPINYING/Symphony";
+        await harness.DbContext.SaveChangesAsync();
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var posted = Assert.Single(tracker.PostedComments);
+        Assert.Equal("JINPINYING/Symphony", posted.Repository);
+        Assert.NotNull((await harness.DbContext.Runs.SingleAsync()).EscalationPostedAtUtc);
+    }
+
+    // "The issue could not be reloaded" is a statement about the read, not about
+    // the directive, and it used to discard the directive for good - no retry, and
+    // an ack telling the owner to post a corrected block that would meet the same
+    // discard. A directive is only ever consumed for something the comment text
+    // itself decides.
+    [Fact]
+    public async Task RunTickAsync_ShouldRetryADirectiveWhoseIssueCannotBeReadRatherThanDiscardIt()
+    {
+        var tracker = new FakeTrackerClient([]);
+        tracker.CommentsByIssueId["issue-1"] =
+        [
+            new NormalizedIssueComment(
+                "directive-1",
+                "symphony:directive\naction: resume",
+                "owner-login",
+                "OWNER",
+                DateTimeOffset.UtcNow.AddMinutes(-1))
+        ];
+
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success));
+
+        await harness.InsertRunAsync("issue-1", "#1", "Open", "instance-1", RunStatusNames.NeedsCommandCenter);
+
+        // The reload finds nothing: IssuesById has no entry for the issue.
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Empty(harness.Coordinator.StartRequests);
+        Assert.Empty(await harness.DbContext.DirectiveLog.ToListAsync());
+        Assert.Contains(
+            await harness.DbContext.EventLog.ToListAsync(),
+            entry => entry.EventName == DirectiveProcessor.PendingDirectiveEvent);
+
+        // The owner is told the plane could not act yet, in wording that is not the
+        // rejection wording - and under a marker that is not the ack marker, which
+        // would have made the next tick treat the directive as already handled.
+        var notice = Assert.Single(
+            tracker.PostedComments.Where(comment =>
+                comment.Body.Contains(DirectiveProcessor.DeferralMarkerFor("directive-1"), StringComparison.Ordinal)));
+        Assert.DoesNotContain(DirectiveProcessor.AckMarkerFor("directive-1"), notice.Body);
+        Assert.Contains("not** been discarded", notice.Body);
+        Assert.DoesNotContain("Directive rejected", notice.Body);
+
+        // And once the read works, the same directive comment dispatches.
+        tracker.IssuesById["issue-1"] = BuildIssue("issue-1", "#1", "Open", null);
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Single(harness.Coordinator.StartRequests);
+        var ledger = Assert.Single(await harness.DbContext.DirectiveLog.ToListAsync());
+        Assert.Equal("consumed_dispatched", ledger.Outcome);
+    }
+
+    // A tracker that stays unreadable must not add a notice per tick.
+    [Fact]
+    public async Task RunTickAsync_ShouldPostTheDirectiveDeferralNoticeOnlyOnce()
+    {
+        var tracker = new FakeTrackerClient([]);
+        tracker.CommentsByIssueId["issue-1"] =
+        [
+            new NormalizedIssueComment(
+                "directive-1",
+                "symphony:directive\naction: resume",
+                "owner-login",
+                "OWNER",
+                DateTimeOffset.UtcNow.AddMinutes(-1))
+        ];
+
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success));
+
+        await harness.InsertRunAsync("issue-1", "#1", "Open", "instance-1", RunStatusNames.NeedsCommandCenter);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Single(
+            tracker.PostedComments.Where(comment =>
+                comment.Body.Contains(DirectiveProcessor.DeferralMarkerFor("directive-1"), StringComparison.Ordinal)));
+        Assert.Empty(await harness.DbContext.DirectiveLog.ToListAsync());
+    }
+
+    // The retry above is the fix for reading a transient empty as a permanent
+    // absence. Unbounded, it is that fault inverted: FetchIssuesByIdsAsync takes
+    // the REST route when it has an issue number, and ReadRestObjectAsync turns a
+    // genuine 404 into the same null a rate limit produces - so a deleted,
+    // transferred or wrongly-recorded issue would be retried for ever, leaving a
+    // directive nobody ever answers and a run parked at needs_command_center being
+    // reprocessed on every tick.
+    //
+    // The bound is attempts AND elapsed time together: attempts alone are set by
+    // the tick interval, and elapsed alone is crossed by one retry after an
+    // overnight outage.
+    [Fact]
+    public async Task RunTickAsync_ShouldStopRetryingADirectiveWhoseIssueStaysUnreadable()
+    {
+        var clock = new MutableTimeProvider(DateTimeOffset.Parse("2026-09-01T10:00:00Z"));
+        var tracker = new FakeTrackerClient([]);
+        tracker.CommentsByIssueId["issue-1"] =
+        [
+            new NormalizedIssueComment(
+                "directive-1",
+                "symphony:directive\naction: resume",
+                "owner-login",
+                "OWNER",
+                DateTimeOffset.Parse("2026-09-01T09:59:00Z"))
+        ];
+
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success),
+            timeProvider: clock);
+
+        await harness.InsertRunAsync("issue-1", "#1", "Open", "instance-1", RunStatusNames.NeedsCommandCenter);
+
+        // Attempts 1 and 2, thirty-five minutes apart: inside the window, so the
+        // directive is still pending and the escalation is still the owner's.
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        clock.Advance(TimeSpan.FromMinutes(35));
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Empty(await harness.DbContext.DirectiveLog.ToListAsync());
+        Assert.Equal(
+            RunStatusNames.NeedsCommandCenter,
+            (await harness.DbContext.Runs.SingleAsync()).Status);
+
+        // Attempt 3 at seventy minutes: three attempts over more than an hour, so
+        // the plane stops asking.
+        clock.Advance(TimeSpan.FromMinutes(35));
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var ledger = Assert.Single(await harness.DbContext.DirectiveLog.ToListAsync());
+        Assert.Equal("consumed_unreadable", ledger.Outcome);
+        Assert.Contains("3 attempts", ledger.Detail);
+
+        var run = await harness.DbContext.Runs.SingleAsync();
+        Assert.Equal(RunStatusNames.AbandonedUnreadableIssue, run.Status);
+        Assert.NotEqual(RunStatusNames.NeedsCommandCenter, run.Status);
+        Assert.NotNull(run.CompletedAtUtc);
+        Assert.Empty(harness.Coordinator.StartRequests);
+
+        // The owner is told which of the three things happened: not "fix your
+        // comment", not "still trying", but how many times the plane asked and
+        // over how long before it gave up.
+        var abandonment = Assert.Single(
+            tracker.PostedComments.Where(comment =>
+                comment.Body.Contains(DirectiveProcessor.AckMarkerFor("directive-1"), StringComparison.Ordinal)));
+        Assert.Contains("Directive abandoned", abandonment.Body);
+        Assert.Contains("3 attempts", abandonment.Body);
+        Assert.Contains("1.2 hours", abandonment.Body);
+        Assert.DoesNotContain("Directive rejected", abandonment.Body);
+        Assert.DoesNotContain("not** been discarded", abandonment.Body);
+
+        // Consumed exactly once: later ticks neither re-answer nor re-count it.
+        clock.Advance(TimeSpan.FromMinutes(35));
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Single(await harness.DbContext.DirectiveLog.ToListAsync());
+        Assert.Single(
+            tracker.PostedComments.Where(comment =>
+                comment.Body.Contains(DirectiveProcessor.AckMarkerFor("directive-1"), StringComparison.Ordinal)));
+    }
+
+    // The bound is worth nothing if it depends on the tracker accepting a write.
+    // The permanent absences it exists for - deleted, transferred, or recorded
+    // against a repository the issue no longer lives in - are exactly the ones
+    // that cannot be commented on, and PostIssueCommentAsync throws on an HTTP or
+    // GraphQL error. If that throw escaped, the exhausted path would land in the
+    // outer "will retry next tick" handler with no ledger row and the run still
+    // parked: the unbounded retry back again, in the one case the bound was for.
+    [Fact]
+    public async Task RunTickAsync_ShouldAbandonAnUnreadableDirectiveEvenWhenTheAbandonmentCommentCannotBePosted()
+    {
+        var clock = new MutableTimeProvider(DateTimeOffset.Parse("2026-09-01T10:00:00Z"));
+        var tracker = new FakeTrackerClient([]) { ThrowOnPostComment = true };
+        tracker.CommentsByIssueId["issue-1"] =
+        [
+            new NormalizedIssueComment(
+                "directive-1",
+                "symphony:directive\naction: resume",
+                "owner-login",
+                "OWNER",
+                DateTimeOffset.Parse("2026-09-01T09:59:00Z"))
+        ];
+
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success),
+            timeProvider: clock);
+
+        await harness.InsertRunAsync("issue-1", "#1", "Open", "instance-1", RunStatusNames.NeedsCommandCenter);
+
+        // Three attempts over more than an hour, with every comment write - the
+        // deferral notices and then the abandonment - refused by the tracker.
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        clock.Advance(TimeSpan.FromMinutes(35));
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        clock.Advance(TimeSpan.FromMinutes(35));
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Empty(tracker.PostedComments);
+
+        var ledger = Assert.Single(await harness.DbContext.DirectiveLog.ToListAsync());
+        Assert.Equal("consumed_unreadable", ledger.Outcome);
+        Assert.Contains("3 attempts", ledger.Detail);
+
+        var run = await harness.DbContext.Runs.SingleAsync();
+        Assert.Equal(RunStatusNames.AbandonedUnreadableIssue, run.Status);
+        Assert.NotEqual(RunStatusNames.NeedsCommandCenter, run.Status);
+        Assert.NotNull(run.CompletedAtUtc);
+        Assert.Empty(harness.Coordinator.StartRequests);
+
+        // The ack the tracker refused is recorded as owed rather than dropped.
+        var owed = Assert.Single(
+            (await harness.DbContext.EventLog.ToListAsync())
+                .Where(entry => entry.EventName == DirectiveProcessor.AckPendingEvent));
+        var owedAck = JsonSerializer.Deserialize<DirectiveProcessor.PendingAckState>(owed.DataJson!);
+        Assert.NotNull(owedAck);
+        Assert.Equal("directive-1", owedAck.CommentId);
+        Assert.Contains(DirectiveProcessor.AckMarkerFor("directive-1"), owedAck.Body);
+
+        // A tracker that starts accepting writes again pays the debt - once - and
+        // does not reopen a directive the plane already answered for good.
+        tracker.ThrowOnPostComment = false;
+        clock.Advance(TimeSpan.FromMinutes(35));
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Single(await harness.DbContext.DirectiveLog.ToListAsync());
+        var abandonment = Assert.Single(
+            tracker.PostedComments.Where(comment =>
+                comment.Body.Contains(DirectiveProcessor.AckMarkerFor("directive-1"), StringComparison.Ordinal)));
+        Assert.Contains("Directive abandoned", abandonment.Body);
+        Assert.Equal(
+            RunStatusNames.AbandonedUnreadableIssue,
+            (await harness.DbContext.Runs.SingleAsync()).Status);
+
+        // Paid means settled: the debt is gone and no later tick posts it again.
+        Assert.Empty(
+            (await harness.DbContext.EventLog.ToListAsync())
+                .Where(entry => entry.EventName == DirectiveProcessor.AckPendingEvent));
+
+        clock.Advance(TimeSpan.FromMinutes(35));
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Single(
+            tracker.PostedComments.Where(comment =>
+                comment.Body.Contains(DirectiveProcessor.AckMarkerFor("directive-1"), StringComparison.Ordinal)));
+    }
+
+    // The write ordering, which is what the third attempt on this issue is for.
+    // Acking before persisting left a window in which the ack marker was on the
+    // issue and the database knew nothing about it: the next tick found the marker,
+    // wrote a bare consumed_already_acked ledger row - which settles no run - and
+    // skipped the directive for ever after because it was now in the ledger. The
+    // directive was consumed and the issue stayed parked at needs_command_center,
+    // which is the failure this issue exists to close, reached by a crash instead
+    // of by a misdirected read.
+    //
+    // From the database's side a process that dies between the persist and the
+    // comment is indistinguishable from a tracker that refuses the write, so the
+    // fault is injected at the write.
+    [Fact]
+    public async Task RunTickAsync_ShouldConsumeAndUnparkWhenTheProcessFailsBetweenPersistingAndAcking()
+    {
+        var clock = new MutableTimeProvider(DateTimeOffset.Parse("2026-09-01T10:00:00Z"));
+        var tracker = new FakeTrackerClient([]) { ThrowOnPostComment = true };
+        tracker.IssuesById["issue-1"] = BuildIssue("issue-1", "#1", "Open", null);
+        tracker.CommentsByIssueId["issue-1"] =
+        [
+            new NormalizedIssueComment(
+                "directive-1",
+                "symphony:directive\naction: resume",
+                "owner-login",
+                "OWNER",
+                DateTimeOffset.Parse("2026-09-01T09:59:00Z"))
+        ];
+
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success),
+            timeProvider: clock);
+
+        await harness.InsertRunAsync("issue-1", "#1", "Open", "instance-1", RunStatusNames.NeedsCommandCenter);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        // Everything durable landed before the tracker was spoken to: the directive
+        // is consumed exactly once and the escalation is off the owner's desk.
+        var ledger = Assert.Single(await harness.DbContext.DirectiveLog.ToListAsync());
+        Assert.Equal("consumed_dispatched", ledger.Outcome);
+        Assert.Single(harness.Coordinator.StartRequests);
+        Assert.Empty(tracker.PostedComments);
+
+        var parked = await harness.DbContext.Runs
+            .Where(run => run.Status == RunStatusNames.NeedsCommandCenter)
+            .ToListAsync();
+        Assert.Empty(parked);
+
+        // The comment the owner is owed is the only thing lost, and it is recorded
+        // as a debt rather than dropped.
+        var owed = Assert.Single(
+            (await harness.DbContext.EventLog.ToListAsync())
+                .Where(entry => entry.EventName == DirectiveProcessor.AckPendingEvent));
+        var owedAck = JsonSerializer.Deserialize<DirectiveProcessor.PendingAckState>(owed.DataJson!);
+        Assert.NotNull(owedAck);
+        Assert.Equal("directive-1", owedAck.CommentId);
+        Assert.Contains(DirectiveProcessor.AckMarkerFor("directive-1"), owedAck.Body);
+
+        // The next tick pays it, and re-dispatches nothing: the ledger row written
+        // first is what keeps the directive from being acted on twice.
+        tracker.ThrowOnPostComment = false;
+        clock.Advance(TimeSpan.FromMinutes(10));
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var ack = Assert.Single(
+            tracker.PostedComments.Where(comment =>
+                comment.Body.Contains(DirectiveProcessor.AckMarkerFor("directive-1"), StringComparison.Ordinal)));
+        Assert.Contains("Directive executed", ack.Body);
+        Assert.Single(await harness.DbContext.DirectiveLog.ToListAsync());
+        Assert.Single(harness.Coordinator.StartRequests);
+        Assert.Empty(
+            (await harness.DbContext.EventLog.ToListAsync())
+                .Where(entry => entry.EventName == DirectiveProcessor.AckPendingEvent));
+    }
+
+    // The other half of the same crash window: the comment landed and the debt did
+    // not get deleted. Replaying it must not tell the owner twice.
+    [Fact]
+    public async Task RunTickAsync_ShouldNotRepostAnOwedAckThatIsAlreadyOnTheIssue()
+    {
+        var tracker = new FakeTrackerClient([]);
+        var ackBody =
+            $"{DirectiveProcessor.AckMarkerFor("directive-1")}\n**Directive executed** — `resume`.\n\n— Symphony directive processor";
+        tracker.CommentsByIssueId["issue-1"] =
+        [
+            new NormalizedIssueComment(
+                "directive-1",
+                "symphony:directive\naction: resume",
+                "owner-login",
+                "OWNER",
+                DateTimeOffset.UtcNow.AddMinutes(-2)),
+            new NormalizedIssueComment(
+                "ack-1",
+                ackBody,
+                "symphony-bot",
+                "OWNER",
+                DateTimeOffset.UtcNow.AddMinutes(-1))
+        ];
+
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success));
+
+        harness.DbContext.EventLog.Add(new EventLogEntity
+        {
+            IssueId = "issue-1",
+            IssueIdentifier = "#1",
+            EventName = DirectiveProcessor.AckPendingEvent,
+            Level = "Information",
+            Message = "Directive comment directive-1: the ack is owed and has not been posted yet.",
+            DataJson = JsonSerializer.Serialize(
+                new DirectiveProcessor.PendingAckState("directive-1", "owner/repo", ackBody, 0, null)),
+            OccurredAtUtc = DateTimeOffset.UtcNow
+        });
+        await harness.DbContext.SaveChangesAsync();
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Empty(tracker.PostedComments);
+        Assert.Empty(
+            (await harness.DbContext.EventLog.ToListAsync())
+                .Where(entry => entry.EventName == DirectiveProcessor.AckPendingEvent));
+    }
+
+    // The bound must not end a retry that is merely slow to be reached. Three
+    // ticks in the same second are three attempts and no elapsed time, and a
+    // directive discarded there would be discarded for a tracker blip.
+    [Fact]
+    public async Task RunTickAsync_ShouldKeepRetryingAnUnreadableIssueInsideTheWindow()
+    {
+        var clock = new MutableTimeProvider(DateTimeOffset.Parse("2026-09-01T10:00:00Z"));
+        var tracker = new FakeTrackerClient([]);
+        tracker.CommentsByIssueId["issue-1"] =
+        [
+            new NormalizedIssueComment(
+                "directive-1",
+                "symphony:directive\naction: resume",
+                "owner-login",
+                "OWNER",
+                DateTimeOffset.Parse("2026-09-01T09:59:00Z"))
+        ];
+
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success),
+            timeProvider: clock);
+
+        await harness.InsertRunAsync("issue-1", "#1", "Open", "instance-1", RunStatusNames.NeedsCommandCenter);
+
+        for (var tick = 0; tick < 5; tick++)
+        {
+            await harness.Service.RunTickAsync(CancellationToken.None);
+            clock.Advance(TimeSpan.FromSeconds(30));
+        }
+
+        Assert.Empty(await harness.DbContext.DirectiveLog.ToListAsync());
+        Assert.Equal(
+            RunStatusNames.NeedsCommandCenter,
+            (await harness.DbContext.Runs.SingleAsync()).Status);
+
+        // One row for the whole outage, not one per tick.
+        var counted = Assert.Single(
+            (await harness.DbContext.EventLog.ToListAsync())
+                .Where(entry => entry.EventName == DirectiveProcessor.UnreadableDirectiveEvent));
+        Assert.Contains("5 attempts", counted.Message);
+
+        // And the read coming back inside the window still dispatches the same
+        // comment: the count is a bound, not a state the directive cannot leave.
+        tracker.IssuesById["issue-1"] = BuildIssue("issue-1", "#1", "Open", null);
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Single(harness.Coordinator.StartRequests);
+        Assert.Equal("consumed_dispatched", (await harness.DbContext.DirectiveLog.SingleAsync()).Outcome);
+    }
+
     // Symphony#50. A directive asked for `review`, the ack said `review`, and the
     // run that followed was `implementation` attempt 2 on an issue that already had
     // an open PR - the exact condition that had escalated it. The phase survived the
@@ -573,9 +1091,13 @@ public sealed class OrchestrationTickServiceTests
             (await harness.DbContext.Runs.SingleAsync()).Status);
         var ledger = Assert.Single(await harness.DbContext.DirectiveLog.ToListAsync());
         Assert.Equal("consumed_invalid", ledger.Outcome);
+        // The wording has to say this is final. A malformed directive is the one
+        // case the plane genuinely will not retry, and it is decided by the comment
+        // text alone - no network call, so no outage can produce this answer.
         Assert.Single(
             tracker.PostedComments.Where(comment =>
-                comment.Body.Contains("could not be executed", StringComparison.Ordinal)));
+                comment.Body.Contains("Directive rejected", StringComparison.Ordinal) &&
+                comment.Body.Contains("will not be retried", StringComparison.Ordinal)));
     }
 
     [Fact]
@@ -3571,10 +4093,13 @@ public sealed class OrchestrationTickServiceTests
                     tracker,
                     TimeProvider.System,
                     NullLogger<EscalationPublisher>.Instance),
+                // The test clock, not the wall clock: the directive processor's
+                // unreadable-reload bound is measured in elapsed time, and a test
+                // that has to wait an hour of real time is a test nobody runs.
                 new DirectiveProcessor(
                     dbContext,
                     tracker,
-                    TimeProvider.System,
+                    clock,
                     NullLogger<DirectiveProcessor>.Instance),
                 new PhaseOrchestrator(
                     dbContext,
@@ -3970,11 +4495,31 @@ public sealed class OrchestrationTickServiceTests
             return Task.FromResult(new GitHubGraphQlExecutionResult(true, "{\"data\":{}}"));
         }
 
-        public List<(string IssueId, string Body)> PostedComments { get; } = [];
+        public List<(string Repository, string IssueId, string Body)> PostedComments { get; } = [];
         public bool ThrowOnPostComment { get; set; }
         public bool ThrowOnFetchCommentMarker { get; set; }
         public bool ReturnNullCommentMarkerSnapshot { get; set; }
         public bool MarkerAlreadyPresent { get; set; }
+
+        /// <summary>
+        /// Which repository each issue actually lives in.
+        ///
+        /// The real client filters every by-id read against the query's
+        /// owner/repo, so asking the wrong repository returns nothing rather than
+        /// erroring - the failure mode that made directives on non-primary issues
+        /// look like "the issue does not exist". A fake that answers whoever asks
+        /// cannot see that bug, so when an entry is present here the reads below
+        /// answer only the repository that owns the issue.
+        /// </summary>
+        public Dictionary<string, string> IssueRepositoryById { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+        // Which repository each per-issue read and write was aimed at.
+        public List<string> IssueCommentFetchRepositories { get; } = [];
+        public List<string> IssueByIdFetchRepositories { get; } = [];
+
+        private bool BelongsTo(TrackerQuery query, string issueId) =>
+            !IssueRepositoryById.TryGetValue(issueId, out var repository) ||
+            string.Equals(repository, $"{query.Owner}/{query.Repo}", StringComparison.OrdinalIgnoreCase);
 
         public Task<IssueCommentMarkerSnapshot?> FetchIssueCommentMarkerAsync(
             TrackerQuery query,
@@ -3988,7 +4533,7 @@ public sealed class OrchestrationTickServiceTests
                 throw new InvalidOperationException("simulated tracker outage on comment scan");
             }
 
-            if (ReturnNullCommentMarkerSnapshot)
+            if (ReturnNullCommentMarkerSnapshot || !BelongsTo(query, issueId))
             {
                 return Task.FromResult<IssueCommentMarkerSnapshot?>(null);
             }
@@ -4015,7 +4560,7 @@ public sealed class OrchestrationTickServiceTests
                 throw new InvalidOperationException("simulated comment post failure");
             }
 
-            PostedComments.Add((issueId, body));
+            PostedComments.Add(($"{query.Owner}/{query.Repo}", issueId, body));
             // Mirror the real tracker: posted comments become visible to later
             // comment fetches (marker scans, directive ack detection).
             CommentsByIssueId.TryAdd(issueId, []);
@@ -4042,6 +4587,12 @@ public sealed class OrchestrationTickServiceTests
             string? issueIdentifier = null,
             CancellationToken cancellationToken = default)
         {
+            IssueCommentFetchRepositories.Add($"{query.Owner}/{query.Repo}");
+            if (!BelongsTo(query, issueId))
+            {
+                return Task.FromResult<IReadOnlyList<NormalizedIssueComment>>([]);
+            }
+
             return Task.FromResult<IReadOnlyList<NormalizedIssueComment>>(
                 CommentsByIssueId.TryGetValue(issueId, out var comments) ? [.. comments] : []);
         }
@@ -4052,8 +4603,9 @@ public sealed class OrchestrationTickServiceTests
             IReadOnlyDictionary<string, string>? identifiersByIssueId = null,
             CancellationToken cancellationToken = default)
         {
+            IssueByIdFetchRepositories.Add($"{query.Owner}/{query.Repo}");
             var result = issueIds
-                .Where(id => IssuesById.ContainsKey(id))
+                .Where(id => IssuesById.ContainsKey(id) && BelongsTo(query, id))
                 .Select(id => IssuesById[id])
                 .ToList();
             return Task.FromResult<IReadOnlyList<NormalizedIssue>>(result);

@@ -241,15 +241,23 @@ public sealed partial class OrchestrationTickService
             // M1: escalations created this tick (or still pending from earlier
             // ticks) are published to GitHub before the tick ends, so a parked
             // escalation reaches the owner within one tick.
+            //
+            // Every query, not the primary one: an escalation is published on the
+            // issue in the repository its run belongs to, and asking the wrong
+            // repository about a global node id returns nothing rather than
+            // failing loudly.
             await escalationPublisher.PublishPendingEscalationsAsync(
-                BuildTrackerQuery(workflowDefinition, apiKey),
+                BuildTrackerQueries(workflowDefinition, apiKey),
                 cancellationToken);
 
             // M3: command-center directives on escalated issues are consumed and
-            // acted on — one comment un-parks a stuck issue.
+            // acted on — one comment un-parks a stuck issue. Same reason as above
+            // for handing over the whole set: a directive on an ADCP or Symphony
+            // issue used to be read against the primary repository, come back
+            // empty, and be discarded as "the issue does not exist".
             await directiveProcessor.ProcessPendingDirectivesAsync(
                 workflowDefinition,
-                BuildTrackerQuery(workflowDefinition, apiKey),
+                BuildTrackerQueries(workflowDefinition, apiKey),
                 (issue, directive, token) => DispatchDirectiveIssueAsync(issue, workflowDefinition, instanceId, directive, token),
                 cancellationToken);
 
