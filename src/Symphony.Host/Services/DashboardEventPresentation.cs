@@ -85,6 +85,7 @@ internal static class DashboardEventPresentation
         ["phase_ready"] = "Approved",
         ["phase_merged"] = "Merged",
         ["phase_escalated"] = "Escalated",
+        ["phase_parked_run_reconciled"] = "Un-parked",
         ["run_completed"] = "Run completed",
         ["retry_scheduled"] = "Retry scheduled",
         ["needs_command_center"] = "Needs command center",

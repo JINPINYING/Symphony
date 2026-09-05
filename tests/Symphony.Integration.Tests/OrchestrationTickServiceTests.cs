@@ -1506,6 +1506,150 @@ public sealed class OrchestrationTickServiceTests
         Assert.Equal(RunStatusNames.NeedsCommandCenter, run.Status);
     }
 
+    // A run that escalated out of IMPLEMENTATION escalated before any pull request
+    // existed, so no ledger row was ever created for it - and the stranded-run
+    // sweep starts from the set of SETTLED ledgers, which such an issue can never
+    // be in. Symphony #45 and #50 sat on the owner's panel that way, #50 for three
+    // days through several restarts, with no directive, label, PR close or restart
+    // able to clear them (#87).
+    [Fact]
+    public async Task RunTickAsync_ShouldUnparkARunWithNoLedgerRowAndNoPullRequest()
+    {
+        var tracker = new FakeTrackerClient([], new Dictionary<string, string> { ["issue-45"] = "Open" });
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await SeedParkedRunWithNoLedgerAsync(harness);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var run = Assert.Single(await harness.DbContext.Runs.ToListAsync());
+        Assert.Equal(RunStatusNames.ResolvedByPhaseClear, run.Status);
+        Assert.NotNull(run.CompletedAtUtc);
+        Assert.Empty(await harness.DbContext.PhaseLedger.ToListAsync());
+        Assert.Contains(
+            await harness.DbContext.EventLog.ToListAsync(),
+            entry => entry.EventName == PhaseOrchestrator.ParkedRunReconciledEventName);
+    }
+
+    // The tracker's own answer settles it whatever the ledger says - and here
+    // there is no ledger to say anything. Symphony #50 was fixed by a pull request
+    // opened by hand.
+    [Fact]
+    public async Task RunTickAsync_ShouldUnparkARunWithNoLedgerRowWhenItsIssueIsClosed()
+    {
+        var tracker = new FakeTrackerClient([], new Dictionary<string, string> { ["issue-45"] = "Closed" });
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await SeedParkedRunWithNoLedgerAsync(harness);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var run = Assert.Single(await harness.DbContext.Runs.ToListAsync());
+        Assert.Equal(RunStatusNames.ResolvedByPhaseClear, run.Status);
+    }
+
+    // With a pull request open on the issue's own branch there IS something for a
+    // person to close, and closing it is the route that already works. Clearing the
+    // run here would un-park an issue whose work is still in flight.
+    [Fact]
+    public async Task RunTickAsync_ShouldLeaveAParkedRunAloneWhileItsBranchHasAnOpenPullRequest()
+    {
+        var tracker = new FakeTrackerClient([], new Dictionary<string, string> { ["issue-45"] = "Open" });
+        tracker.OpenPullRequests =
+        [
+            new OpenPullRequest(146, "the work", "https://example.invalid/pull/146", "codex", false,
+                "SUCCESS", "MERGEABLE", DateTimeOffset.UtcNow, "", "symphony/45")
+        ];
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await SeedParkedRunWithNoLedgerAsync(harness);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var run = Assert.Single(await harness.DbContext.Runs.ToListAsync());
+        Assert.Equal(RunStatusNames.NeedsCommandCenter, run.Status);
+    }
+
+    // Nothing external has to change for this sweep to reach the same verdict
+    // again, so an unbounded un-park would re-dispatch and re-escalate an issue
+    // with a durable fault for ever. The second escalation is a person's, and the
+    // panel already tells them to post a directive.
+    [Fact]
+    public async Task RunTickAsync_ShouldUnparkALedgerlessRunOnlyOncePerIssue()
+    {
+        var tracker = new FakeTrackerClient([], new Dictionary<string, string> { ["issue-45"] = "Open" });
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await SeedParkedRunWithNoLedgerAsync(harness);
+        harness.DbContext.EventLog.Add(new EventLogEntity
+        {
+            IssueId = "issue-45",
+            IssueIdentifier = "#45",
+            EventName = PhaseOrchestrator.ParkedRunReconciledEventName,
+            Level = LogLevel.Information.ToString(),
+            Message = "already un-parked once",
+            OccurredAtUtc = DateTimeOffset.UtcNow.AddDays(-1)
+        });
+        await harness.DbContext.SaveChangesAsync();
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var run = Assert.Single(await harness.DbContext.Runs.ToListAsync());
+        Assert.Equal(RunStatusNames.NeedsCommandCenter, run.Status);
+    }
+
+    // Escalating is a genuine ask of a person. Clearing it on the next tick would
+    // turn every implementation escalation into one more silent retry that the
+    // owner never sees.
+    [Fact]
+    public async Task RunTickAsync_ShouldLeaveAFreshlyParkedLedgerlessRunAlone()
+    {
+        var tracker = new FakeTrackerClient([], new Dictionary<string, string> { ["issue-45"] = "Open" });
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await SeedParkedRunWithNoLedgerAsync(harness, parkedAgo: TimeSpan.FromMinutes(10));
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var run = Assert.Single(await harness.DbContext.Runs.ToListAsync());
+        Assert.Equal(RunStatusNames.NeedsCommandCenter, run.Status);
+    }
+
+    private static async Task SeedParkedRunWithNoLedgerAsync(TestHarness harness, TimeSpan? parkedAgo = null)
+    {
+        var parkedAt = DateTimeOffset.UtcNow - (parkedAgo ?? TimeSpan.FromDays(3));
+        harness.DbContext.Runs.Add(new RunEntity
+        {
+            Id = Guid.NewGuid().ToString("N"),
+            IssueId = "issue-45",
+            IssueIdentifier = "#45",
+            Phase = RunPhaseNames.Implementation,
+            Status = RunStatusNames.NeedsCommandCenter,
+            LastEvent = "needs_command_center",
+            LastMessage = "The implementation runner refused the dispatch.",
+            EscalationPostedAtUtc = parkedAt,
+            StartedAtUtc = parkedAt.AddMinutes(-20),
+            CompletedAtUtc = parkedAt,
+        });
+
+        await harness.DbContext.SaveChangesAsync();
+    }
+
     [Fact]
     public async Task RunTickAsync_ShouldLeaveAMergeGateEscalationUpWhileItsPullRequestIsStillOpen()
     {
