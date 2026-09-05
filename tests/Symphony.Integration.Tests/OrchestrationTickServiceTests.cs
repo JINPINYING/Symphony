@@ -619,17 +619,168 @@ public sealed class OrchestrationTickServiceTests
         Assert.NotNull(run.CompletedAtUtc);
         Assert.Empty(harness.Coordinator.StartRequests);
 
-        // Consumed exactly once: a tracker that starts accepting writes again does
-        // not reopen a directive the plane already answered for good.
+        // The ack the tracker refused is recorded as owed rather than dropped.
+        var owed = Assert.Single(
+            (await harness.DbContext.EventLog.ToListAsync())
+                .Where(entry => entry.EventName == DirectiveProcessor.AckPendingEvent));
+        var owedAck = JsonSerializer.Deserialize<DirectiveProcessor.PendingAckState>(owed.DataJson!);
+        Assert.NotNull(owedAck);
+        Assert.Equal("directive-1", owedAck.CommentId);
+        Assert.Contains(DirectiveProcessor.AckMarkerFor("directive-1"), owedAck.Body);
+
+        // A tracker that starts accepting writes again pays the debt - once - and
+        // does not reopen a directive the plane already answered for good.
         tracker.ThrowOnPostComment = false;
         clock.Advance(TimeSpan.FromMinutes(35));
         await harness.Service.RunTickAsync(CancellationToken.None);
 
         Assert.Single(await harness.DbContext.DirectiveLog.ToListAsync());
-        Assert.Empty(tracker.PostedComments);
+        var abandonment = Assert.Single(
+            tracker.PostedComments.Where(comment =>
+                comment.Body.Contains(DirectiveProcessor.AckMarkerFor("directive-1"), StringComparison.Ordinal)));
+        Assert.Contains("Directive abandoned", abandonment.Body);
         Assert.Equal(
             RunStatusNames.AbandonedUnreadableIssue,
             (await harness.DbContext.Runs.SingleAsync()).Status);
+
+        // Paid means settled: the debt is gone and no later tick posts it again.
+        Assert.Empty(
+            (await harness.DbContext.EventLog.ToListAsync())
+                .Where(entry => entry.EventName == DirectiveProcessor.AckPendingEvent));
+
+        clock.Advance(TimeSpan.FromMinutes(35));
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Single(
+            tracker.PostedComments.Where(comment =>
+                comment.Body.Contains(DirectiveProcessor.AckMarkerFor("directive-1"), StringComparison.Ordinal)));
+    }
+
+    // The write ordering, which is what the third attempt on this issue is for.
+    // Acking before persisting left a window in which the ack marker was on the
+    // issue and the database knew nothing about it: the next tick found the marker,
+    // wrote a bare consumed_already_acked ledger row - which settles no run - and
+    // skipped the directive for ever after because it was now in the ledger. The
+    // directive was consumed and the issue stayed parked at needs_command_center,
+    // which is the failure this issue exists to close, reached by a crash instead
+    // of by a misdirected read.
+    //
+    // From the database's side a process that dies between the persist and the
+    // comment is indistinguishable from a tracker that refuses the write, so the
+    // fault is injected at the write.
+    [Fact]
+    public async Task RunTickAsync_ShouldConsumeAndUnparkWhenTheProcessFailsBetweenPersistingAndAcking()
+    {
+        var clock = new MutableTimeProvider(DateTimeOffset.Parse("2026-09-01T10:00:00Z"));
+        var tracker = new FakeTrackerClient([]) { ThrowOnPostComment = true };
+        tracker.IssuesById["issue-1"] = BuildIssue("issue-1", "#1", "Open", null);
+        tracker.CommentsByIssueId["issue-1"] =
+        [
+            new NormalizedIssueComment(
+                "directive-1",
+                "symphony:directive\naction: resume",
+                "owner-login",
+                "OWNER",
+                DateTimeOffset.Parse("2026-09-01T09:59:00Z"))
+        ];
+
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success),
+            timeProvider: clock);
+
+        await harness.InsertRunAsync("issue-1", "#1", "Open", "instance-1", RunStatusNames.NeedsCommandCenter);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        // Everything durable landed before the tracker was spoken to: the directive
+        // is consumed exactly once and the escalation is off the owner's desk.
+        var ledger = Assert.Single(await harness.DbContext.DirectiveLog.ToListAsync());
+        Assert.Equal("consumed_dispatched", ledger.Outcome);
+        Assert.Single(harness.Coordinator.StartRequests);
+        Assert.Empty(tracker.PostedComments);
+
+        var parked = await harness.DbContext.Runs
+            .Where(run => run.Status == RunStatusNames.NeedsCommandCenter)
+            .ToListAsync();
+        Assert.Empty(parked);
+
+        // The comment the owner is owed is the only thing lost, and it is recorded
+        // as a debt rather than dropped.
+        var owed = Assert.Single(
+            (await harness.DbContext.EventLog.ToListAsync())
+                .Where(entry => entry.EventName == DirectiveProcessor.AckPendingEvent));
+        var owedAck = JsonSerializer.Deserialize<DirectiveProcessor.PendingAckState>(owed.DataJson!);
+        Assert.NotNull(owedAck);
+        Assert.Equal("directive-1", owedAck.CommentId);
+        Assert.Contains(DirectiveProcessor.AckMarkerFor("directive-1"), owedAck.Body);
+
+        // The next tick pays it, and re-dispatches nothing: the ledger row written
+        // first is what keeps the directive from being acted on twice.
+        tracker.ThrowOnPostComment = false;
+        clock.Advance(TimeSpan.FromMinutes(10));
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var ack = Assert.Single(
+            tracker.PostedComments.Where(comment =>
+                comment.Body.Contains(DirectiveProcessor.AckMarkerFor("directive-1"), StringComparison.Ordinal)));
+        Assert.Contains("Directive executed", ack.Body);
+        Assert.Single(await harness.DbContext.DirectiveLog.ToListAsync());
+        Assert.Single(harness.Coordinator.StartRequests);
+        Assert.Empty(
+            (await harness.DbContext.EventLog.ToListAsync())
+                .Where(entry => entry.EventName == DirectiveProcessor.AckPendingEvent));
+    }
+
+    // The other half of the same crash window: the comment landed and the debt did
+    // not get deleted. Replaying it must not tell the owner twice.
+    [Fact]
+    public async Task RunTickAsync_ShouldNotRepostAnOwedAckThatIsAlreadyOnTheIssue()
+    {
+        var tracker = new FakeTrackerClient([]);
+        var ackBody =
+            $"{DirectiveProcessor.AckMarkerFor("directive-1")}\n**Directive executed** — `resume`.\n\n— Symphony directive processor";
+        tracker.CommentsByIssueId["issue-1"] =
+        [
+            new NormalizedIssueComment(
+                "directive-1",
+                "symphony:directive\naction: resume",
+                "owner-login",
+                "OWNER",
+                DateTimeOffset.UtcNow.AddMinutes(-2)),
+            new NormalizedIssueComment(
+                "ack-1",
+                ackBody,
+                "symphony-bot",
+                "OWNER",
+                DateTimeOffset.UtcNow.AddMinutes(-1))
+        ];
+
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success));
+
+        harness.DbContext.EventLog.Add(new EventLogEntity
+        {
+            IssueId = "issue-1",
+            IssueIdentifier = "#1",
+            EventName = DirectiveProcessor.AckPendingEvent,
+            Level = "Information",
+            Message = "Directive comment directive-1: the ack is owed and has not been posted yet.",
+            DataJson = JsonSerializer.Serialize(
+                new DirectiveProcessor.PendingAckState("directive-1", "owner/repo", ackBody, 0, null)),
+            OccurredAtUtc = DateTimeOffset.UtcNow
+        });
+        await harness.DbContext.SaveChangesAsync();
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Empty(tracker.PostedComments);
+        Assert.Empty(
+            (await harness.DbContext.EventLog.ToListAsync())
+                .Where(entry => entry.EventName == DirectiveProcessor.AckPendingEvent));
     }
 
     // The bound must not end a retry that is merely slow to be reached. Three

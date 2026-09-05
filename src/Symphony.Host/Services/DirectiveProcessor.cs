@@ -18,10 +18,11 @@ public sealed record DirectiveDispatchContext(
 //
 // One comment un-parks a stuck issue: resume / reimplement / custom dispatch the
 // issue (at the recorded or named phase, with instructions embedded in the
-// prompt), close closes the source issue. Exactly-once is layered like the M1
-// escalation publisher: the durable directive_log row (keyed by comment id) is
-// the primary dedupe, and the ack comment's marker covers the crash window
-// between acting and recording. A malformed directive is answered with the parse
+// prompt), close closes the source issue. Exactly-once rests on the durable
+// directive_log row, keyed by comment id, and every consumption writes that row -
+// together with the settled run statuses and the ack still owed - before it says
+// anything to the tracker, so the only thing a crash or a refused write can lose
+// is a comment, which a later tick posts. A malformed directive is answered with the parse
 // error and consumed — the processor never guesses. A directive that cannot be
 // acted on yet (no free agent slot, claim refused, tracker outage) stays
 // unconsumed and is retried by the ordinary tick loop. The one retry that is
@@ -95,6 +96,38 @@ public sealed class DirectiveProcessor(
     public static string AckMarkerFor(string commentId) => $"<!-- symphony:directive-ack:{commentId} -->";
 
     /// <summary>
+    /// The event name an ack the owner is owed — persisted, not yet posted — is
+    /// recorded under. One row per directive comment, deleted once the comment
+    /// lands.
+    /// </summary>
+    /// <remarks>
+    /// This row is what makes the write ordering safe. The ledger row, the settled
+    /// run statuses and this debt are written in ONE SaveChanges, and the ack
+    /// comment is posted afterwards.
+    ///
+    /// Acking first left a window the other way round: the marker was on the issue
+    /// and nothing was in the database. The next tick then found the marker, wrote a
+    /// bare <c>consumed_already_acked</c> ledger row — which settles no run — and
+    /// skipped the directive for ever after because it was now in the ledger. The
+    /// directive was consumed and the issue stayed parked at
+    /// <see cref="RunStatusNames.NeedsCommandCenter"/>: the exact failure this issue
+    /// exists to close, reached by a crash instead of by a misdirected read.
+    ///
+    /// Persisting first inverts the window into a harmless one. The directive is
+    /// consumed and the runs are settled; the only thing missing is a comment, and
+    /// this row is how a later tick posts it.
+    /// </remarks>
+    public const string AckPendingEvent = "directive_ack_pending";
+
+    /// <summary>The ack a consumed directive is still owed, and where to post it.</summary>
+    public sealed record PendingAckState(
+        string CommentId,
+        string RepositoryKey,
+        string Body,
+        int Attempts,
+        DateTimeOffset? FirstAttemptAtUtc);
+
+    /// <summary>
     /// The marker on the notice that says a valid directive is understood but could
     /// not be acted on yet.
     ///
@@ -124,6 +157,13 @@ public sealed class DirectiveProcessor(
         Func<NormalizedIssue, DirectiveDispatchContext, CancellationToken, Task<bool>> dispatchAsync,
         CancellationToken cancellationToken)
     {
+        // Before anything else: pay the acks that were recorded as owed but never
+        // posted. Driven from the ledger of debts rather than from the escalated
+        // runs below, because consuming a directive settles those runs in the same
+        // SaveChanges that records the debt - an issue whose ack is owed is usually
+        // an issue this loop will never look at again.
+        await ReplayOwedAcksAsync(queries, cancellationToken);
+
         List<RunEntity> escalatedRuns;
         try
         {
@@ -219,8 +259,11 @@ public sealed class DirectiveProcessor(
                 continue;
             }
 
-            // Crash-window dedupe: an ack comment already exists but the ledger row
-            // was lost — record it as consumed without re-acting.
+            // An ack comment exists but no ledger row does. Since the ledger row,
+            // the settled runs and the owed ack are all written BEFORE the comment
+            // is posted, this can no longer be produced by the plane itself; it
+            // covers rows written by an older build and markers put on the issue by
+            // hand. Recorded without re-acting - the owner has already been told.
             var ackMarker = AckMarkerFor(comment.Id);
             if (comments.Any(item => item.Body.Contains(ackMarker, StringComparison.Ordinal)))
             {
@@ -229,6 +272,7 @@ public sealed class DirectiveProcessor(
                     parsed.Action ?? "unknown", parsed.Phase,
                     "consumed_already_acked",
                     "Ack marker found on the issue; ledger row restored without re-acting.",
+                    owedAck: null,
                     cancellationToken);
                 continue;
             }
@@ -269,13 +313,11 @@ public sealed class DirectiveProcessor(
         {
             await trackerClient.CloseIssueAsync(query, issueId, cancellationToken);
             ResolveStuckRuns(stuckRuns, $"Issue closed by command-center directive (comment {comment.Id}).");
-            await AckAsync(
-                query, comment, issueId,
-                $"**Directive executed** — `close`. The source issue was closed and its escalated run(s) marked `resolved_by_directive`.",
+            await ConsumeAndAckAsync(
+                query, comment, issueId, issueIdentifier, action, parsed.Phase,
+                "consumed_closed", null,
+                "**Directive executed** — `close`. The source issue was closed and its escalated run(s) marked `resolved_by_directive`.",
                 cancellationToken);
-            await RecordConsumptionAsync(
-                comment.Id, issueId, issueIdentifier, action, parsed.Phase,
-                "consumed_closed", null, cancellationToken);
             return true;
         }
 
@@ -339,14 +381,12 @@ public sealed class DirectiveProcessor(
         }
 
         ResolveStuckRuns(stuckRuns, $"Escalation resolved by command-center directive (comment {comment.Id}); issue re-dispatched at phase '{targetPhase}'.");
-        await AckAsync(
-            query, comment, issueId,
+        await ConsumeAndAckAsync(
+            query, comment, issueId, issueIdentifier, action, targetPhase,
+            "consumed_dispatched", null,
             $"**Directive executed** — `{action}` at phase `{targetPhase}`. The issue was re-dispatched" +
             (string.IsNullOrWhiteSpace(parsed.Instructions) ? "." : " with your instructions embedded in the worker prompt."),
             cancellationToken);
-        await RecordConsumptionAsync(
-            comment.Id, issueId, issueIdentifier, action, targetPhase,
-            "consumed_dispatched", null, cancellationToken);
         return true;
     }
 
@@ -424,43 +464,21 @@ public sealed class DirectiveProcessor(
         // permanent absences this branch exists for - an issue deleted,
         // transferred, or recorded against a repository it no longer lives in -
         // are precisely the ones that cannot be commented on either, and
-        // PostIssueCommentAsync throws on an HTTP or GraphQL error. Letting that
-        // throw propagate would carry the exhausted path back out through the
-        // outer "unconsumed directives will retry next tick" handler with no
-        // ledger row written and the runs still parked: the unbounded retry
-        // restored in the one case the bound was built for.
-        try
-        {
-            await AckAsync(
-                query, comment, issueId,
-                $"**Directive abandoned:** the plane could not read {issueIdentifier} back from " +
-                $"`{repositoryKey}` in {attemptSummary}, so it has stopped retrying and consumed this directive.\n\n" +
-                "Your comment parsed correctly — this is not a rejection, and nothing was dispatched. A read that " +
-                "never succeeds usually means the issue was deleted, transferred, or is recorded against a " +
-                $"repository it no longer lives in. Check that {issueIdentifier} is visible in `{repositoryKey}`, " +
-                "then post a fresh `symphony:directive` block. The escalated run(s) are recorded as " +
-                $"`{RunStatusNames.AbandonedUnreadableIssue}` rather than left parked for ever.",
-                cancellationToken);
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            logger.LogWarning(
-                ex,
-                "Could not post the abandonment comment for directive {CommentId} on {IssueIdentifier}; " +
-                "the directive is consumed and the escalated run(s) settled regardless.",
-                comment.Id, issueIdentifier);
-        }
-
-        // Written last, and in one SaveChanges: the ledger row and the settled
-        // run statuses land together whether or not the comment above posted.
-        await RecordConsumptionAsync(
-            comment.Id, issueId, issueIdentifier, action, parsed.Phase,
+        // PostIssueCommentAsync throws on an HTTP or GraphQL error. ConsumeAndAck
+        // writes the ledger row, the settled run statuses and the owed ack in one
+        // SaveChanges BEFORE it goes near the tracker, so neither a refused write
+        // nor a process that dies mid-post can leave this issue parked.
+        await ConsumeAndAckAsync(
+            query, comment, issueId, issueIdentifier, action, parsed.Phase,
             "consumed_unreadable",
             $"the source issue could not be read from {repositoryKey} in {attemptSummary}",
+            $"**Directive abandoned:** the plane could not read {issueIdentifier} back from " +
+            $"`{repositoryKey}` in {attemptSummary}, so it has stopped retrying and consumed this directive.\n\n" +
+            "Your comment parsed correctly — this is not a rejection, and nothing was dispatched. A read that " +
+            "never succeeds usually means the issue was deleted, transferred, or is recorded against a " +
+            $"repository it no longer lives in. Check that {issueIdentifier} is visible in `{repositoryKey}`, " +
+            "then post a fresh `symphony:directive` block. The escalated run(s) are recorded as " +
+            $"`{RunStatusNames.AbandonedUnreadableIssue}` rather than left parked for ever.",
             cancellationToken);
         return true;
     }
@@ -620,24 +638,294 @@ public sealed class DirectiveProcessor(
         string error,
         CancellationToken cancellationToken)
     {
-        await AckAsync(
-            query, comment, issueId,
+        await ConsumeAndAckAsync(
+            query, comment, issueId, issueIdentifier,
+            "invalid", null, "consumed_invalid", error,
             $"**Directive rejected:** {error}.\n\nThis directive will not be retried. The escalation remains open; post a corrected `symphony:directive` block. Nothing was dispatched — the control plane does not guess.",
             cancellationToken);
-        await RecordConsumptionAsync(
-            comment.Id, issueId, issueIdentifier,
-            "invalid", null, "consumed_invalid", error, cancellationToken);
     }
 
-    private async Task AckAsync(
+    /// <summary>
+    /// Consume a directive for good, then tell the owner what happened.
+    /// </summary>
+    /// <remarks>
+    /// Durable first, comment second, and never the other way round. Everything a
+    /// later tick has to agree on - the ledger row that stops the directive being
+    /// acted on twice, the run statuses the caller has already moved off
+    /// <see cref="RunStatusNames.NeedsCommandCenter"/>, and the ack the owner is
+    /// owed - lands in a single SaveChanges before the first tracker call. A
+    /// process that dies, or a tracker that refuses the write, can then only lose
+    /// the comment, and <see cref="ReplayOwedAcksAsync"/> posts it on a later tick.
+    /// </remarks>
+    private async Task ConsumeAndAckAsync(
         TrackerQuery query,
         NormalizedIssueComment comment,
         string issueId,
-        string message,
+        string issueIdentifier,
+        string action,
+        string? phase,
+        string outcome,
+        string? detail,
+        string ackMessage,
         CancellationToken cancellationToken)
     {
-        var body = $"{AckMarkerFor(comment.Id)}\n{message}\n\n— Symphony directive processor";
-        await trackerClient.PostIssueCommentAsync(query, issueId, body, cancellationToken);
+        var body = BuildAckBody(comment.Id, ackMessage);
+        await RecordConsumptionAsync(
+            comment.Id, issueId, issueIdentifier, action, phase, outcome, detail,
+            new PendingAckState(comment.Id, TrackerQuerySet.KeyOf(query), body, 0, null),
+            cancellationToken);
+        await DeliverOwedAckAsync(query, comment.Id, issueId, issueIdentifier, body, cancellationToken);
+    }
+
+    private static string BuildAckBody(string commentId, string message) =>
+        $"{AckMarkerFor(commentId)}\n{message}\n\n— Symphony directive processor";
+
+    // The ack immediately after consumption. The marker is not looked for first:
+    // the directive loop has just established that it is not on the issue, and
+    // this runs in the same tick.
+    private async Task DeliverOwedAckAsync(
+        TrackerQuery query,
+        string commentId,
+        string issueId,
+        string issueIdentifier,
+        string body,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await trackerClient.PostIssueCommentAsync(query, issueId, body, cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(
+                ex,
+                "Could not post the ack for directive {CommentId} on {IssueIdentifier}; the directive is " +
+                "consumed and the escalated run(s) settled regardless, and the ack stays owed for a later tick.",
+                commentId, issueIdentifier);
+            return;
+        }
+
+        await ClearOwedAckAsync(commentId, issueId, cancellationToken);
+    }
+
+    /// <summary>
+    /// Post the acks recorded as owed on an earlier tick, once each.
+    /// </summary>
+    /// <remarks>
+    /// Idempotent on replay in both directions. The marker is looked for on the
+    /// issue first, so a process that died between posting the comment and deleting
+    /// the debt re-reads its own marker and deletes the debt rather than posting a
+    /// second time; and the debt is only deleted once the comment is known to be
+    /// there, so a death before the delete re-posts rather than losing the record.
+    ///
+    /// Bounded for the same reason the reload it usually follows is: an issue that
+    /// cannot be read cannot be commented on either, and a debt retried for ever
+    /// spends a tracker call per tick for good. The bound only ever costs a
+    /// courtesy comment - the directive is already consumed and the runs already
+    /// settled - so exhausting it drops the debt and says so in the log.
+    /// </remarks>
+    private async Task ReplayOwedAcksAsync(TrackerQuerySet queries, CancellationToken cancellationToken)
+    {
+        List<EventLogEntity> owed;
+        try
+        {
+            owed = await dbContext.EventLog
+                .Where(entry => entry.EventName == AckPendingEvent)
+                .OrderBy(entry => entry.Id)
+                .ToListAsync(cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Could not load the directive acks still owed; will retry next tick.");
+            return;
+        }
+
+        foreach (var entry in owed)
+        {
+            var state = ReadPendingAckState(entry.DataJson);
+            if (state is null || string.IsNullOrWhiteSpace(entry.IssueId))
+            {
+                // Nothing left to post with. Keeping the row would retry a payload
+                // that can never be read.
+                await DiscardOwedAckAsync(entry, "its recorded payload could not be read", cancellationToken);
+                continue;
+            }
+
+            var issueId = entry.IssueId;
+            var issueIdentifier = entry.IssueIdentifier ?? issueId;
+            Exception? failure = null;
+            try
+            {
+                var query = queries.For(state.RepositoryKey);
+                var marker = AckMarkerFor(state.CommentId);
+                var comments = await trackerClient.FetchIssueCommentsAsync(
+                    query, issueId, issueIdentifier, cancellationToken);
+                if (!comments.Any(item => item.Body.Contains(marker, StringComparison.Ordinal)))
+                {
+                    await trackerClient.PostIssueCommentAsync(query, issueId, state.Body, cancellationToken);
+                    logger.LogInformation(
+                        "Posted the ack owed for directive {CommentId} on {IssueIdentifier} on a later tick.",
+                        state.CommentId, issueIdentifier);
+                }
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                failure = ex;
+            }
+
+            if (failure is null)
+            {
+                await ClearOwedAckAsync(state.CommentId, issueId, cancellationToken);
+                continue;
+            }
+
+            await CountOwedAckFailureAsync(entry, state, issueIdentifier, failure, cancellationToken);
+        }
+    }
+
+    private async Task CountOwedAckFailureAsync(
+        EventLogEntity entry,
+        PendingAckState state,
+        string issueIdentifier,
+        Exception failure,
+        CancellationToken cancellationToken)
+    {
+        var nowUtc = timeProvider.GetUtcNow();
+        var attempts = state.Attempts + 1;
+        var firstAttemptAtUtc = state.FirstAttemptAtUtc ?? nowUtc;
+        var elapsed = nowUtc - firstAttemptAtUtc;
+
+        if (attempts >= UnreadableDirectiveMinimumAttempts && elapsed >= UnreadableDirectiveRetryWindow)
+        {
+            logger.LogWarning(
+                failure,
+                "Giving up on the ack owed for directive {CommentId} on {IssueIdentifier} after {Attempts} " +
+                "attempts over {Elapsed}. The directive stays consumed and its run(s) stay settled.",
+                state.CommentId, issueIdentifier, attempts, DescribeElapsed(elapsed));
+            await DiscardOwedAckAsync(
+                entry,
+                $"it could not be posted in {attempts} attempts over {DescribeElapsed(elapsed)}",
+                cancellationToken);
+            return;
+        }
+
+        logger.LogWarning(
+            failure,
+            "Could not post the ack owed for directive {CommentId} on {IssueIdentifier} (attempt {Attempts}); " +
+            "the debt stays recorded and will retry next tick.",
+            state.CommentId, issueIdentifier, attempts);
+
+        try
+        {
+            entry.DataJson = JsonSerializer.Serialize(
+                state with { Attempts = attempts, FirstAttemptAtUtc = firstAttemptAtUtc });
+            entry.Message =
+                $"Directive comment {state.CommentId}: the ack is owed and could not be posted on " +
+                $"{attempts} attempts over {DescribeElapsed(elapsed)}.";
+            entry.OccurredAtUtc = nowUtc;
+            await dbContext.SaveChangesAsync(cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(
+                ex, "Could not count the failed ack attempt for directive {CommentId}.", state.CommentId);
+        }
+    }
+
+    private Task ClearOwedAckAsync(string commentId, string issueId, CancellationToken cancellationToken) =>
+        RemoveOwedAckRowsAsync(commentId, issueId, null, cancellationToken);
+
+    private Task DiscardOwedAckAsync(EventLogEntity entry, string reason, CancellationToken cancellationToken)
+    {
+        dbContext.EventLog.Remove(entry);
+        return SaveOwedAckChangeAsync(reason, cancellationToken);
+    }
+
+    private async Task RemoveOwedAckRowsAsync(
+        string commentId,
+        string issueId,
+        string? reason,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var rows = await dbContext.EventLog
+                .Where(entry => entry.EventName == AckPendingEvent && entry.IssueId == issueId)
+                .ToListAsync(cancellationToken);
+            foreach (var row in rows)
+            {
+                var state = ReadPendingAckState(row.DataJson);
+                if (state is null || string.Equals(state.CommentId, commentId, StringComparison.Ordinal))
+                {
+                    dbContext.EventLog.Remove(row);
+                }
+            }
+
+            await dbContext.SaveChangesAsync(cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // The debt outliving the comment costs one duplicate ack at worst; the
+            // marker check in ReplayOwedAcksAsync catches it before it is posted.
+            logger.LogWarning(
+                ex,
+                "Could not clear the ack debt for directive {CommentId}{Reason}.",
+                commentId,
+                reason is null ? string.Empty : $" ({reason})");
+        }
+    }
+
+    private async Task SaveOwedAckChangeAsync(string reason, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await dbContext.SaveChangesAsync(cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Could not drop an unpostable directive ack ({Reason}).", reason);
+        }
+    }
+
+    private static PendingAckState? ReadPendingAckState(string? dataJson)
+    {
+        if (string.IsNullOrWhiteSpace(dataJson))
+        {
+            return null;
+        }
+
+        try
+        {
+            return JsonSerializer.Deserialize<PendingAckState>(dataJson);
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
     }
 
     /// <summary>
@@ -762,6 +1050,12 @@ public sealed class DirectiveProcessor(
     /// <summary>The comment a pending directive belongs to, as persisted.</summary>
     public sealed record PendingDirectiveState(string CommentId, string Action);
 
+    /// <summary>
+    /// Write everything a later tick has to agree on about a consumed directive, in
+    /// one SaveChanges: the exactly-once ledger row, the run statuses the caller
+    /// moved off <see cref="RunStatusNames.NeedsCommandCenter"/> (tracked entities,
+    /// flushed here), and - when there is one - the ack still owed to the owner.
+    /// </summary>
     private async Task RecordConsumptionAsync(
         string commentId,
         string issueId,
@@ -770,6 +1064,7 @@ public sealed class DirectiveProcessor(
         string? phase,
         string outcome,
         string? detail,
+        PendingAckState? owedAck,
         CancellationToken cancellationToken)
     {
         var nowUtc = timeProvider.GetUtcNow();
@@ -793,6 +1088,20 @@ public sealed class DirectiveProcessor(
             Message = $"Directive comment {commentId}: {outcome}{(detail is null ? "." : $" — {detail}")}",
             OccurredAtUtc = nowUtc
         });
+        if (owedAck is not null)
+        {
+            dbContext.EventLog.Add(new EventLogEntity
+            {
+                IssueId = issueId,
+                IssueIdentifier = issueIdentifier,
+                EventName = AckPendingEvent,
+                Level = LogLevel.Information.ToString(),
+                Message = $"Directive comment {commentId}: the ack is owed and has not been posted yet.",
+                DataJson = JsonSerializer.Serialize(owedAck),
+                OccurredAtUtc = nowUtc
+            });
+        }
+
         await dbContext.SaveChangesAsync(cancellationToken);
 
         logger.LogInformation(
