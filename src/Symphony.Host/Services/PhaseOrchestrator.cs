@@ -1120,11 +1120,16 @@ public sealed class PhaseOrchestrator(
         // Nothing to ask for if it has already been done. A repair only reaches
         // this stage without having run, but the head can still move while it waits
         // - a hold can span a night, and someone can push during one.
+        //
+        // The hold goes, because there is no longer anything to hold for; the
+        // runner is NOT recorded as recovered, because it is precisely the case
+        // where the held runner did not run. A push from outside the plane says
+        // nothing about whether its account has credit again.
         if (!string.IsNullOrWhiteSpace(ledger.RejectedHeadSha) &&
             !string.Equals(pullRequest.HeadSha, ledger.RejectedHeadSha, StringComparison.OrdinalIgnoreCase))
         {
             ledger.Stage = PhaseStages.AwaitingVerify;
-            ClearRunnerHold(ledger);
+            DropRunnerHold(ledger);
             ledger.UpdatedAtUtc = timeProvider.GetUtcNow();
             AddPhaseEvent(ledger.IssueId, ledger.IssueIdentifier, "phase_repair_head_moved",
                 $"PR #{ledger.PrNumber} moved to head {Short(pullRequest.HeadSha)} before its repair was re-dispatched; " +
@@ -1501,10 +1506,7 @@ public sealed class PhaseOrchestrator(
         var wasQuotaHold = string.Equals(ledger.HoldReason, RunnerQuotaHoldReason, StringComparison.Ordinal);
         var runner = ledger.HoldRunner;
 
-        ledger.HoldUntilUtc = null;
-        ledger.HoldSinceUtc = null;
-        ledger.HoldReason = null;
-        ledger.HoldRunner = null;
+        DropRunnerHold(ledger);
 
         if (!wasQuotaHold || string.IsNullOrWhiteSpace(runner))
         {
@@ -1514,6 +1516,32 @@ public sealed class PhaseOrchestrator(
         AddPhaseEvent(ledger.IssueId, ledger.IssueIdentifier, RunnerQuotaRecoveredEventName,
             $"Runner '{runner}' produced work again on {ledger.IssueIdentifier}, so it is no longer an open cause.",
             JsonSerializer.Serialize(new RunnerQuotaEventState(runner)));
+    }
+
+    /// <summary>
+    /// This ledger has stopped waiting, but nobody has seen the runner work.
+    /// </summary>
+    /// <remarks>
+    /// For the paths that leave a hold because the work turned out to be
+    /// unnecessary rather than because it was done - a head that moved from outside
+    /// the plane while a repair was still only being asked for. The ledger must not
+    /// keep holding, because there is nothing left to hold for; the runner must not
+    /// be recorded as recovered, because a push by someone else is no evidence at
+    /// all about a vendor account's credit.
+    ///
+    /// The distinction is load-bearing: <see cref="IsRunnerQuotaAlreadyEscalatedAsync"/>
+    /// takes the newest recovery-or-escalation row for a runner as the truth, so a
+    /// recovery written here would close a cause that is still open and let the
+    /// next reset window raise the same exhausted runner a second time.
+    ///
+    /// Callers save; this only stages the change alongside theirs.
+    /// </remarks>
+    private static void DropRunnerHold(PhaseLedgerEntity ledger)
+    {
+        ledger.HoldUntilUtc = null;
+        ledger.HoldSinceUtc = null;
+        ledger.HoldReason = null;
+        ledger.HoldRunner = null;
     }
 
     /// <summary>
