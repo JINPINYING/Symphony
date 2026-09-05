@@ -1630,6 +1630,84 @@ public sealed class OrchestrationTickServiceTests
         Assert.Equal(RunStatusNames.NeedsCommandCenter, run.Status);
     }
 
+    // The scan is one page ordered by most-recently-updated, with no cursor behind
+    // it, so on a busy repository a stale pull request is the FIRST thing to fall
+    // off - and a pull request belonging to a run parked for hours is exactly that.
+    // The sweep un-parks once and only once per issue, so an un-park decided on a
+    // truncated page is a durable wrong answer that never gets a second chance.
+    [Fact]
+    public async Task RunTickAsync_ShouldLeaveALedgerlessParkedRunUpWhenTheOpenPullRequestScanIsTruncated()
+    {
+        var tracker = new FakeTrackerClient([], new Dictionary<string, string> { ["issue-45"] = "Open" });
+        tracker.OpenPullRequests = Enumerable
+            .Range(1, PhaseOrchestrator.OpenPullRequestScanLimit)
+            .Select(number => new OpenPullRequest(
+                number, $"other work {number}", $"https://example.invalid/pull/{number}", "codex", false,
+                "SUCCESS", "MERGEABLE", DateTimeOffset.UtcNow, "", $"symphony/{number + 900}"))
+            .ToList();
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await SeedParkedRunWithNoLedgerAsync(harness);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var run = Assert.Single(await harness.DbContext.Runs.ToListAsync());
+        Assert.Equal(RunStatusNames.NeedsCommandCenter, run.Status);
+        Assert.DoesNotContain(
+            await harness.DbContext.EventLog.ToListAsync(),
+            entry => entry.EventName == PhaseOrchestrator.ParkedRunReconciledEventName);
+    }
+
+    // A pull request the scan did not list is still a pull request. The head-scoped
+    // lookup is complete for the name it asks about, which is why the un-park is
+    // decided on that answer rather than on absence from a page.
+    [Fact]
+    public async Task RunTickAsync_ShouldLeaveALedgerlessParkedRunUpWhenABranchLookupFindsAPullRequestTheScanMissed()
+    {
+        var tracker = new FakeTrackerClient([], new Dictionary<string, string> { ["issue-45"] = "Open" });
+        tracker.PullRequestStatusByNumber[146] = new PullRequestStatus(146, "OPEN", false, "sha-146", "SUCCESS", "MERGEABLE");
+        tracker.OpenPullRequestNumberByHeadBranch["symphony/45"] = 146;
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await SeedParkedRunWithNoLedgerAsync(harness);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var run = Assert.Single(await harness.DbContext.Runs.ToListAsync());
+        Assert.Equal(RunStatusNames.NeedsCommandCenter, run.Status);
+    }
+
+    // A rate limit or a timeout is UNKNOWN, not "absent". Clearing an alarm we
+    // could not verify is worse than leaving one up a little longer.
+    [Fact]
+    public async Task RunTickAsync_ShouldLeaveALedgerlessParkedRunUpWhenTheBranchLookupFails()
+    {
+        var tracker = new FakeTrackerClient([], new Dictionary<string, string> { ["issue-45"] = "Open" })
+        {
+            OpenPullRequestByHeadBranchFailure = new HttpRequestException("rate limited")
+        };
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await SeedParkedRunWithNoLedgerAsync(harness);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var run = Assert.Single(await harness.DbContext.Runs.ToListAsync());
+        Assert.Equal(RunStatusNames.NeedsCommandCenter, run.Status);
+        Assert.DoesNotContain(
+            await harness.DbContext.EventLog.ToListAsync(),
+            entry => entry.EventName == PhaseOrchestrator.ParkedRunReconciledEventName);
+    }
+
     private static async Task SeedParkedRunWithNoLedgerAsync(TestHarness harness, TimeSpan? parkedAgo = null)
     {
         var parkedAt = DateTimeOffset.UtcNow - (parkedAgo ?? TimeSpan.FromDays(3));
@@ -5438,11 +5516,20 @@ public sealed class OrchestrationTickServiceTests
             return Task.FromResult<string?>(null);
         }
 
+        // Models the read that does not answer: a rate limit or a timeout on the
+        // head-scoped lookup. "Could not ask" must not read as "no pull request".
+        public Exception? OpenPullRequestByHeadBranchFailure { get; set; }
+
         public Task<PullRequestStatus?> FetchOpenPullRequestByHeadBranchAsync(
             TrackerQuery query,
             string headRefName,
             CancellationToken cancellationToken = default)
         {
+            if (OpenPullRequestByHeadBranchFailure is not null)
+            {
+                return Task.FromException<PullRequestStatus?>(OpenPullRequestByHeadBranchFailure);
+            }
+
             if (OpenPullRequestNumberByHeadBranch.TryGetValue(headRefName, out var number) &&
                 PullRequestStatusByNumber.TryGetValue(number, out var status))
             {

@@ -150,7 +150,11 @@ public sealed class PhaseOrchestrator(
 
     // Enough to cover every branch an issue could have open at once, without asking
     // the tracker for a page it will never read.
-    private const int OpenPullRequestScanLimit = 50;
+    //
+    // It is ONE page and there is no cursor behind it, so a result of exactly this
+    // many is "at least this many", not "this many". Anything deciding on the
+    // ABSENCE of a pull request has to treat a full page as truncated.
+    public const int OpenPullRequestScanLimit = 50;
 
     public static string ReviewVerdictMarker(int prNumber, string headSha) =>
         $"<!-- symphony:review-verdict:{prNumber}:{headSha} -->";
@@ -704,8 +708,9 @@ public sealed class PhaseOrchestrator(
             .ToList();
         var alreadyUnparked = (await dbContext.EventLog
                 .Where(entry => entry.EventName == ParkedRunReconciledEventName &&
-                                candidateIssueIds.Contains(entry.IssueId))
-                .Select(entry => entry.IssueId)
+                                entry.IssueId != null &&
+                                candidateIssueIds.Contains(entry.IssueId!))
+                .Select(entry => entry.IssueId!)
                 .ToListAsync(cancellationToken))
             .ToHashSet(StringComparer.Ordinal);
 
@@ -745,6 +750,10 @@ public sealed class PhaseOrchestrator(
                 // Scoped to this repository by the query, so a branch match needs no
                 // further repository test: "#45" exists in every repository the
                 // plane watches, and so does `symphony/45`.
+                //
+                // ONE page, newest-updated first, and there is no cursor to follow -
+                // so this list is a positive signal only. Absence from it is handled
+                // below, where it is the thing the decision turns on.
                 openPullRequests = await trackerClient.FetchOpenPullRequestsAsync(
                     query,
                     OpenPullRequestScanLimit,
@@ -767,6 +776,14 @@ public sealed class PhaseOrchestrator(
                 snapshot => snapshot.Id,
                 StringComparer.OrdinalIgnoreCase);
 
+            // A full page means there may be more open pull requests than were
+            // listed, and the scan is ordered by most-recently-updated, so the
+            // stale ones drop off first - which is exactly what a pull request
+            // belonging to a run parked for hours looks like. "Not in the first
+            // page" is not "does not exist", and this sweep un-parks on that
+            // answer once and only once per issue, so a wrong one is durable.
+            var scanMayBeTruncated = openPullRequests.Count >= OpenPullRequestScanLimit;
+
             foreach (var run in runs)
             {
                 if (!stateByIssueId.TryGetValue(run.IssueId, out var snapshot))
@@ -786,8 +803,16 @@ public sealed class PhaseOrchestrator(
                 else
                 {
                     branchByIssueId.TryGetValue(run.IssueId, out var branchName);
-                    var openPullRequest = FindOpenPullRequestForIssue(openPullRequests, branchName, run.IssueIdentifier);
-                    if (openPullRequest is not null)
+                    var families = BranchFamiliesFor(branchName, run.IssueIdentifier);
+                    if (families.Count == 0)
+                    {
+                        // No branch of its own and no issue number to derive one
+                        // from: this run cannot be told apart from one whose pull
+                        // request the scan simply did not list. Fail closed.
+                        continue;
+                    }
+
+                    if (FindOpenPullRequestForIssue(openPullRequests, families) is not null)
                     {
                         // There IS something to close, which is the route that
                         // already works. Leave it to the person or to the escalated
@@ -795,11 +820,52 @@ public sealed class PhaseOrchestrator(
                         continue;
                     }
 
-                    if (branchName is null && !TryReadIssueNumber(run.IssueIdentifier, out _))
+                    // Absence from that page is now the whole decision, so it has to
+                    // be confirmed rather than assumed. Ask the tracker for each of
+                    // this issue's branches by name - a head-scoped query, complete
+                    // by construction, and the same lookup ResolvePullRequestNumberAsync
+                    // trusts as definitive.
+                    bool confirmedAbsent;
+                    try
                     {
-                        // No branch of its own and no issue number to derive one
-                        // from: this run cannot be told apart from one whose pull
-                        // request the scan simply did not list. Fail closed.
+                        confirmedAbsent = await HasNoOpenPullRequestOnAnyBranchAsync(
+                            query,
+                            families,
+                            cancellationToken);
+                    }
+                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        // A read that did not answer is UNKNOWN, not "no pull
+                        // request". Leave the item up and try again next tick.
+                        logger.LogWarning(
+                            ex,
+                            "Could not confirm whether {IssueIdentifier} still has an open pull request; leaving the parked run up.",
+                            run.IssueIdentifier);
+                        continue;
+                    }
+
+                    if (!confirmedAbsent)
+                    {
+                        continue;
+                    }
+
+                    // The named branches are ruled out, but a pull request on a
+                    // SUFFIXED branch of the same family ("symphony/87-retry") can
+                    // only be seen in the scan, and a full page may have hidden one.
+                    // There is no cursor to follow and no exact-name query that
+                    // matches a prefix, so this is the truncation the sweep cannot
+                    // read past: say so and leave the item for a person.
+                    if (scanMayBeTruncated)
+                    {
+                        logger.LogWarning(
+                            "The open pull request scan on {Repository} returned a full page of {Count}, so a branch-family pull request for {IssueIdentifier} cannot be ruled out; leaving the parked run up.",
+                            TrackerQuerySet.KeyOf(query),
+                            openPullRequests.Count,
+                            run.IssueIdentifier);
                         continue;
                     }
 
@@ -828,18 +894,14 @@ public sealed class PhaseOrchestrator(
         run.CompletedAtUtc ?? run.LastEventAtUtc ?? run.StartedAtUtc;
 
     /// <summary>
-    /// The open pull request belonging to this issue, if the repository has one.
+    /// The branch names this issue's pull request could be on.
     ///
     /// Same two rules ResolvePullRequestNumberAsync uses: the branch the plane
-    /// prepared for the issue, and any branch of that family ("symphony/150" also
-    /// owns "symphony/150-toolcalls"). Without a workspace record the branch is
+    /// prepared for the issue, and - without a workspace record - the branch
     /// derived from the issue number, which is the convention the plane names
     /// branches by and the same one the attention panel matches on.
     /// </summary>
-    private static OpenPullRequest? FindOpenPullRequestForIssue(
-        IReadOnlyList<OpenPullRequest> openPullRequests,
-        string? branchName,
-        string issueIdentifier)
+    private static List<string> BranchFamiliesFor(string? branchName, string issueIdentifier)
     {
         var families = new List<string>();
         if (!string.IsNullOrWhiteSpace(branchName))
@@ -849,9 +911,27 @@ public sealed class PhaseOrchestrator(
 
         if (TryReadIssueNumber(issueIdentifier, out var number))
         {
-            families.Add($"symphony/{number}");
+            var derived = $"symphony/{number}";
+            if (!families.Contains(derived, StringComparer.OrdinalIgnoreCase))
+            {
+                families.Add(derived);
+            }
         }
 
+        return families;
+    }
+
+    /// <summary>
+    /// The open pull request belonging to this issue, if the scan listed one.
+    ///
+    /// A branch of the family counts too ("symphony/150" also owns
+    /// "symphony/150-toolcalls"), which is the only reason the scan is consulted
+    /// at all: an exact-name query cannot match a prefix.
+    /// </summary>
+    private static OpenPullRequest? FindOpenPullRequestForIssue(
+        IReadOnlyList<OpenPullRequest> openPullRequests,
+        IReadOnlyList<string> families)
+    {
         if (families.Count == 0)
         {
             return null;
@@ -864,6 +944,35 @@ public sealed class PhaseOrchestrator(
                 // The separator is required so `symphony/15` cannot claim
                 // `symphony/150`.
                 pullRequest.HeadRefName.StartsWith($"{family}-", StringComparison.OrdinalIgnoreCase)));
+    }
+
+    /// <summary>
+    /// True when the tracker confirms there is no open pull request on ANY of
+    /// these branches.
+    ///
+    /// Head-scoped, one query per branch, so the answer is complete for the name
+    /// asked about rather than "whatever the first page happened to hold". Any
+    /// failure propagates: the caller has to be able to tell "no pull request"
+    /// apart from "could not ask".
+    /// </summary>
+    private async Task<bool> HasNoOpenPullRequestOnAnyBranchAsync(
+        TrackerQuery query,
+        IReadOnlyList<string> families,
+        CancellationToken cancellationToken)
+    {
+        foreach (var family in families)
+        {
+            var pullRequest = await trackerClient.FetchOpenPullRequestByHeadBranchAsync(
+                query,
+                family,
+                cancellationToken);
+            if (pullRequest is not null)
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static bool TryReadIssueNumber(string issueIdentifier, out string number)
