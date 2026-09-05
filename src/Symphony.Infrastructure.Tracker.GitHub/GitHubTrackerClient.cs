@@ -9,7 +9,13 @@ using Symphony.Core.Models;
 
 namespace Symphony.Infrastructure.Tracker.GitHub;
 
-public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITrackerClient, IGitHubTrackerClient
+public sealed partial class GitHubTrackerClient(
+    HttpClient httpClient,
+    // Optional so the adapter stays constructible with nothing but a transport -
+    // every test does that - while the host injects the singleton that keeps the
+    // readings. The adapter reads the budget headers because it is the only thing
+    // holding the response; it does not decide what they mean.
+    IGitHubRateLimitObserver? rateLimitObserver = null) : ITrackerClient, IGitHubTrackerClient
 {
     // Field selection for the by-ids fallback, which is the only issue read still
     // served by GraphQL - and only when the caller cannot name the issue number
@@ -27,19 +33,21 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
                   title
                   number
                 }
-                labels(first: 50) {
+                labels(first: $labels) {
+                  totalCount
                   nodes {
                     name
                   }
                 }
-                linkedBranches(first: 10) {
+                linkedBranches(first: $branches) {
                   nodes {
                     ref {
                       name
                     }
                   }
                 }
-                closedByPullRequestsReferences(first: 10) @include(if: $includePullRequests) {
+                closedByPullRequestsReferences(first: $connections) @include(if: $includePullRequests) {
+                  totalCount
                   nodes {
                     id
                     number
@@ -49,7 +57,8 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
                     baseRefName
                   }
                 }
-                blockedBy(first: 20) {
+                blockedBy(first: $connections) {
+                  totalCount
                   nodes {
                     id
                     number
@@ -59,7 +68,7 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
         """;
 
     private const string GraphQlIssuesByIdsQuery = """
-        query($ids: [ID!]!, $includePullRequests: Boolean!) {
+        query($ids: [ID!]!, $labels: Int!, $branches: Int!, $connections: Int!, $includePullRequests: Boolean!) {
           nodes(ids: $ids) {
             ... on Issue {
               repository {
@@ -75,13 +84,49 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
         }
         """;
 
+    /// <summary>
+    /// The by-ids fallback query text and the page sizes it is issued with, so the
+    /// cost model asserts against the query the plane actually sends.
+    /// </summary>
+    internal static string IssuesByIdsQueryText => GraphQlIssuesByIdsQuery;
+
+    internal static IReadOnlyDictionary<string, int> IssuesByIdsPageSizes(int issueCount) =>
+        new Dictionary<string, int>(StringComparer.Ordinal)
+        {
+            ["ids"] = Math.Max(1, issueCount),
+            ["labels"] = NarrowLabelPage,
+            ["branches"] = NarrowLinkedBranchPage,
+            ["connections"] = NarrowConnectionPage
+        };
+
+    /// <summary>How many issue ids one by-ids fallback request covers.</summary>
+    internal const int IssuesByIdsBatchSize = 50;
+
+    /// <summary>
+    /// Labels requested per issue on the first pass of a state refresh.
+    ///
+    /// GitHub charges what a query REQUESTS, multiplied down the nesting: 50
+    /// labels on each of 100 ids is 5,000 nodes - 51 points - whether the issues
+    /// carry two labels or none. Twenty covers every issue the plane has ever
+    /// seen, and <c>totalCount</c> makes the twenty-first detectable rather than
+    /// silently dropped. That matters more here than anywhere else: this read is
+    /// what tells the cache an issue has LOST <c>symphony-ready</c>, and a label
+    /// set truncated without saying so removes issues from the queue for a reason
+    /// nobody can see.
+    /// </summary>
+    private const int NarrowLabelPage = 20;
+
+    /// <summary>GitHub's per-connection maximum, used to re-read a truncated label set.</summary>
+    private const int WideLabelPage = 100;
+
     private const string GraphQlIssueStatesByIdsQuery = """
-        query($ids: [ID!]!) {
+        query($ids: [ID!]!, $labels: Int!) {
           nodes(ids: $ids) {
             ... on Issue {
               id
               state
-              labels(first: 50) {
+              labels(first: $labels) {
+                totalCount
                 nodes {
                   name
                 }
@@ -96,6 +141,22 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
           }
         }
         """;
+
+    /// <summary>
+    /// The state-refresh query text and the page sizes it is issued with, so the
+    /// cost model asserts against the query the plane actually sends.
+    /// </summary>
+    internal static string IssueStatesQueryText => GraphQlIssueStatesByIdsQuery;
+
+    internal static IReadOnlyDictionary<string, int> IssueStatesPageSizes(int issueCount) =>
+        new Dictionary<string, int>(StringComparer.Ordinal)
+        {
+            ["ids"] = Math.Max(1, issueCount),
+            ["labels"] = NarrowLabelPage
+        };
+
+    /// <summary>How many issue ids one state-refresh request covers.</summary>
+    internal const int IssueStatesBatchSize = 100;
 
     public async Task<IReadOnlyList<NormalizedIssue>> FetchCandidateIssuesAsync(
         TrackerQuery query,
@@ -180,55 +241,58 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
             }
         }
 
-        foreach (var issueIdBatch in unresolved.Chunk(100))
+        foreach (var issueIdBatch in unresolved.Chunk(IssueStatesBatchSize))
         {
-            using var request = BuildGraphQlRequest(
-                endpoint,
-                query.ApiKey,
-                GraphQlIssueStatesByIdsQuery,
-                new
-                {
-                    ids = issueIdBatch
-                });
+            var (states, truncatedIds) = await ReadIssueStatesGraphQlAsync(
+                endpoint, query, issueIdBatch, NarrowLabelPage, cancellationToken);
 
-            using var response = await SendAsync(request, cancellationToken);
-            using var document = await ParseGraphQlDocumentAsync(response, cancellationToken);
-
-            var dataElement = GetRequiredObject(document.RootElement, "data");
-            var nodesElement = GetRequiredArray(dataElement, "nodes");
-
-            foreach (var issueNode in nodesElement.EnumerateArray())
+            foreach (var (issueId, snapshot) in states)
             {
-                if (issueNode.ValueKind != JsonValueKind.Object)
-                {
-                    continue;
-                }
+                statesById[issueId] = snapshot;
+            }
 
-                if (!issueNode.TryGetProperty("repository", out var repositoryNode) ||
-                    repositoryNode.ValueKind != JsonValueKind.Object)
-                {
-                    continue;
-                }
+            if (truncatedIds.Count == 0)
+            {
+                continue;
+            }
 
-                var owner = repositoryNode.TryGetProperty("owner", out var ownerNode)
-                    ? GetOptionalString(ownerNode, "login")
-                    : null;
-                var repo = GetOptionalString(repositoryNode, "name");
+            // An issue with more labels than the first page held. Re-read those ids
+            // at GitHub's maximum page rather than reporting the labels that
+            // happened to fit: a partial label set is not a smaller answer, it is a
+            // different one, and it is the answer the queue is built from.
+            Dictionary<string, IssueStateSnapshot> wideStates;
+            List<string> stillTruncated;
+            try
+            {
+                (wideStates, stillTruncated) = await ReadIssueStatesGraphQlAsync(
+                    endpoint, query, truncatedIds.ToArray(), WideLabelPage, cancellationToken);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (GitHubTrackerException)
+            {
+                // The re-read is the optional half. Failing it must not discard the
+                // states this batch already answered; the truncated ids are simply
+                // not reported, so the caller keeps what it held for them.
+                wideStates = [];
+                stillTruncated = truncatedIds;
+            }
 
-                if (!string.Equals(owner, query.Owner, StringComparison.OrdinalIgnoreCase) ||
-                    !string.Equals(repo, query.Repo, StringComparison.OrdinalIgnoreCase))
-                {
-                    continue;
-                }
+            foreach (var (issueId, snapshot) in wideStates)
+            {
+                statesById[issueId] = snapshot;
+            }
 
-                var issueId = GetOptionalString(issueNode, "id");
-                if (string.IsNullOrWhiteSpace(issueId))
-                {
-                    continue;
-                }
-
-                var normalizedState = NormalizeState(GetOptionalString(issueNode, "state")) ?? "Open";
-                statesById[issueId] = new IssueStateSnapshot(issueId, normalizedState, ExtractLabelNames(issueNode));
+            // Still short of the whole at a hundred labels. The read did not
+            // answer, so it says nothing rather than something incomplete: the id
+            // is dropped from the result and the caller keeps whatever it already
+            // held for that issue. Reporting a truncated label set here would drop
+            // `symphony-ready` from the cache and quietly retire the issue.
+            foreach (var issueId in stillTruncated)
+            {
+                statesById.Remove(issueId);
             }
         }
 
@@ -243,6 +307,91 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
 
         return result;
     }
+
+    /// <summary>
+    /// One state-refresh request, and the ids whose label set came back short of
+    /// its own <c>totalCount</c>.
+    ///
+    /// The truncated ids are RETURNED rather than swallowed because a short label
+    /// page and a complete one are different answers, and only the caller knows
+    /// what to do about the difference.
+    /// </summary>
+    private async Task<(Dictionary<string, IssueStateSnapshot> States, List<string> TruncatedIds)>
+        ReadIssueStatesGraphQlAsync(
+            string endpoint,
+            TrackerQuery query,
+            string[] issueIds,
+            int labelPage,
+            CancellationToken cancellationToken)
+    {
+        var states = new Dictionary<string, IssueStateSnapshot>(StringComparer.OrdinalIgnoreCase);
+        var truncatedIds = new List<string>();
+
+        using var request = BuildGraphQlRequest(
+            endpoint,
+            query.ApiKey,
+            GraphQlIssueStatesByIdsQuery,
+            new
+            {
+                ids = issueIds,
+                labels = labelPage
+            });
+
+        using var response = await SendAsync(request, cancellationToken);
+        using var document = await ParseGraphQlDocumentAsync(response, cancellationToken);
+
+        var dataElement = GetRequiredObject(document.RootElement, "data");
+        foreach (var issueNode in GetRequiredArray(dataElement, "nodes").EnumerateArray())
+        {
+            if (issueNode.ValueKind != JsonValueKind.Object)
+            {
+                continue;
+            }
+
+            if (!issueNode.TryGetProperty("repository", out var repositoryNode) ||
+                repositoryNode.ValueKind != JsonValueKind.Object)
+            {
+                continue;
+            }
+
+            var owner = repositoryNode.TryGetProperty("owner", out var ownerNode)
+                ? GetOptionalString(ownerNode, "login")
+                : null;
+            var repo = GetOptionalString(repositoryNode, "name");
+
+            if (!string.Equals(owner, query.Owner, StringComparison.OrdinalIgnoreCase) ||
+                !string.Equals(repo, query.Repo, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var issueId = GetOptionalString(issueNode, "id");
+            if (string.IsNullOrWhiteSpace(issueId))
+            {
+                continue;
+            }
+
+            if (HasTruncatedLabels(issueNode))
+            {
+                truncatedIds.Add(issueId);
+            }
+
+            var normalizedState = NormalizeState(GetOptionalString(issueNode, "state")) ?? "Open";
+            states[issueId] = new IssueStateSnapshot(issueId, normalizedState, ExtractLabelNames(issueNode));
+        }
+
+        return (states, truncatedIds);
+    }
+
+    private static bool HasTruncatedLabels(JsonElement issueNode) =>
+        issueNode.TryGetProperty("labels", out var labelsNode) &&
+        labelsNode.ValueKind == JsonValueKind.Object &&
+        labelsNode.TryGetProperty("totalCount", out var totalCountNode) &&
+        totalCountNode.ValueKind == JsonValueKind.Number &&
+        totalCountNode.TryGetInt32(out var totalCount) &&
+        labelsNode.TryGetProperty("nodes", out var labelNodes) &&
+        labelNodes.ValueKind == JsonValueKind.Array &&
+        totalCount > labelNodes.GetArrayLength();
 
     private const string GraphQlIssueCommentMarkerQuery = """
         query($id: ID!, $after: String) {
@@ -569,48 +718,51 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
             }
         }
 
-        foreach (var issueIdBatch in unresolved.Chunk(50))
+        foreach (var issueIdBatch in unresolved.Chunk(IssuesByIdsBatchSize))
         {
-            using var request = BuildGraphQlRequest(
-                endpoint,
-                query.ApiKey,
-                GraphQlIssuesByIdsQuery,
-                new
-                {
-                    ids = issueIdBatch,
-                    includePullRequests = query.IncludePullRequests
-                });
+            var batch = await ReadIssuesByIdsGraphQlAsync(
+                endpoint, query, issueIdBatch, NarrowLabelPage, NarrowConnectionPage, cancellationToken);
 
-            using var response = await SendAsync(request, cancellationToken);
-            using var document = await ParseGraphQlDocumentAsync(response, cancellationToken);
+            var truncatedIds = batch
+                .Where(entry => entry.Value.Truncated)
+                .Select(entry => entry.Key)
+                .ToArray();
 
-            var dataElement = GetRequiredObject(document.RootElement, "data");
-            foreach (var issueNode in GetRequiredArray(dataElement, "nodes").EnumerateArray())
+            if (truncatedIds.Length != 0)
             {
-                if (issueNode.ValueKind != JsonValueKind.Object ||
-                    string.IsNullOrWhiteSpace(GetOptionalString(issueNode, "id")))
+                // Something on these issues had more than the first page held.
+                // Re-read them at GitHub's maximum rather than reporting the part
+                // that fit - a blocker list short of the whole reads as "nothing
+                // blocks this", which is the one wrong answer that dispatches.
+                try
                 {
-                    continue;
-                }
+                    var wide = await ReadIssuesByIdsGraphQlAsync(
+                        endpoint, query, truncatedIds, WideLabelPage, WideConnectionPage, cancellationToken);
 
-                if (!issueNode.TryGetProperty("repository", out var repositoryNode) ||
-                    repositoryNode.ValueKind != JsonValueKind.Object)
+                    foreach (var (issueId, issue) in wide)
+                    {
+                        batch[issueId] = issue;
+                    }
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
                 {
-                    continue;
+                    throw;
                 }
-
-                var owner = repositoryNode.TryGetProperty("owner", out var ownerNode)
-                    ? GetOptionalString(ownerNode, "login")
-                    : null;
-                var repo = GetOptionalString(repositoryNode, "name");
-                if (!string.Equals(owner, query.Owner, StringComparison.OrdinalIgnoreCase) ||
-                    !string.Equals(repo, query.Repo, StringComparison.OrdinalIgnoreCase))
+                catch (GitHubTrackerException)
                 {
-                    continue;
+                    // The re-read is the optional half. The issues the narrow pass
+                    // answered whole are kept; the truncated ones stay flagged
+                    // below, which is the honest answer rather than a lost batch.
                 }
+            }
 
-                var issue = ParseIssue(issueNode, query.IncludePullRequests, $"{query.Owner}/{query.Repo}");
-                issuesById[issue.Id] = issue;
+            foreach (var (issueId, issue) in batch)
+            {
+                // Still short of the whole after the wide re-read: say so on the
+                // issue rather than hand back a partial list as a complete one.
+                issuesById[issueId] = issue.Truncated
+                    ? issue.Issue with { EnrichmentDegraded = true }
+                    : issue.Issue;
             }
         }
 
@@ -624,6 +776,66 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
         }
 
         return result;
+    }
+
+    /// <summary>One issue from the by-ids fallback, and whether any connection on it was short of its own count.</summary>
+    private readonly record struct FetchedIssue(NormalizedIssue Issue, bool Truncated);
+
+    private async Task<Dictionary<string, FetchedIssue>> ReadIssuesByIdsGraphQlAsync(
+        string endpoint,
+        TrackerQuery query,
+        string[] issueIds,
+        int labelPage,
+        int connectionPage,
+        CancellationToken cancellationToken)
+    {
+        using var request = BuildGraphQlRequest(
+            endpoint,
+            query.ApiKey,
+            GraphQlIssuesByIdsQuery,
+            new
+            {
+                ids = issueIds,
+                labels = labelPage,
+                branches = NarrowLinkedBranchPage,
+                connections = connectionPage,
+                includePullRequests = query.IncludePullRequests
+            });
+
+        using var response = await SendAsync(request, cancellationToken);
+        using var document = await ParseGraphQlDocumentAsync(response, cancellationToken);
+
+        var issuesById = new Dictionary<string, FetchedIssue>(StringComparer.OrdinalIgnoreCase);
+        var dataElement = GetRequiredObject(document.RootElement, "data");
+        foreach (var issueNode in GetRequiredArray(dataElement, "nodes").EnumerateArray())
+        {
+            if (issueNode.ValueKind != JsonValueKind.Object ||
+                string.IsNullOrWhiteSpace(GetOptionalString(issueNode, "id")))
+            {
+                continue;
+            }
+
+            if (!issueNode.TryGetProperty("repository", out var repositoryNode) ||
+                repositoryNode.ValueKind != JsonValueKind.Object)
+            {
+                continue;
+            }
+
+            var owner = repositoryNode.TryGetProperty("owner", out var ownerNode)
+                ? GetOptionalString(ownerNode, "login")
+                : null;
+            var repo = GetOptionalString(repositoryNode, "name");
+            if (!string.Equals(owner, query.Owner, StringComparison.OrdinalIgnoreCase) ||
+                !string.Equals(repo, query.Repo, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var issue = ParseIssue(issueNode, query.IncludePullRequests, $"{query.Owner}/{query.Repo}");
+            issuesById[issue.Id] = new FetchedIssue(issue, HasTruncatedConnection(issueNode));
+        }
+
+        return issuesById;
     }
 
     // Pull requests, checks and changed files are all /repos/... reads. They used
@@ -926,6 +1138,16 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
                 variablesNode);
 
             using var response = await httpClient.SendAsync(request, cancellationToken);
+
+            // This path cannot go through SendAsync - the raw tool reports failure
+            // as a result, not as an exception - so the reading has to be taken
+            // here explicitly. An agent-issued github_graphql call spends from the
+            // same 5,000-point hourly budget as every scan, and a budget observed
+            // only on the plane's own calls under-reports exactly when the agents
+            // are busiest. Taken before either return so a refused call - the
+            // reading worth having - is recorded too.
+            RecordRateLimit(response);
+
             var payloadJson = await response.Content.ReadAsStringAsync(cancellationToken);
             if (!response.IsSuccessStatusCode)
             {
@@ -1341,6 +1563,13 @@ public sealed partial class GitHubTrackerClient(HttpClient httpClient) : ITracke
         try
         {
             var response = await httpClient.SendAsync(request, cancellationToken);
+
+            // Recorded before the refusal path below disposes the response. The
+            // GraphQL budget is the one that runs out, and its exhaustion is
+            // reported in these headers - X-Ratelimit-Used: 5011 against a 5000
+            // limit on 2026-09-05 - while `gh api rate_limit` said 5000 remaining.
+            RecordRateLimit(response);
+
             if (!response.IsSuccessStatusCode)
             {
                 // GraphQL usually reports exhaustion as a 200 with a RATE_LIMITED

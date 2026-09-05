@@ -1545,9 +1545,28 @@ function renderUtilityStrip() {
     dotLabel(state.health?.ok === true ? "ok" : "down", `Engine ${state.health?.label || "unknown"}`)
   ].join("");
 
-  /* The mock-up put a GitHub API request budget here. The engine does not
-     report one - rate_limits is the agent vendors' quota - so this shows the
-     quota it actually has rather than a plausible number for a different thing. */
+  /* The GitHub request budget the mock-up asked for, now that the engine
+     reports one. It is measured from the x-ratelimit-* headers on the calls the
+     plane is already making, per resource - graphql and core are separate
+     budgets and exhausting either blinds different things. Absent until the
+     first call answers, and absent reads as unknown rather than as healthy:
+     the exhaustion on 2026-09-05 was invisible precisely because nothing
+     distinguished "not measured" from "fine". */
+  const gitHubBudgets = snap.github_rate_limits || [];
+  const gitHubMeters = gitHubBudgets.map(budget => {
+    const pct = Math.round(Number(budget.used_percent ?? 0));
+    const cls = pct >= 90 ? "is-full" : pct >= 80 ? "is-high" : "";
+    const word = pct >= 90 ? "critical" : pct >= 80 ? "high" : "ok";
+    /* Null burn is "too few readings to say", not zero. A dash says that; a 0
+       would claim the budget is not being spent. */
+    const burn = budget.burn_points_per_hour == null
+      ? "rate unknown"
+      : `${Math.round(Number(budget.burn_points_per_hour))}/h`;
+    return `<span class="wt-svc-item">${escapeHtml(String(budget.resource || "github"))}
+      <span class="wt-bar ${cls}" role="img" aria-label="${pct}% used, ${word}"><i style="width:${Math.min(100, pct)}%"></i></span>
+      <span class="wt-lim-num">${pct}% used, ${escapeHtml(burn)}</span></span>`;
+  }).join("");
+
   const byRunner = snap.rate_limits_by_runner || {};
   const meters = Object.entries(byRunner).map(([name, limits]) => {
     const pct = Math.round(Number(limits?.primary?.usedPercent ?? limits?.usedPercent ?? 0));
@@ -1560,6 +1579,10 @@ function renderUtilityStrip() {
 
   host.innerHTML = `
     <div class="wt-strip"><span class="wt-strip-h">Services</span>${services}</div>
+    <div class="wt-strip wt-lim">
+      <span class="wt-strip-h">GitHub budget</span>
+      ${gitHubMeters || `<span class="wt-empty">Not measured yet.</span>`}
+    </div>
     <div class="wt-strip wt-lim">
       <span class="wt-strip-h">Agent quota</span>
       ${meters || `<span class="wt-empty">No quota reported.</span>`}

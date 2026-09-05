@@ -140,6 +140,12 @@ internal static class SymphonyHostApplication
         services.AddSingleton<RefreshSignalService>();
         // Singleton: a failure streak only means anything across ticks.
         services.AddSingleton<TrackerReachability>();
+        // Singleton for the same reason: a burn rate only means anything across
+        // calls. Registered under its own type AND the abstraction, so the tracker
+        // adapter reports into the same instance the status page reads.
+        services.AddSingleton<GitHubRateLimitBudget>();
+        services.AddSingleton<IGitHubRateLimitObserver>(
+            provider => provider.GetRequiredService<GitHubRateLimitBudget>());
         services.AddScoped<EscalationPublisher>();
         services.AddScoped<DirectiveProcessor>();
         services.AddScoped<PhaseOrchestrator>();

@@ -159,6 +159,10 @@ public static class OwnerAttentionSummary
         IReadOnlyList<AgentActivityReport> agentActivity,
         IReadOnlyList<WatchedTaskReport> watchedTasks,
         TrackerReachabilitySnapshot? tracker,
+        // What GitHub says is left of its budgets. Null or empty means nothing has
+        // been observed yet, which raises nothing: an unobserved budget is unknown,
+        // and the panel must not report unknown as either healthy or spent.
+        IReadOnlyList<GitHubRateLimitBudgetSnapshot>? gitHubRateLimits,
         // Issues the plane will move on its own. Required, not defaulted: a caller
         // that forgets it gets the panel back that reported healthy in-flight work
         // as the owner's obligation, and silently.
@@ -211,6 +215,40 @@ public static class OwnerAttentionSummary
                 Actor: AttentionActors.Operator,
                 Action: new AttentionAction("command", "Check connectivity",
                     Command: "gh api rate_limit")));
+        }
+
+        // The budget going, before it has gone. Every previous exhaustion was
+        // discovered by the plane falling silent - three times, on 2026-09-01
+        // twice and 2026-09-05 - because nothing looked at the allowance until
+        // something was refused. At 80% there is still a fifth of the window in
+        // which stopping a poll or a repair round changes the outcome.
+        foreach (var budget in (gitHubRateLimits ?? [])
+                     .Where(budget => budget.UsedPercent >= GitHubRateLimitBudget.AttentionPercent)
+                     .OrderByDescending(budget => budget.UsedPercent))
+        {
+            // A rate the plane has not measured yet is reported as unmeasured. A
+            // burn rate invented from one reading would be the same class of claim
+            // as the endpoint that said 5,000 remaining while calls were refused.
+            var burn = budget.BurnPointsPerHour is { } rate
+                ? $"Burning about {rate:0} points/hour."
+                : "Too few readings so far to say how fast it is going.";
+
+            var resets = budget.ResetAtUtc is { } reset
+                ? $" The window resets at {reset.UtcDateTime:HH:mm}Z."
+                : string.Empty;
+
+            var runsOut = budget.ProjectedExhaustionUtc is { } exhausted
+                ? $" At that rate it runs out at {exhausted.UtcDateTime:HH:mm}Z, before the reset."
+                : string.Empty;
+
+            items.Add(new AttentionItem(
+                $"The GitHub {budget.Resource} budget is {budget.UsedPercent:0}% spent",
+                $"{budget.Used} of {budget.Limit} points used, {budget.Remaining} left. {burn}{runsOut}{resets} " +
+                "When it reaches zero the plane stops seeing new work until the window rolls over.",
+                budget.Remaining <= 0 ? LevelDown : LevelAttention,
+                Actor: AttentionActors.Operator,
+                Action: new AttentionAction("command", "Read the budget GitHub reports",
+                    Command: "gh api rate_limit --jq .resources.graphql")));
         }
 
         // Said on every item the tracker supplied, not only in the banner above.

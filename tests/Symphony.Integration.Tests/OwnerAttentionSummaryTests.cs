@@ -21,6 +21,7 @@ public sealed class OwnerAttentionSummaryTests
         IReadOnlyList<AgentActivityReport>? agentActivity = null,
         IReadOnlyList<WatchedTaskReport>? watchedTasks = null,
         TrackerReachabilitySnapshot? tracker = null,
+        IReadOnlyList<GitHubRateLimitBudgetSnapshot>? gitHubRateLimits = null,
         IReadOnlyList<InFlightIssue>? inFlight = null,
         IReadOnlyDictionary<string, string>? escalationReasons = null,
         DateTimeOffset? lastEvent = null,
@@ -28,7 +29,7 @@ public sealed class OwnerAttentionSummaryTests
         IReadOnlyCollection<string>? closedIssueIds = null) =>
         OwnerAttentionSummary.Build(
             healthy, escalated ?? [], running, retrying, phases ?? [], openPullRequests ?? [],
-            agentActivity ?? [], watchedTasks ?? [], tracker, inFlight ?? [],
+            agentActivity ?? [], watchedTasks ?? [], tracker, gitHubRateLimits, inFlight ?? [],
             escalationReasons ?? new Dictionary<string, string>(), lastEvent, Now, primaryRepository,
             closedIssueIds);
 
@@ -927,6 +928,61 @@ public sealed class OwnerAttentionSummaryTests
 
         var pullRequestItem = Assert.Single(result.Items, item => item.Label.Contains("PR #105", StringComparison.Ordinal));
         Assert.DoesNotContain("Unverified", pullRequestItem.Detail, StringComparison.Ordinal);
+    }
+
+    // The plane spent its whole hourly GraphQL budget on 2026-09-05 and the first
+    // sign of it was the candidate scan being refused. The panel has to say it
+    // while there is still a window left to act in. ADCP#88.
+    [Fact]
+    public void ABudgetPastEightyPercentIsRaisedWithItsBurnRate()
+    {
+        var result = Build(gitHubRateLimits:
+        [
+            new GitHubRateLimitBudgetSnapshot(
+                "graphql", 5000, 4200, 800, 84.0,
+                ResetAtUtc: Now.AddMinutes(20),
+                ObservedAtUtc: Now,
+                BurnPointsPerHour: 2400,
+                ProjectedExhaustionUtc: Now.AddMinutes(20))
+        ]);
+
+        var item = Assert.Single(result.Items, entry => entry.Label.Contains("graphql", StringComparison.Ordinal));
+        Assert.Equal(OwnerAttentionSummary.LevelAttention, item.Severity);
+        Assert.Contains("2400 points/hour", item.Detail, StringComparison.Ordinal);
+        Assert.Contains("4200 of 5000", item.Detail, StringComparison.Ordinal);
+    }
+
+    // Null is "too few readings to measure", not zero. A burn rate invented from
+    // one reading is the same class of claim as the endpoint that reported 5,000
+    // remaining while every call was being refused.
+    [Fact]
+    public void AnUnmeasuredBurnRateIsSaidToBeUnmeasured()
+    {
+        var result = Build(gitHubRateLimits:
+        [
+            new GitHubRateLimitBudgetSnapshot(
+                "graphql", 5000, 5011, 0, 100.2,
+                ResetAtUtc: Now.AddMinutes(20),
+                ObservedAtUtc: Now,
+                BurnPointsPerHour: null,
+                ProjectedExhaustionUtc: null)
+        ]);
+
+        var item = Assert.Single(result.Items, entry => entry.Label.Contains("graphql", StringComparison.Ordinal));
+        Assert.Contains("Too few readings", item.Detail, StringComparison.Ordinal);
+
+        // Nothing left is not "needs attention", it is down: the plane has already
+        // stopped seeing new work.
+        Assert.Equal(OwnerAttentionSummary.LevelDown, item.Severity);
+    }
+
+    // An unobserved budget is unknown, and a panel that reports unknown as either
+    // healthy or spent is the panel that hid the last three exhaustions.
+    [Fact]
+    public void AnUnobservedBudgetRaisesNothing()
+    {
+        Assert.Empty(Build(gitHubRateLimits: []).Items);
+        Assert.Empty(Build(gitHubRateLimits: null).Items);
     }
 
     // The point of the whole feature is that silence is legible - which means a

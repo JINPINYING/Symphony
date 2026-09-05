@@ -12,6 +12,7 @@ public sealed class RuntimeStateService(
     IWorkflowDefinitionProvider workflowDefinitionProvider,
     IWatchedTaskReader watchedTaskReader,
     TrackerReachability trackerReachability,
+    GitHubRateLimitBudget gitHubRateLimitBudget,
     TimeProvider timeProvider)
 {
     // A malformed or older snapshot must never take the page down. An empty list
@@ -455,6 +456,7 @@ public sealed class RuntimeStateService(
             agentActivity: agentActivity,
             watchedTasks: watchedTasks,
             tracker: trackerReachability.Current,
+            gitHubRateLimits: gitHubRateLimitBudget.Current,
             inFlightIssues: inFlightIssues,
             phaseEscalationReasons: phaseEscalationReasons,
             lastEventAtUtc: recentActivity.Count > 0 ? recentActivity[0].At : null,
@@ -569,6 +571,28 @@ public sealed class RuntimeStateService(
                 blind = trackerReachability.Current.UnreachableSinceUtc is { } blindSince &&
                         generatedAt - blindSince > TrackerReachability.UnreachableGrace
             },
+            // What GitHub says about its own budgets, from the headers on the calls
+            // the plane is already making. Absent until the first call answers -
+            // an empty list here means "not yet observed", which is why the page
+            // must render it as unknown rather than as healthy. `gh api rate_limit`
+            // is deliberately not the source: it is a separate call, and its
+            // top-level `rate` block is the core budget rather than the GraphQL one
+            // that runs out.
+            github_rate_limits = gitHubRateLimitBudget.Current.Select(budget => new
+            {
+                resource = budget.Resource,
+                limit = budget.Limit,
+                used = budget.Used,
+                remaining = budget.Remaining,
+                used_percent = budget.UsedPercent,
+                reset_at = budget.ResetAtUtc?.ToString("o"),
+                observed_at = budget.ObservedAtUtc.ToString("o"),
+                // Null means "too few readings to measure", not "nothing is being
+                // spent". The consumer has to be able to tell those apart.
+                burn_points_per_hour = budget.BurnPointsPerHour,
+                projected_exhaustion_at = budget.ProjectedExhaustionUtc?.ToString("o"),
+                attention = budget.UsedPercent >= GitHubRateLimitBudget.AttentionPercent
+            }),
             watched_tasks = watchedTasks.Select(task => new
             {
                 name = task.Name,
