@@ -981,6 +981,45 @@ public sealed class GitHubTrackerClientTests
         Assert.Equal(100.2, latest.UsedPercent);
     }
 
+    /// <summary>
+    /// The raw <c>github_graphql</c> tool spends from the same 5,000-point hourly
+    /// budget as every scan, and it is the one path that cannot go through the
+    /// shared GraphQL send helper - it reports failure as a result rather than an
+    /// exception. A budget observed only on the plane's own calls under-reports
+    /// exactly when the agents are busiest, so the reading is taken here too.
+    /// </summary>
+    [Theory]
+    [InlineData(HttpStatusCode.OK, "{\"data\":{\"viewer\":{\"login\":\"nick\"}}}")]
+    [InlineData(HttpStatusCode.Forbidden, "{\"message\":\"API rate limit exceeded\"}")]
+    public async Task TheBudgetHeadersAreRecordedForTheRawGraphQlTool(HttpStatusCode statusCode, string payload)
+    {
+        var observer = new RecordingRateLimitObserver();
+        using var httpClient = new HttpClient(new BudgetHeaderHandler(statusCode, payload))
+        {
+            BaseAddress = new Uri("https://api.github.com/graphql")
+        };
+
+        var result = await new GitHubTrackerClient(httpClient, observer).ExecuteGitHubGraphQlAsync(
+            new TrackerQuery(
+                Endpoint: "https://api.github.com/graphql",
+                ApiKey: "token",
+                Owner: "released",
+                Repo: "symphony",
+                ActiveStates: ["Open"],
+                Labels: [],
+                Milestone: null),
+            "query { viewer { login } }",
+            null);
+
+        Assert.Equal(statusCode == HttpStatusCode.OK, result.Success);
+
+        var reading = Assert.Single(observer.Readings);
+        Assert.Equal("graphql", reading.Resource);
+        Assert.Equal(5000, reading.Limit);
+        Assert.Equal(5011, reading.Used);
+        Assert.Equal(0, reading.Remaining);
+    }
+
     private static string EnrichmentPayload(int blockerTotal, int blockerCount)
     {
         var blockers = string.Join(',', Enumerable.Range(1, blockerCount)
@@ -1192,6 +1231,30 @@ public sealed class GitHubTrackerClientTests
             return Task.FromResult(response);
         }
     }
+    /// <summary>
+    /// Answers with a chosen status and the budget headers GitHub attached on
+    /// 2026-09-05, so the same handler proves the reading is taken on the success
+    /// and the refusal alike.
+    /// </summary>
+    private sealed class BudgetHeaderHandler(HttpStatusCode statusCode, string json) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            var response = new HttpResponseMessage(statusCode)
+            {
+                Content = new StringContent(json, Encoding.UTF8, "application/json")
+            };
+
+            response.Headers.TryAddWithoutValidation("x-ratelimit-resource", "graphql");
+            response.Headers.TryAddWithoutValidation("x-ratelimit-limit", "5000");
+            response.Headers.TryAddWithoutValidation("x-ratelimit-used", "5011");
+            response.Headers.TryAddWithoutValidation("x-ratelimit-remaining", "0");
+            response.Headers.TryAddWithoutValidation("x-ratelimit-reset", "1788610784");
+
+            return Task.FromResult(response);
+        }
+    }
+
     private sealed class CountingHandler : HttpMessageHandler
     {
         public int RequestCount { get; private set; }

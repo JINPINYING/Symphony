@@ -1138,6 +1138,16 @@ public sealed partial class GitHubTrackerClient(
                 variablesNode);
 
             using var response = await httpClient.SendAsync(request, cancellationToken);
+
+            // This path cannot go through SendAsync - the raw tool reports failure
+            // as a result, not as an exception - so the reading has to be taken
+            // here explicitly. An agent-issued github_graphql call spends from the
+            // same 5,000-point hourly budget as every scan, and a budget observed
+            // only on the plane's own calls under-reports exactly when the agents
+            // are busiest. Taken before either return so a refused call - the
+            // reading worth having - is recorded too.
+            RecordRateLimit(response);
+
             var payloadJson = await response.Content.ReadAsStringAsync(cancellationToken);
             if (!response.IsSuccessStatusCode)
             {
