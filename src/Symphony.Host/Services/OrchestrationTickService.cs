@@ -69,7 +69,11 @@ public sealed partial class OrchestrationTickService
     // real answer; these are the fallback for when it did not say.
     private static readonly TimeSpan RateLimitBackoff = TimeSpan.FromMinutes(10);
     private static readonly TimeSpan MaxRateLimitBackoff = TimeSpan.FromMinutes(60);
-    private static readonly TimeSpan CandidateScanInterval = TimeSpan.FromSeconds(60);
+    // The cadence lives in Symphony.Core.Configuration.TrackerReadCadence, beside
+    // the arithmetic that decides whether it is affordable. It used to be a private
+    // constant here, which is how three separate changes each moved one number with
+    // nothing recomputing the hourly product. See GitHubTrackerGraphQlCost.
+    private static readonly TimeSpan CandidateScanInterval = TrackerReadCadence.CandidateScan;
     private DateTimeOffset nextCandidateScanUtc = DateTimeOffset.MinValue;
     // Consecutive rate-limited scans. In memory on purpose: a restart has observed
     // nothing and should not inherit an escalated backoff, and the pause itself is
@@ -86,10 +90,10 @@ public sealed partial class OrchestrationTickService
     // it mirrors: a tick can be fifteen seconds, and refreshing a whole cache four
     // times a minute spends the budget this change exists to protect. The
     // dashboard is no staler for it - the scan beside it already moves at 60s.
-    private static readonly TimeSpan TrackedIssueRefreshInterval = TimeSpan.FromSeconds(60);
+    private static readonly TimeSpan TrackedIssueRefreshInterval = TrackerReadCadence.TrackedIssueRefresh;
     private DateTimeOffset nextTrackedIssueRefreshUtc = DateTimeOffset.MinValue;
 
-    private static readonly TimeSpan OpenPullRequestPollInterval = TimeSpan.FromMinutes(2);
+    private static readonly TimeSpan OpenPullRequestPollInterval = TrackerReadCadence.OpenPullRequestPoll;
     private DateTimeOffset nextOpenPullRequestPollUtc = DateTimeOffset.MinValue;
 
     public OrchestrationTickService(

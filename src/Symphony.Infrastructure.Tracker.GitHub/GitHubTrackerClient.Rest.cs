@@ -110,6 +110,13 @@ public sealed partial class GitHubTrackerClient
             throw new GitHubTrackerException("github_api_request", "GitHub REST request failed.", ex);
         }
 
+        // Before anything can return or throw, and before the response is disposed
+        // on the refusal path below. The reading GitHub attached to a refusal is
+        // the most valuable one there is - it is the only one that says how the
+        // budget was spent - and a record taken only on success would lose exactly
+        // the readings worth having.
+        RecordRateLimit(response);
+
         if (response.IsSuccessStatusCode)
         {
             return response;
@@ -174,6 +181,68 @@ public sealed partial class GitHubTrackerClient
 
         return body.Contains("rate limit", StringComparison.OrdinalIgnoreCase);
     }
+
+    /// <summary>
+    /// Records what GitHub said about the budget on this response.
+    ///
+    /// WHY IT IS TAKEN HERE. The plane exhausted the 5,000-point hourly GraphQL
+    /// budget on 2026-09-05 and the first sign of it was the candidate scan going
+    /// blind. <c>gh api rate_limit</c> read 5,000 remaining at the same moment: its
+    /// top-level <c>rate</c> block is the core budget, and the GraphQL figure is at
+    /// <c>.resources.graphql</c>. The headers are on the calls the plane is already
+    /// making, they name their own resource, and they cost nothing.
+    ///
+    /// Silent when the headers are absent or unreadable: a proxy that strips them
+    /// is not a reason to fail a read, and an invented reading is worse than none
+    /// because the panel it feeds would present it as measurement.
+    /// </summary>
+    private void RecordRateLimit(HttpResponseMessage response)
+    {
+        if (rateLimitObserver is null)
+        {
+            return;
+        }
+
+        var limit = ReadHeaderInt(response, "x-ratelimit-limit");
+        var used = ReadHeaderInt(response, "x-ratelimit-used");
+        var remaining = ReadHeaderInt(response, "x-ratelimit-remaining");
+        if (limit is null || used is null || remaining is null)
+        {
+            return;
+        }
+
+        var resource = ReadHeaderString(response, "x-ratelimit-resource");
+        var reset = ReadHeaderLong(response, "x-ratelimit-reset");
+
+        try
+        {
+            rateLimitObserver.Record(new GitHubRateLimitReading(
+                string.IsNullOrWhiteSpace(resource) ? "unknown" : resource.Trim().ToLowerInvariant(),
+                limit.Value,
+                used.Value,
+                remaining.Value,
+                reset is null ? null : DateTimeOffset.FromUnixTimeSeconds(reset.Value),
+                DateTimeOffset.UtcNow));
+        }
+        catch (Exception)
+        {
+            // Telemetry taken on the way past a real read. Losing the telemetry
+            // must never lose the read.
+        }
+    }
+
+    private static string? ReadHeaderString(HttpResponseMessage response, string name) =>
+        response.Headers.TryGetValues(name, out var values) ? values.FirstOrDefault() : null;
+
+    private static int? ReadHeaderInt(HttpResponseMessage response, string name) =>
+        int.TryParse(ReadHeaderString(response, name), NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed)
+            ? parsed
+            : null;
+
+    private static long? ReadHeaderLong(HttpResponseMessage response, string name) =>
+        long.TryParse(ReadHeaderString(response, name), NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed)
+            ? parsed
+            : null;
 
     private static string DescribeRateLimit(string body, int statusCode)
     {

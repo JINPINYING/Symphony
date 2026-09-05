@@ -63,6 +63,20 @@ Locked on 2026-03-05:
 - Use GraphQL only for writes and for the fields REST cannot express (`linkedBranches`,
   `blockedBy`, `closedByPullRequestsReferences`). Those are enrichment: they must degrade
   without stopping a dispatch.
+- GraphQL is charged on what a query REQUESTS - `first`/`last` multiplied down each
+  nesting path, divided by 100 - not on what comes back. So:
+  - Ask for the page you consume. Where the whole connection is consumed, ask for a
+    small page AND `totalCount`, and re-read wide when the page was short. A smaller
+    page with no `totalCount` is a silent wrong answer.
+  - Page sizes are query variables, so the narrow first pass and the wide re-read are
+    the same query text.
+  - Cadences live in `TrackerReadCadence`, beside the arithmetic that decides whether
+    they are affordable. `GitHubTrackerGraphQlCost` models the steady-state hourly
+    cost from the query constants, and a test fails the build above
+    `TrackerReadCadence.ModelledHourlyCeiling`.
+  - Budget observation comes from the `x-ratelimit-*` headers on calls already being
+    made, not from `/rate_limit` - whose top-level `rate` block is the core budget,
+    not the GraphQL one that runs out.
 - Normalize all tracker payloads to the spec domain model before use.
 - Use PAT auth for v1.
 - Filter candidates by configured state + label + milestone.
