@@ -2074,6 +2074,514 @@ public sealed class OrchestrationTickServiceTests
             run => run.Phase == RunPhaseNames.Implementation && run.Status == RunStatusNames.Running);
     }
 
+    // ADCP#29. On 2026-09-04 the Codex account ran out of quota, four reviews
+    // never started, and the phase machine escalated the REVIEWER for a contract
+    // violation - four times in fifty minutes, for one cause, asking a person for
+    // a decision that does not exist. A quota refusal clears on a clock. The phase
+    // waits for the clock.
+    [Fact]
+    public async Task RunTickAsync_ShouldHoldAReviewWhoseRunnerIsOutOfQuotaInsteadOfEscalating()
+    {
+        var tracker = new FakeTrackerClient([]);
+        tracker.IssuesById["issue-1"] = BuildIssue("issue-1", "#1", "Open", null, pullRequests: []);
+        tracker.PullRequestStatusByNumber[5] = new PullRequestStatus(5, "OPEN", false, "aaa111", "SUCCESS", "MERGEABLE");
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await harness.InsertReviewingLedgerAsync("issue-1", "#1", prNumber: 5);
+        await harness.InsertQuotaRefusedReviewRunAsync("issue-1", "#1", runner: "codex");
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var ledger = await harness.DbContext.PhaseLedger.SingleAsync();
+        Assert.NotEqual(PhaseStages.Escalated, ledger.Stage);
+
+        // Back to the stage that asks, so the hold expiring is all it takes to
+        // retry - and held until the reset the refusal named for itself.
+        Assert.Equal(PhaseStages.AwaitingReview, ledger.Stage);
+        Assert.Equal("codex", ledger.HoldRunner);
+        Assert.Equal(PhaseOrchestrator.RunnerQuotaHoldReason, ledger.HoldReason);
+        Assert.NotNull(ledger.HoldUntilUtc);
+        Assert.True(ledger.HoldUntilUtc > DateTimeOffset.UtcNow, "the hold must be ahead of now");
+
+        var events = await harness.DbContext.EventLog.ToListAsync();
+        Assert.Contains(events, entry => entry.EventName == PhaseOrchestrator.RunnerQuotaHoldEventName);
+        Assert.DoesNotContain(events, entry => entry.EventName == PhaseOrchestrator.EscalationEventName);
+    }
+
+    // A hold is a wait, not a licence to keep asking: while it is on, the phase
+    // makes no dispatch and the stuck backstop does not fire on it either.
+    [Fact]
+    public async Task RunTickAsync_ShouldNotDispatchAReviewWhileItsRunnerIsHeldOnQuota()
+    {
+        var tracker = new FakeTrackerClient([]);
+        tracker.IssuesById["issue-1"] = BuildIssue("issue-1", "#1", "Open", null, pullRequests: []);
+        tracker.PullRequestStatusByNumber[5] = new PullRequestStatus(5, "OPEN", false, "aaa111", "SUCCESS", "MERGEABLE");
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success));
+
+        await harness.InsertReviewingLedgerAsync(
+            "issue-1",
+            "#1",
+            prNumber: 5,
+            stage: PhaseStages.AwaitingReview,
+            holdUntilUtc: DateTimeOffset.UtcNow.AddMinutes(20),
+            holdSinceUtc: DateTimeOffset.UtcNow.AddMinutes(-5),
+            // Stale enough that the two-hour backstop would fire if a hold did not
+            // suppress it: a deliberate wait is not an absence of progress.
+            updatedAtUtc: DateTimeOffset.UtcNow - PhaseOrchestrator.StuckStageTimeout - TimeSpan.FromMinutes(30));
+        await harness.InsertQuotaRefusedReviewRunAsync("issue-1", "#1", runner: "codex");
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Empty(harness.Coordinator.StartRequests);
+
+        var ledger = await harness.DbContext.PhaseLedger.SingleAsync();
+        Assert.Equal(PhaseStages.AwaitingReview, ledger.Stage);
+        Assert.DoesNotContain(
+            await harness.DbContext.EventLog.ToListAsync(),
+            entry => entry.EventName == PhaseOrchestrator.EscalationEventName);
+    }
+
+    // The hold is a clock, not a parking space: once it expires the review is
+    // dispatched again without anybody having to ask.
+    [Fact]
+    public async Task RunTickAsync_ShouldDispatchTheReviewAgainOnceTheQuotaHoldExpires()
+    {
+        var issue = BuildIssue("issue-1", "#1", "Open", null,
+            pullRequests: [new PullRequestRef("pr-5", 5, "OPEN", null, "symphony/1", "main")]);
+        var tracker = new FakeTrackerClient([]);
+        tracker.IssuesById["issue-1"] = issue;
+        tracker.PullRequestStatusByNumber[5] = new PullRequestStatus(5, "OPEN", false, "aaa111", "SUCCESS", "MERGEABLE");
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success));
+
+        await harness.InsertReviewingLedgerAsync(
+            "issue-1",
+            "#1",
+            prNumber: 5,
+            stage: PhaseStages.AwaitingReview,
+            holdUntilUtc: DateTimeOffset.UtcNow.AddMinutes(-1),
+            holdSinceUtc: DateTimeOffset.UtcNow.AddMinutes(-40));
+        await harness.InsertQuotaRefusedReviewRunAsync("issue-1", "#1", runner: "codex");
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var ledger = await harness.DbContext.PhaseLedger.SingleAsync();
+        Assert.Null(ledger.HoldUntilUtc);
+        Assert.Equal(PhaseStages.Reviewing, ledger.Stage);
+
+        // Back to the SAME reviewer. The implementer here is claude, so ADR-006
+        // fixes the reviewer at codex - the vendor that ran out. Waiting for its
+        // window is the recovery; handing the review to the vendor that wrote the
+        // code is not a recovery at all.
+        var dispatch = Assert.Single(harness.Coordinator.StartRequests);
+        Assert.Equal("codex", dispatch.RunnerOverride);
+        Assert.Contains(
+            await harness.DbContext.EventLog.ToListAsync(),
+            entry => entry.EventName == "phase_runner_quota_hold_expired");
+    }
+
+    // What "eventually escalate" has to say when it fires. The old message named a
+    // contract violation, which was wrong about who failed and about what would
+    // fix it.
+    [Fact]
+    public async Task RunTickAsync_ShouldEscalateAnExhaustedRunnerByNameRatherThanAsAContractViolation()
+    {
+        var tracker = new FakeTrackerClient([]);
+        tracker.IssuesById["issue-1"] = BuildIssue("issue-1", "#1", "Open", null, pullRequests: []);
+        tracker.PullRequestStatusByNumber[5] = new PullRequestStatus(5, "OPEN", false, "aaa111", "SUCCESS", "MERGEABLE");
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await harness.InsertReviewingLedgerAsync(
+            "issue-1",
+            "#1",
+            prNumber: 5,
+            // Held longer than any published usage window lasts: this is an account
+            // with no credit, which is the one part of it that is the owner's.
+            holdSinceUtc: DateTimeOffset.UtcNow - PhaseOrchestrator.RunnerQuotaHoldTimeout - TimeSpan.FromHours(1));
+        await harness.InsertQuotaRefusedReviewRunAsync("issue-1", "#1", runner: "codex");
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Equal(PhaseStages.Escalated, (await harness.DbContext.PhaseLedger.SingleAsync()).Stage);
+
+        var escalation = Assert.Single(
+            await harness.DbContext.EventLog
+                .Where(entry => entry.EventName == PhaseOrchestrator.EscalationEventName)
+                .ToListAsync());
+        Assert.Contains("out of quota", escalation.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("codex", escalation.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("next reset it reported is", escalation.Message, StringComparison.OrdinalIgnoreCase);
+
+        // The words that were wrong about both who failed and what would fix it.
+        Assert.DoesNotContain("contract violation", escalation.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    // One cause, one attention item. Four pull requests blocked by one empty
+    // account produced five things "waiting on you" and taught nobody anything
+    // four times over.
+    [Fact]
+    public async Task RunTickAsync_ShouldRaiseOneExhaustedRunnerOnceAcrossEveryBlockedIssue()
+    {
+        var tracker = new FakeTrackerClient([]);
+        tracker.IssuesById["issue-1"] = BuildIssue("issue-1", "#1", "Open", null, pullRequests: []);
+        tracker.IssuesById["issue-2"] = BuildIssue("issue-2", "#2", "Open", null, pullRequests: []);
+        tracker.PullRequestStatusByNumber[5] = new PullRequestStatus(5, "OPEN", false, "aaa111", "SUCCESS", "MERGEABLE");
+        tracker.PullRequestStatusByNumber[6] = new PullRequestStatus(6, "OPEN", false, "bbb222", "SUCCESS", "MERGEABLE");
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 2),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        var exhaustedSince = DateTimeOffset.UtcNow - PhaseOrchestrator.RunnerQuotaHoldTimeout - TimeSpan.FromHours(1);
+        await harness.InsertReviewingLedgerAsync("issue-1", "#1", prNumber: 5, holdSinceUtc: exhaustedSince);
+        await harness.InsertQuotaRefusedReviewRunAsync("issue-1", "#1", runner: "codex");
+        await harness.InsertReviewingLedgerAsync("issue-2", "#2", prNumber: 6, headSha: "bbb222", holdSinceUtc: exhaustedSince);
+        await harness.InsertQuotaRefusedReviewRunAsync("issue-2", "#2", runner: "codex");
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var events = await harness.DbContext.EventLog.ToListAsync();
+        Assert.Single(events.Where(entry => entry.EventName == PhaseOrchestrator.EscalationEventName));
+        Assert.Single(events.Where(entry => entry.EventName == PhaseOrchestrator.RunnerQuotaEscalatedEventName));
+
+        // The second issue is still blocked and still says so - it just does not
+        // say it to the owner a second time.
+        var ledgers = await harness.DbContext.PhaseLedger.ToListAsync();
+        Assert.Single(ledgers.Where(entry => entry.Stage == PhaseStages.Escalated));
+        var held = Assert.Single(ledgers.Where(entry => entry.Stage != PhaseStages.Escalated));
+        Assert.NotNull(held.HoldUntilUtc);
+        Assert.Equal("codex", held.HoldRunner);
+    }
+
+    // The review path was rewound to the stage that asks; the repair path was not,
+    // so its hold expired straight back into `wait_for_repair`, which waits on the
+    // latest repair run - the same dead one - and renewed the hold. The bounded
+    // repair sat out one quota window, then the next, until the six-hour bound
+    // escalated it: the exact outcome the hold exists to prevent. A hold has to end
+    // in an attempt.
+    [Fact]
+    public async Task RunTickAsync_ShouldDispatchTheRepairAgainOnceItsQuotaHoldExpires()
+    {
+        var tracker = new FakeTrackerClient([]);
+        tracker.IssuesById["issue-1"] = BuildIssue("issue-1", "#1", "Open", null,
+            pullRequests: [new PullRequestRef("pr-5", 5, "OPEN", null, "symphony/1", "main")]);
+        tracker.PullRequestStatusByNumber[5] = new PullRequestStatus(5, "OPEN", false, "aaa111", "SUCCESS", "MERGEABLE");
+        tracker.CommentsByIssueId["issue-1"] =
+        [
+            new NormalizedIssueComment(
+                "review-1",
+                PhaseOrchestrator.ReviewVerdictMarker(5, "aaa111") +
+                "\nVERDICT: CHANGES_REQUIRED\n- the repair path was left behind",
+                "reviewer",
+                "OWNER",
+                DateTimeOffset.UtcNow)
+        ];
+
+        var clock = new MutableTimeProvider(DateTimeOffset.UtcNow);
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success),
+            timeProvider: clock);
+
+        await harness.InsertWorkspaceRecordAsync("issue-1", "#1", "symphony/1");
+        await harness.InsertWaitForRepairLedgerAsync("issue-1", "#1", prNumber: 5);
+        await harness.InsertQuotaRefusedReviewRunAsync(
+            "issue-1", "#1", runner: "claude",
+            status: RunStatusNames.Failed, phase: RunPhaseNames.Implementation);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        // Held at the stage that ASKS for the repair, not at the one that waits on
+        // the run that already refused.
+        var ledger = await harness.DbContext.PhaseLedger.SingleAsync();
+        Assert.Equal(PhaseStages.AwaitingRepair, ledger.Stage);
+        Assert.NotNull(ledger.HoldUntilUtc);
+        Assert.Equal("claude", ledger.HoldRunner);
+        Assert.Empty(harness.Coordinator.StartRequests);
+        var heldSince = ledger.HoldSinceUtc;
+        Assert.NotNull(heldSince);
+
+        clock.Advance(ledger.HoldUntilUtc!.Value - clock.GetUtcNow() + TimeSpan.FromMinutes(1));
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        // The repair actually runs: the point of waiting for the reset is asking
+        // again afterwards.
+        var dispatch = Assert.Single(harness.Coordinator.StartRequests);
+        Assert.Equal("claude", dispatch.RunnerOverride);
+        Assert.Contains("the repair path was left behind", dispatch.PromptOverride);
+
+        ledger = await harness.DbContext.PhaseLedger.SingleAsync();
+        Assert.Equal(PhaseStages.WaitForRepair, ledger.Stage);
+        Assert.Equal(1, ledger.RepairCount); // still the ONE bounded repair
+        Assert.Null(ledger.HoldUntilUtc);
+
+        // The hold's clock survives the re-dispatch: a repair that refuses again on
+        // the same empty account has to reach the six-hour bound, not restart it.
+        Assert.Equal(heldSince, ledger.HoldSinceUtc);
+    }
+
+    // A hold can span a night, and someone can push during one. Asking again for
+    // work that has landed spends an agent on nothing and puts a second repair
+    // against a head no reviewer has rejected.
+    [Fact]
+    public async Task RunTickAsync_ShouldNotRedispatchARepairWhoseHeadHasAlreadyMoved()
+    {
+        var tracker = new FakeTrackerClient([]);
+        tracker.IssuesById["issue-1"] = BuildIssue("issue-1", "#1", "Open", null,
+            pullRequests: [new PullRequestRef("pr-5", 5, "OPEN", null, "symphony/1", "main")]);
+        tracker.PullRequestStatusByNumber[5] = new PullRequestStatus(5, "OPEN", false, "bbb222", "SUCCESS", "MERGEABLE");
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success));
+
+        await harness.InsertWorkspaceRecordAsync("issue-1", "#1", "symphony/1");
+        await harness.InsertWaitForRepairLedgerAsync(
+            "issue-1", "#1", prNumber: 5, stage: PhaseStages.AwaitingRepair);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Empty(harness.Coordinator.StartRequests);
+        Assert.Equal(PhaseStages.AwaitingVerify, (await harness.DbContext.PhaseLedger.SingleAsync()).Stage);
+    }
+
+    // The head moving while a repair is still only being ASKED for is the one case
+    // where the held runner provably did not run. Recording it as recovery would
+    // close a cause that is still open - and because the newest row for a runner
+    // wins, the next reset window would raise the same empty account a second time,
+    // which is the duplicate the whole scheme exists to prevent.
+    [Fact]
+    public async Task RunTickAsync_ShouldNotCallAHeldRunnerRecoveredWhenSomeoneElseMovedTheHead()
+    {
+        var tracker = new FakeTrackerClient([]);
+        tracker.IssuesById["issue-1"] = BuildIssue("issue-1", "#1", "Open", null, pullRequests: []);
+        tracker.IssuesById["issue-2"] = BuildIssue("issue-2", "#2", "Open", null,
+            pullRequests: [new PullRequestRef("pr-6", 6, "OPEN", null, "symphony/2", "main")]);
+        tracker.IssuesById["issue-3"] = BuildIssue("issue-3", "#3", "Open", null, pullRequests: []);
+        tracker.PullRequestStatusByNumber[5] = new PullRequestStatus(5, "OPEN", false, "aaa111", "SUCCESS", "MERGEABLE");
+        tracker.PullRequestStatusByNumber[6] = new PullRequestStatus(6, "OPEN", false, "bbb222", "SUCCESS", "MERGEABLE");
+        tracker.PullRequestStatusByNumber[7] = new PullRequestStatus(7, "OPEN", false, "aaa111", "SUCCESS", "MERGEABLE");
+
+        var clock = new MutableTimeProvider(DateTimeOffset.UtcNow);
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 3),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning),
+            timeProvider: clock);
+
+        // 'claude' is out of quota and has been raised with the command center.
+        await harness.InsertReviewingLedgerAsync(
+            "issue-1", "#1", prNumber: 5,
+            holdSinceUtc: clock.GetUtcNow() - PhaseOrchestrator.RunnerQuotaHoldTimeout - TimeSpan.FromHours(1));
+        await harness.InsertQuotaRefusedReviewRunAsync("issue-1", "#1", runner: "claude", status: RunStatusNames.Failed);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        Assert.Single(
+            await harness.DbContext.EventLog
+                .Where(entry => entry.EventName == PhaseOrchestrator.RunnerQuotaEscalatedEventName)
+                .ToListAsync());
+
+        // A repair held on that same empty account, and a head that moved from
+        // outside the plane before the repair was ever re-dispatched.
+        await harness.InsertWorkspaceRecordAsync("issue-2", "#2", "symphony/2");
+        await harness.InsertWaitForRepairLedgerAsync(
+            "issue-2", "#2", prNumber: 6, stage: PhaseStages.AwaitingRepair,
+            holdUntilUtc: clock.GetUtcNow() - TimeSpan.FromMinutes(1),
+            holdSinceUtc: clock.GetUtcNow() - TimeSpan.FromMinutes(30),
+            holdRunner: "claude");
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        // The ledger stops waiting - there is nothing left to wait for - but
+        // nothing claims the runner worked.
+        var moved = await harness.DbContext.PhaseLedger.SingleAsync(entry => entry.IssueId == "issue-2");
+        Assert.Equal(PhaseStages.AwaitingVerify, moved.Stage);
+        Assert.Null(moved.HoldUntilUtc);
+        Assert.Null(moved.HoldRunner);
+        Assert.Empty(
+            await harness.DbContext.EventLog
+                .Where(entry => entry.EventName == PhaseOrchestrator.RunnerQuotaRecoveredEventName)
+                .ToListAsync());
+
+        // So a later window finds the cause still open and does not raise it twice.
+        clock.Advance(TimeSpan.FromDays(1));
+        await harness.InsertReviewingLedgerAsync(
+            "issue-3", "#3", prNumber: 7,
+            holdSinceUtc: clock.GetUtcNow() - PhaseOrchestrator.RunnerQuotaHoldTimeout - TimeSpan.FromHours(1),
+            updatedAtUtc: clock.GetUtcNow());
+        await harness.InsertQuotaRefusedReviewRunAsync("issue-3", "#3", runner: "claude", status: RunStatusNames.Failed);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Single(
+            await harness.DbContext.EventLog
+                .Where(entry => entry.EventName == PhaseOrchestrator.RunnerQuotaEscalatedEventName)
+                .ToListAsync());
+    }
+
+    // The findings are the repair's whole brief. Re-dispatching without them would
+    // be an unbounded "fix it", which is worse than saying the brief is gone.
+    [Fact]
+    public async Task RunTickAsync_ShouldEscalateWhenTheRepairFindingsAreNoLongerOnTheIssue()
+    {
+        var tracker = new FakeTrackerClient([]);
+        tracker.IssuesById["issue-1"] = BuildIssue("issue-1", "#1", "Open", null,
+            pullRequests: [new PullRequestRef("pr-5", 5, "OPEN", null, "symphony/1", "main")]);
+        tracker.PullRequestStatusByNumber[5] = new PullRequestStatus(5, "OPEN", false, "aaa111", "SUCCESS", "MERGEABLE");
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success));
+
+        await harness.InsertWorkspaceRecordAsync("issue-1", "#1", "symphony/1");
+        await harness.InsertWaitForRepairLedgerAsync(
+            "issue-1", "#1", prNumber: 5, stage: PhaseStages.AwaitingRepair);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Empty(harness.Coordinator.StartRequests);
+        Assert.Equal(PhaseStages.Escalated, (await harness.DbContext.PhaseLedger.SingleAsync()).Stage);
+    }
+
+    // The 2026-09-04 outage spanned two reset windows. Suppression keyed on the
+    // reset the refusal named expires with it, so the second window would have
+    // raised the same empty account a second time - one cause, two attention
+    // items, on different days. The condition is "still exhausted", not "before
+    // the reset we last guessed at".
+    [Fact]
+    public async Task RunTickAsync_ShouldRaiseAnExhaustedRunnerOnceAcrossTwoResetWindows()
+    {
+        var tracker = new FakeTrackerClient([]);
+        tracker.IssuesById["issue-1"] = BuildIssue("issue-1", "#1", "Open", null, pullRequests: []);
+        tracker.IssuesById["issue-2"] = BuildIssue("issue-2", "#2", "Open", null, pullRequests: []);
+        tracker.PullRequestStatusByNumber[5] = new PullRequestStatus(5, "OPEN", false, "aaa111", "SUCCESS", "MERGEABLE");
+        tracker.PullRequestStatusByNumber[6] = new PullRequestStatus(6, "OPEN", false, "bbb222", "SUCCESS", "MERGEABLE");
+
+        var clock = new MutableTimeProvider(DateTimeOffset.UtcNow);
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 2),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning),
+            timeProvider: clock);
+
+        await harness.InsertReviewingLedgerAsync(
+            "issue-1", "#1", prNumber: 5,
+            holdSinceUtc: clock.GetUtcNow() - PhaseOrchestrator.RunnerQuotaHoldTimeout - TimeSpan.FromHours(1));
+        await harness.InsertQuotaRefusedReviewRunAsync("issue-1", "#1", runner: "codex", status: RunStatusNames.Failed);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        Assert.Single(
+            await harness.DbContext.EventLog
+                .Where(entry => entry.EventName == PhaseOrchestrator.EscalationEventName)
+                .ToListAsync());
+
+        // A full day later: every reset the first refusal could have named is long
+        // past, and the account is still empty.
+        clock.Advance(TimeSpan.FromDays(1));
+
+        await harness.InsertReviewingLedgerAsync(
+            "issue-2", "#2", prNumber: 6, headSha: "bbb222",
+            holdSinceUtc: clock.GetUtcNow() - PhaseOrchestrator.RunnerQuotaHoldTimeout - TimeSpan.FromHours(1),
+            updatedAtUtc: clock.GetUtcNow());
+        await harness.InsertQuotaRefusedReviewRunAsync("issue-2", "#2", runner: "codex", status: RunStatusNames.Failed);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var events = await harness.DbContext.EventLog.ToListAsync();
+        Assert.Single(events.Where(entry => entry.EventName == PhaseOrchestrator.EscalationEventName));
+        Assert.Single(events.Where(entry => entry.EventName == PhaseOrchestrator.RunnerQuotaEscalatedEventName));
+
+        // Still blocked, still recorded, still not said twice.
+        var second = await harness.DbContext.PhaseLedger.SingleAsync(entry => entry.IssueId == "issue-2");
+        Assert.NotEqual(PhaseStages.Escalated, second.Stage);
+        Assert.Equal("codex", second.HoldRunner);
+    }
+
+    // Suppression that never lifts is just a mute. The cause closes when the runner
+    // is seen producing work again - the only honest evidence there is - and the
+    // next outage after that is a new one and says so.
+    [Fact]
+    public async Task RunTickAsync_ShouldRaiseAnExhaustedRunnerAgainAfterItHasBeenSeenWorking()
+    {
+        var tracker = new FakeTrackerClient([]);
+        tracker.IssuesById["issue-1"] = BuildIssue("issue-1", "#1", "Open", null, pullRequests: []);
+        tracker.IssuesById["issue-2"] = BuildIssue("issue-2", "#2", "Open", null, pullRequests: []);
+        tracker.IssuesById["issue-3"] = BuildIssue("issue-3", "#3", "Open", null, pullRequests: []);
+        tracker.PullRequestStatusByNumber[5] = new PullRequestStatus(5, "OPEN", false, "aaa111", "SUCCESS", "MERGEABLE");
+        tracker.PullRequestStatusByNumber[6] = new PullRequestStatus(6, "OPEN", false, "aaa111", "SUCCESS", "MERGEABLE");
+        tracker.PullRequestStatusByNumber[7] = new PullRequestStatus(7, "OPEN", false, "aaa111", "SUCCESS", "MERGEABLE");
+
+        var clock = new MutableTimeProvider(DateTimeOffset.UtcNow);
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 2),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning),
+            timeProvider: clock);
+
+        await harness.InsertReviewingLedgerAsync(
+            "issue-1", "#1", prNumber: 5,
+            holdSinceUtc: clock.GetUtcNow() - PhaseOrchestrator.RunnerQuotaHoldTimeout - TimeSpan.FromHours(1));
+        await harness.InsertQuotaRefusedReviewRunAsync("issue-1", "#1", runner: "codex", status: RunStatusNames.Failed);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        Assert.Single(
+            await harness.DbContext.EventLog
+                .Where(entry => entry.EventName == PhaseOrchestrator.RunnerQuotaEscalatedEventName)
+                .ToListAsync());
+
+        // The account comes back: a review held on codex posts its verdict.
+        tracker.CommentsByIssueId["issue-2"] =
+        [
+            new NormalizedIssueComment(
+                "review-2",
+                PhaseOrchestrator.ReviewVerdictMarker(6, "aaa111") + "\nVERDICT: APPROVED",
+                "reviewer",
+                "OWNER",
+                clock.GetUtcNow())
+        ];
+        await harness.InsertReviewingLedgerAsync(
+            "issue-2", "#2", prNumber: 6,
+            holdUntilUtc: clock.GetUtcNow() - TimeSpan.FromMinutes(1),
+            holdSinceUtc: clock.GetUtcNow() - TimeSpan.FromMinutes(30),
+            updatedAtUtc: clock.GetUtcNow());
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        Assert.Single(
+            await harness.DbContext.EventLog
+                .Where(entry => entry.EventName == PhaseOrchestrator.RunnerQuotaRecoveredEventName)
+                .ToListAsync());
+
+        // Later still, it runs out again. That is a new cause and a new attention
+        // item, not the old one repeating.
+        clock.Advance(TimeSpan.FromDays(1));
+        await harness.InsertReviewingLedgerAsync(
+            "issue-3", "#3", prNumber: 7,
+            holdSinceUtc: clock.GetUtcNow() - PhaseOrchestrator.RunnerQuotaHoldTimeout - TimeSpan.FromHours(1),
+            updatedAtUtc: clock.GetUtcNow());
+        await harness.InsertQuotaRefusedReviewRunAsync("issue-3", "#3", runner: "codex", status: RunStatusNames.Failed);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Equal(
+            2,
+            (await harness.DbContext.EventLog
+                .Where(entry => entry.EventName == PhaseOrchestrator.RunnerQuotaEscalatedEventName)
+                .ToListAsync()).Count);
+    }
+
     [Fact]
     public async Task RunTickAsync_ShouldRedispatchReviewWhenItsRunDisappeared()
     {
@@ -4101,10 +4609,14 @@ public sealed class OrchestrationTickServiceTests
                     tracker,
                     clock,
                     NullLogger<DirectiveProcessor>.Instance),
+                // The test clock too. Quota holds, the six-hour bound and the
+                // stuck-stage backstop are all elapsed time on this component, and a
+                // harness that hands it the wall clock while every other service
+                // runs on a controllable one cannot express "a day later" at all.
                 new PhaseOrchestrator(
                     dbContext,
                     tracker,
-                    TimeProvider.System,
+                    clock,
                     NullLogger<PhaseOrchestrator>.Instance),
                 new EventLogRetentionService(
                     dbContext,
@@ -4262,6 +4774,105 @@ public sealed class OrchestrationTickServiceTests
                 SessionId = sessionId,
                 StartedAtUtc = DateTimeOffset.UtcNow.AddMinutes(-10),
                 CompletedAtUtc = completedAtUtc
+            });
+
+            await DbContext.SaveChangesAsync();
+        }
+
+        /// <summary>A ledger sitting at the reviewing stage, optionally already held.</summary>
+        public async Task InsertReviewingLedgerAsync(
+            string issueId,
+            string identifier,
+            int prNumber,
+            string headSha = "aaa111",
+            string stage = PhaseStages.Reviewing,
+            string implementerRunner = "claude",
+            DateTimeOffset? holdUntilUtc = null,
+            DateTimeOffset? holdSinceUtc = null,
+            DateTimeOffset? updatedAtUtc = null)
+        {
+            DbContext.PhaseLedger.Add(new PhaseLedgerEntity
+            {
+                IssueId = issueId,
+                IssueIdentifier = identifier,
+                Stage = stage,
+                PrNumber = prNumber,
+                HeadSha = headSha,
+                ImplementerRunner = implementerRunner,
+                HoldUntilUtc = holdUntilUtc,
+                HoldSinceUtc = holdSinceUtc,
+                HoldReason = holdSinceUtc is null ? null : PhaseOrchestrator.RunnerQuotaHoldReason,
+                HoldRunner = holdSinceUtc is null ? null : "codex",
+                CreatedAtUtc = DateTimeOffset.UtcNow.AddHours(-1),
+                UpdatedAtUtc = updatedAtUtc ?? DateTimeOffset.UtcNow
+            });
+
+            await DbContext.SaveChangesAsync();
+        }
+
+        /// <summary>
+        /// A ledger waiting on the single bounded repair it has already ordered.
+        /// </summary>
+        public async Task InsertWaitForRepairLedgerAsync(
+            string issueId,
+            string identifier,
+            int prNumber,
+            string headSha = "aaa111",
+            string stage = PhaseStages.WaitForRepair,
+            string implementerRunner = "claude",
+            DateTimeOffset? holdUntilUtc = null,
+            DateTimeOffset? holdSinceUtc = null,
+            string? holdRunner = null)
+        {
+            DbContext.PhaseLedger.Add(new PhaseLedgerEntity
+            {
+                IssueId = issueId,
+                IssueIdentifier = identifier,
+                Stage = stage,
+                PrNumber = prNumber,
+                HeadSha = headSha,
+                ImplementerRunner = implementerRunner,
+                HoldUntilUtc = holdUntilUtc,
+                HoldSinceUtc = holdSinceUtc,
+                HoldReason = holdRunner is null ? null : PhaseOrchestrator.RunnerQuotaHoldReason,
+                HoldRunner = holdRunner,
+                RepairCount = 1,
+                RejectedHeadSha = headSha,
+                LastVerdict = ReviewVerdicts.ChangesRequired,
+                LastVerdictHeadSha = headSha,
+                CreatedAtUtc = DateTimeOffset.UtcNow.AddHours(-1),
+                UpdatedAtUtc = DateTimeOffset.UtcNow
+            });
+
+            await DbContext.SaveChangesAsync();
+        }
+
+        /// <summary>
+        /// A review run that ended the way an out-of-quota vendor ends one: no
+        /// verdict, no tokens, and the refusal recorded as its last message.
+        /// </summary>
+        public async Task InsertQuotaRefusedReviewRunAsync(
+            string issueId,
+            string identifier,
+            string runner,
+            string status = RunStatusNames.Retrying,
+            string phase = RunPhaseNames.Review)
+        {
+            DbContext.Runs.Add(new RunEntity
+            {
+                Id = Guid.NewGuid().ToString("N"),
+                IssueId = issueId,
+                IssueIdentifier = identifier,
+                OwnerInstanceId = "instance-1",
+                Status = status,
+                State = "Open",
+                Phase = phase,
+                Runner = runner,
+                LastEvent = status,
+                LastMessage = "runner_quota_exhausted: The Codex runner is out of quota: "
+                              + "You've hit your usage limit. Upgrade to Pro or try again at 7:24 PM.",
+                StartedAtUtc = DateTimeOffset.UtcNow.AddMinutes(-10),
+                LastEventAtUtc = DateTimeOffset.UtcNow.AddMinutes(-9)
             });
 
             await DbContext.SaveChangesAsync();

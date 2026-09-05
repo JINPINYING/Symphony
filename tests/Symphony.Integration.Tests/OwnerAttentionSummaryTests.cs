@@ -725,6 +725,7 @@ public sealed class OwnerAttentionSummaryTests
     [InlineData(PhaseStages.AwaitingVerify)]
     [InlineData(PhaseStages.AwaitingReview)]
     [InlineData(PhaseStages.Reviewing)]
+    [InlineData(PhaseStages.AwaitingRepair)]
     [InlineData(PhaseStages.WaitForRepair)]
     public void APullRequestThePipelineIsDrivingIsNotWaitingOnYou(string stage)
     {

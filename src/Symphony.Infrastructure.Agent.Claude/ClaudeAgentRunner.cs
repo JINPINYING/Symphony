@@ -161,8 +161,18 @@ public sealed class ClaudeAgentRunner(ILogger<ClaudeAgentRunner> logger) : IAgen
 
         stopwatch.Stop();
 
+        // ADCP#29. The exit code and the result subtype are what the CLI says about
+        // itself; this is what the run actually did. A vendor that refuses to start
+        // can still report a clean success, and a success that consumed no tokens
+        // and produced no text is not one - the same floor the Codex runner
+        // asserts, for the same reason and in the same words.
+        var activity = new AgentRunActivity();
+        activity.RecordTokens(finalInputTokens, finalOutputTokens, null);
+        activity.RecordAssistantOutput(resultText);
+
         var success = process.ExitCode == 0 && !resultIsError &&
-                      (resultSubtype is null || string.Equals(resultSubtype, "success", StringComparison.OrdinalIgnoreCase));
+                      (resultSubtype is null || string.Equals(resultSubtype, "success", StringComparison.OrdinalIgnoreCase)) &&
+                      !activity.ProducedNothing;
 
         if (success)
         {
@@ -187,20 +197,34 @@ public sealed class ClaudeAgentRunner(ILogger<ClaudeAgentRunner> logger) : IAgen
                 Duration: stopwatch.Elapsed);
         }
 
-        var errorCode = resultSubtype is not null && !string.Equals(resultSubtype, "success", StringComparison.OrdinalIgnoreCase)
-            ? $"claude_{resultSubtype}"
-            : resultIsError
-                ? "claude_result_error"
-                : "subprocess_exit";
+        var failedTheFloorOnly = process.ExitCode == 0 && !resultIsError &&
+                                 (resultSubtype is null || string.Equals(resultSubtype, "success", StringComparison.OrdinalIgnoreCase));
+        var errorCode = failedTheFloorOnly
+            ? AgentRunActivity.FloorErrorCode
+            : AgentQuotaSignals.IsQuotaExhaustion(resultText) || AgentQuotaSignals.IsQuotaExhaustion(stderr.ToString())
+                ? AgentRunActivity.QuotaErrorCode
+                : resultSubtype is not null && !string.Equals(resultSubtype, "success", StringComparison.OrdinalIgnoreCase)
+                    ? $"claude_{resultSubtype}"
+                    : resultIsError
+                        ? "claude_result_error"
+                        : "subprocess_exit";
         logger.LogWarning(
-            "claude run for {IssueIdentifier} failed: exit={ExitCode} subtype={Subtype} isError={IsError}",
-            request.IssueIdentifier, process.ExitCode, resultSubtype, resultIsError);
+            "claude run for {IssueIdentifier} failed: exit={ExitCode} subtype={Subtype} isError={IsError} code={ErrorCode}",
+            request.IssueIdentifier, process.ExitCode, resultSubtype, resultIsError, errorCode);
+
+        var failureStderr = string.IsNullOrWhiteSpace(stderr.ToString())
+            ? Truncate(resultText, 2_000) ?? "claude run failed."
+            : stderr.ToString();
+        if (failedTheFloorOnly)
+        {
+            failureStderr = $"{failureStderr}{Environment.NewLine}{activity.FloorMessage(process.ExitCode)}".Trim();
+        }
 
         return new AgentRunResult(
             Success: false,
             ExitCode: process.ExitCode,
             Stdout: stdout.ToString(),
-            Stderr: string.IsNullOrWhiteSpace(stderr.ToString()) ? Truncate(resultText, 2_000) ?? "claude run failed." : stderr.ToString(),
+            Stderr: failureStderr,
             Duration: stopwatch.Elapsed,
             ErrorCode: errorCode);
     }

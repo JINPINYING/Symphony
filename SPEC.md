@@ -1167,6 +1167,23 @@ Error mapping (recommended normalized categories):
 - `turn_failed`
 - `turn_cancelled`
 - `turn_input_required`
+- `runner_quota_exhausted` — the vendor account is out of quota or rate limited.
+  Distinct from an ordinary failure because it clears on a clock rather than on
+  effort: the orchestrator holds the affected phase until the reset the refusal
+  named and retries, instead of escalating a decision nobody can make. A hold ends
+  in an attempt: it parks the phase at a stage that dispatches, never at one that
+  waits on the run that already refused, or the reset would only ever be followed
+  by another hold.
+- `no_agent_activity` — the session ended without consuming a token or producing
+  any assistant output. A run that produced nothing did not run, whatever exit
+  code the process returned, and is never recorded as a success.
+
+Success floor:
+
+- A run is recorded successful only if it consumed tokens or produced assistant
+  output. Exit code alone is not sufficient: an app-server can return cleanly
+  while carrying a refusal, and a refusal recorded as a success is worse than a
+  failure because everything downstream then blames the agent for the silence.
 
 ### 10.7 Agent Runner Contract
 
@@ -1625,6 +1642,12 @@ API design notes:
    - User input requested (hard fail)
    - Subprocess exit
    - Stalled session (no activity)
+   - Runner quota exhausted (transient: every phase that can be refused for it
+     holds at a stage that can re-ask, and re-dispatches at the reset. Raised with
+     the command center at most once per runner for as long as that runner stays
+     exhausted, across however many reset windows the outage spans; the cause
+     closes when the runner is next observed producing work)
+   - Session produced no tokens and no assistant output
 
 4. `Tracker Failures`
    - API transport errors
@@ -2102,6 +2125,11 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - User input requests are handled according to the implementation's documented policy and do not
   stall indefinitely
 - Usage and rate-limit payloads are extracted from nested payload shapes
+- A turn carrying a usage-limit or rate-limit error fails as `runner_quota_exhausted`,
+  never as a success, and the refusal text is preserved in the run record so the
+  orchestrator can hold rather than escalate
+- A session that ends having consumed no tokens and produced no assistant output
+  fails as `no_agent_activity`, whatever exit code the process returned
 - Compatible payload variants for approvals, user-input-required signals, and usage/rate-limit
   telemetry are accepted when they preserve the same logical meaning
 - If optional client-side tools are implemented, the startup handshake advertises the supported tool

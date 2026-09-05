@@ -17,8 +17,9 @@ public sealed class PhaseLedgerEntity
     // PR #122, and two repositories can each have one.
     public string Repository { get; set; } = string.Empty;
 
-    // awaiting_verify | awaiting_review | reviewing | wait_for_repair |
-    // awaiting_final_review | final_reviewing | ready | escalated
+    // awaiting_verify | awaiting_review | reviewing | awaiting_repair |
+    // wait_for_repair | awaiting_final_review | final_reviewing | ready |
+    // escalated
     public string Stage { get; set; } = string.Empty;
 
     public int PrNumber { get; set; }
@@ -31,6 +32,26 @@ public sealed class PhaseLedgerEntity
     public string? RejectedHeadSha { get; set; }
     public string? LastVerdict { get; set; }
     public string? LastVerdictHeadSha { get; set; }
+
+    // A transient runner refusal the phase is waiting out rather than escalating
+    // (ADCP#29). A vendor that is out of quota has not violated anything and there
+    // is no directive that buys it credits, so the phase holds where it is until
+    // the reset the refusal named and then asks again.
+    //
+    // Durable on the ledger rather than in memory, for the same reason the
+    // candidate-scan pause is durable: restarting is exactly what a person does
+    // when the board says something needs them, and a restart must not cancel a
+    // wait whose clock belongs to the vendor's account rather than to this process.
+    public DateTimeOffset? HoldUntilUtc { get; set; }
+
+    // When the CURRENT run of holds began - not when the latest one was renewed.
+    // A quota window that keeps being renewed for longer than a window can
+    // plausibly last is an account problem, and that is the only thing here that
+    // is genuinely the owner's.
+    public DateTimeOffset? HoldSinceUtc { get; set; }
+    public string? HoldReason { get; set; }
+    public string? HoldRunner { get; set; }
+
     public DateTimeOffset CreatedAtUtc { get; set; }
     public DateTimeOffset UpdatedAtUtc { get; set; }
 }
