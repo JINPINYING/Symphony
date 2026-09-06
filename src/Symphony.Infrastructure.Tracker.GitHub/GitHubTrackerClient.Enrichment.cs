@@ -244,7 +244,7 @@ public sealed partial class GitHubTrackerClient
                 includePullRequests = query.IncludePullRequests
             });
 
-        using var response = await SendAsync(request, cancellationToken);
+        using var response = await SendAsync(request, GitHubGraphQlCallSites.Enrichment, cancellationToken);
         using var document = await ParseGraphQlDocumentAsync(response, cancellationToken);
 
         var dataElement = GetRequiredObject(document.RootElement, "data");

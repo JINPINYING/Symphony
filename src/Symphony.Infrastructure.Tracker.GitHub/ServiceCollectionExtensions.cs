@@ -16,9 +16,14 @@ public static class ServiceCollectionExtensions
             // observer is visibly wired rather than resolved by convention. A host
             // that registers none gets null and the adapter simply records nothing.
             .AddTypedClient((httpClient, provider) =>
-                new GitHubTrackerClient(httpClient, provider.GetService<IGitHubRateLimitObserver>()));
+                new GitHubTrackerClient(
+                    httpClient,
+                    provider.GetService<IGitHubRateLimitObserver>(),
+                    provider.GetService<IGitHubApiCallObserver>(),
+                    provider.GetService<GitHubConditionalRequestCache>()));
         services.AddScoped<ITrackerClient>(provider => provider.GetRequiredService<GitHubTrackerClient>());
         services.AddScoped<IGitHubTrackerClient>(provider => provider.GetRequiredService<GitHubTrackerClient>());
+        services.AddSingleton<GitHubConditionalRequestCache>();
 
         return services;
     }

@@ -22,14 +22,14 @@ public sealed class GitHubTrackerGraphQlCostTests
         var cost = GitHubTrackerGraphQlCost.Model(GitHubTrackerGraphQlCost.PessimisticSteadyState);
 
         Assert.True(
-            cost.PointsPerHour < TrackerReadCadence.ModelledHourlyCeiling,
+            cost.PointsPerHour < TrackerReadCadence.ModelledGraphQlHourlyCeiling,
             $"Modelled GraphQL cost is {cost.PointsPerHour:0} points/hour against a ceiling of " +
-            $"{TrackerReadCadence.ModelledHourlyCeiling} and a budget of {GraphQlCost.HourlyBudget}.\n" +
+            $"{TrackerReadCadence.ModelledGraphQlHourlyCeiling} and a budget of {GraphQlCost.HourlyBudget}.\n" +
             cost.Describe());
 
         // The ceiling is not the budget. A plane that plans to spend the whole
         // allowance has none left for the bursts it cannot model.
-        Assert.True(TrackerReadCadence.ModelledHourlyCeiling < GraphQlCost.HourlyBudget);
+        Assert.True(TrackerReadCadence.ModelledGraphQlHourlyCeiling < GraphQlCost.HourlyBudget);
     }
 
     [Fact]
@@ -52,6 +52,35 @@ public sealed class GitHubTrackerGraphQlCostTests
         Assert.Equal(TimeSpan.FromSeconds(60), TrackerReadCadence.CandidateScan);
         Assert.Equal(60d, TrackerReadCadence.CallsPerHour(TrackerReadCadence.CandidateScan));
         Assert.Equal(30d, TrackerReadCadence.CallsPerHour(TrackerReadCadence.OpenPullRequestPoll));
+        Assert.Equal(30d, TrackerReadCadence.CallsPerHour(TrackerReadCadence.PhaseLedgerPoll));
+        Assert.Equal(60d, TrackerReadCadence.CallsPerHour(TrackerReadCadence.EscalatedIssueDirectivePoll));
+        Assert.Equal(12d, TrackerReadCadence.CallsPerHour(TrackerReadCadence.ParkedRunSweep));
+    }
+
+    [Fact]
+    public void ModelledRestSteadyStateStaysUnderTheCoreCeiling()
+    {
+        var cost = GitHubTrackerRestCost.Model(GitHubTrackerRestCost.PessimisticSteadyState);
+
+        Assert.True(
+            cost.PointsPerHour < TrackerReadCadence.ModelledCoreHourlyCeiling,
+            $"Modelled REST core cost is {cost.PointsPerHour:0} points/hour against a ceiling of " +
+            $"{TrackerReadCadence.ModelledCoreHourlyCeiling} and a budget of {RestCost.HourlyBudget}.\n" +
+            cost.Describe());
+
+        Assert.True(TrackerReadCadence.ModelledCoreHourlyCeiling < RestCost.HourlyBudget);
+    }
+
+    [Fact]
+    public void RestCostModelNamesOnlyRuntimeCallSites()
+    {
+        var modelled = GitHubTrackerRestCost.Model(GitHubTrackerRestCost.PessimisticSteadyState)
+            .Reads
+            .Select(read => read.CallSite)
+            .ToHashSet(StringComparer.Ordinal);
+
+        Assert.Subset(GitHubRestCallSites.All.ToHashSet(StringComparer.Ordinal), modelled);
+        Assert.All(modelled, callSite => Assert.Contains(callSite, GitHubRestCallSites.All));
     }
 
     /// <summary>

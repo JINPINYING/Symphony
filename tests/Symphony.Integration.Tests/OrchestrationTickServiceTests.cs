@@ -317,6 +317,52 @@ public sealed class OrchestrationTickServiceTests
         Assert.Equal("consumed_dispatched", ledger.Outcome);
     }
 
+    [Fact]
+    public async Task RunTickAsync_ShouldThrottleEscalatedIssueDirectivePollsAcrossFreshTickServiceInstances()
+    {
+        var clock = new MutableTimeProvider(new DateTimeOffset(2026, 9, 6, 12, 0, 0, TimeSpan.Zero));
+        var cadence = new GitHubTrackerPollCadence();
+        var tracker = new FakeTrackerClient([]);
+        tracker.CommentsByIssueId["issue-1"] =
+        [
+            new NormalizedIssueComment("comment-1", "ordinary comment", "owner-login", "OWNER", clock.GetUtcNow())
+        ];
+
+        await using var first = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning),
+            timeProvider: clock,
+            gitHubPollCadence: cadence);
+        await first.InsertRunAsync("issue-1", "#1", "Open", "instance-1", RunStatusNames.NeedsCommandCenter);
+
+        await first.Service.RunTickAsync(CancellationToken.None);
+        Assert.Single(tracker.IssueCommentFetchRepositories);
+
+        await using var second = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning),
+            timeProvider: clock,
+            reuseDbPath: first.DbPath,
+            gitHubPollCadence: cadence);
+
+        await second.Service.RunTickAsync(CancellationToken.None);
+        Assert.Single(tracker.IssueCommentFetchRepositories);
+
+        clock.Advance(TrackerReadCadence.EscalatedIssueDirectivePoll);
+        await using var third = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning),
+            timeProvider: clock,
+            reuseDbPath: first.DbPath,
+            gitHubPollCadence: cadence);
+
+        await third.Service.RunTickAsync(CancellationToken.None);
+        Assert.Equal(2, tracker.IssueCommentFetchRepositories.Count);
+    }
+
     // Symphony#82. Every directive was read against the PRIMARY repository, whatever
     // repository the escalated issue lived in. A node id is global and an issue
     // number is unique only within a repository, so the wrong repository answers
@@ -409,6 +455,7 @@ public sealed class OrchestrationTickServiceTests
     [Fact]
     public async Task RunTickAsync_ShouldRetryADirectiveWhoseIssueCannotBeReadRatherThanDiscardIt()
     {
+        var clock = new MutableTimeProvider(DateTimeOffset.Parse("2026-09-01T10:00:00Z"));
         var tracker = new FakeTrackerClient([]);
         tracker.CommentsByIssueId["issue-1"] =
         [
@@ -423,7 +470,8 @@ public sealed class OrchestrationTickServiceTests
         await using var harness = await TestHarness.CreateAsync(
             BuildWorkflowDefinition(maxConcurrentAgents: 1),
             tracker,
-            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success));
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.Success),
+            timeProvider: clock);
 
         await harness.InsertRunAsync("issue-1", "#1", "Open", "instance-1", RunStatusNames.NeedsCommandCenter);
 
@@ -448,6 +496,7 @@ public sealed class OrchestrationTickServiceTests
 
         // And once the read works, the same directive comment dispatches.
         tracker.IssuesById["issue-1"] = BuildIssue("issue-1", "#1", "Open", null);
+        clock.Advance(TrackerReadCadence.EscalatedIssueDirectivePoll);
         await harness.Service.RunTickAsync(CancellationToken.None);
 
         Assert.Single(harness.Coordinator.StartRequests);
@@ -812,7 +861,7 @@ public sealed class OrchestrationTickServiceTests
         for (var tick = 0; tick < 5; tick++)
         {
             await harness.Service.RunTickAsync(CancellationToken.None);
-            clock.Advance(TimeSpan.FromSeconds(30));
+            clock.Advance(TrackerReadCadence.EscalatedIssueDirectivePoll);
         }
 
         Assert.Empty(await harness.DbContext.DirectiveLog.ToListAsync());
@@ -1579,6 +1628,53 @@ public sealed class OrchestrationTickServiceTests
         Assert.Equal(RunStatusNames.NeedsCommandCenter, run.Status);
     }
 
+    [Fact]
+    public async Task RunTickAsync_ShouldThrottleParkedRunSweepsAcrossFreshTickServiceInstances()
+    {
+        var clock = new MutableTimeProvider(new DateTimeOffset(2026, 9, 6, 12, 0, 0, TimeSpan.Zero));
+        var cadence = new GitHubTrackerPollCadence();
+        var tracker = new FakeTrackerClient([], new Dictionary<string, string> { ["issue-45"] = "Open" });
+        tracker.OpenPullRequests =
+        [
+            new OpenPullRequest(146, "the work", "https://example.invalid/pull/146", "codex", false,
+                "SUCCESS", "MERGEABLE", DateTimeOffset.UtcNow, "", "symphony/45")
+        ];
+
+        await using var first = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning),
+            timeProvider: clock,
+            gitHubPollCadence: cadence);
+        await SeedParkedRunWithNoLedgerAsync(first);
+
+        await first.Service.RunTickAsync(CancellationToken.None);
+        Assert.Equal(1, tracker.IssueStateFetchRepositories.Count);
+
+        await using var second = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning),
+            timeProvider: clock,
+            reuseDbPath: first.DbPath,
+            gitHubPollCadence: cadence);
+
+        await second.Service.RunTickAsync(CancellationToken.None);
+        Assert.Equal(1, tracker.IssueStateFetchRepositories.Count);
+
+        clock.Advance(TrackerReadCadence.ParkedRunSweep);
+        await using var third = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning),
+            timeProvider: clock,
+            reuseDbPath: first.DbPath,
+            gitHubPollCadence: cadence);
+
+        await third.Service.RunTickAsync(CancellationToken.None);
+        Assert.Equal(2, tracker.IssueStateFetchRepositories.Count);
+    }
+
     // Nothing external has to change for this sweep to reach the same verdict
     // again, so an unbounded un-park would re-dispatch and re-escalate an issue
     // with a durable fault for ever. The second escalation is a person's, and the
@@ -2001,6 +2097,73 @@ public sealed class OrchestrationTickServiceTests
         Assert.Single(
             (await harness.DbContext.EventLog.ToListAsync())
                 .Where(entry => entry.EventName == "phase_implementation_no_pull_request"));
+    }
+
+    [Fact]
+    public async Task RunTickAsync_ShouldThrottlePhaseLedgerPollingAcrossFreshTickServiceInstances()
+    {
+        var clock = new MutableTimeProvider(new DateTimeOffset(2026, 9, 6, 12, 0, 0, TimeSpan.Zero));
+        var cadence = new GitHubTrackerPollCadence();
+        var tracker = new FakeTrackerClient([]);
+        tracker.PullRequestStatusByNumber[5] = new PullRequestStatus(5, "OPEN", false, "aaa111", "SUCCESS", "MERGEABLE");
+
+        await using var first = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning),
+            timeProvider: clock,
+            gitHubPollCadence: cadence);
+        await first.InsertReviewingLedgerAsync(
+            "issue-1",
+            "#1",
+            5,
+            updatedAtUtc: clock.GetUtcNow().AddMinutes(-10));
+        first.DbContext.Runs.Add(new RunEntity
+        {
+            Id = Guid.NewGuid().ToString("N"),
+            IssueId = "issue-1",
+            IssueIdentifier = "#1",
+            Status = RunStatusNames.Running,
+            State = "Open",
+            Phase = RunPhaseNames.Review,
+            Runner = AgentRunnerNames.Codex,
+            StartedAtUtc = clock.GetUtcNow().AddMinutes(-5),
+            LastEventAtUtc = clock.GetUtcNow().AddMinutes(-5)
+        });
+        await first.DbContext.SaveChangesAsync();
+
+        await first.Service.RunTickAsync(CancellationToken.None);
+        Assert.Single(tracker.PullRequestStatusRequests);
+        Assert.Single(tracker.IssueCommentFetchRepositories);
+
+        await using var second = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning),
+            timeProvider: clock,
+            reuseDbPath: first.DbPath,
+            gitHubPollCadence: cadence);
+
+        await second.Service.RunTickAsync(CancellationToken.None);
+        Assert.Single(tracker.PullRequestStatusRequests);
+        Assert.Single(tracker.IssueCommentFetchRepositories);
+
+        clock.Advance(TimeSpan.FromSeconds(15));
+        var ledger = await second.DbContext.PhaseLedger.SingleAsync();
+        ledger.UpdatedAtUtc = clock.GetUtcNow();
+        await second.DbContext.SaveChangesAsync();
+
+        await using var third = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning),
+            timeProvider: clock,
+            reuseDbPath: first.DbPath,
+            gitHubPollCadence: cadence);
+
+        await third.Service.RunTickAsync(CancellationToken.None);
+        Assert.Equal(2, tracker.PullRequestStatusRequests.Count);
+        Assert.Equal(2, tracker.IssueCommentFetchRepositories.Count);
     }
 
     // A pull request closed and then reopened was orphaned forever. The ledger
@@ -4786,7 +4949,8 @@ public sealed class OrchestrationTickServiceTests
             FakeTrackerClient tracker,
             FakeIssueExecutionCoordinator coordinator,
             TimeProvider? timeProvider = null,
-            string? reuseDbPath = null)
+            string? reuseDbPath = null,
+            GitHubTrackerPollCadence? gitHubPollCadence = null)
         {
             var dbPath = reuseDbPath ?? Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid():N}-orchestration.db");
             var options = new DbContextOptionsBuilder<SymphonyDbContext>()
@@ -4810,6 +4974,7 @@ public sealed class OrchestrationTickServiceTests
             coordinator.Attach(dbContext, dbPath);
             var clock = timeProvider ?? TimeProvider.System;
             var trackerReachability = new TrackerReachability(clock);
+            var pollCadence = gitHubPollCadence ?? new GitHubTrackerPollCadence();
 
             var service = new OrchestrationTickService(
                 new FakeWorkflowDefinitionProvider(workflowDefinition),
@@ -4829,6 +4994,7 @@ public sealed class OrchestrationTickServiceTests
                 new DirectiveProcessor(
                     dbContext,
                     tracker,
+                    pollCadence,
                     clock,
                     NullLogger<DirectiveProcessor>.Instance),
                 // The test clock too. Quota holds, the six-hour bound and the
@@ -4838,6 +5004,7 @@ public sealed class OrchestrationTickServiceTests
                 new PhaseOrchestrator(
                     dbContext,
                     tracker,
+                    pollCadence,
                     clock,
                     NullLogger<PhaseOrchestrator>.Instance),
                 new EventLogRetentionService(
@@ -4845,6 +5012,7 @@ public sealed class OrchestrationTickServiceTests
                     clock,
                     NullLogger<EventLogRetentionService>.Instance),
                 trackerReachability,
+                pollCadence,
                 Options.Create(new OrchestrationOptions
                 {
                     InstanceId = "instance-1",
@@ -5489,10 +5657,17 @@ public sealed class OrchestrationTickServiceTests
             return Task.CompletedTask;
         }
 
-        public Task<IReadOnlyList<OpenPullRequest>> FetchOpenPullRequestsAsync(TrackerQuery query, int limit, CancellationToken cancellationToken = default)
-            => Task.FromResult<IReadOnlyList<OpenPullRequest>>(OpenPullRequests);
-
         public IReadOnlyList<OpenPullRequest> OpenPullRequests { get; set; } = [];
+        public List<(string Repository, int Limit)> OpenPullRequestFetches { get; } = [];
+
+        public Task<IReadOnlyList<OpenPullRequest>> FetchOpenPullRequestsAsync(
+            TrackerQuery query,
+            int limit,
+            CancellationToken cancellationToken = default)
+        {
+            OpenPullRequestFetches.Add(($"{query.Owner}/{query.Repo}", limit));
+            return Task.FromResult(OpenPullRequests);
+        }
 
 
         public Task<string?> MergePullRequestAsync(

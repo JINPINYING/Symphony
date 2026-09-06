@@ -15,7 +15,16 @@ public sealed partial class GitHubTrackerClient(
     // every test does that - while the host injects the singleton that keeps the
     // readings. The adapter reads the budget headers because it is the only thing
     // holding the response; it does not decide what they mean.
-    IGitHubRateLimitObserver? rateLimitObserver = null) : ITrackerClient, IGitHubTrackerClient
+    IGitHubRateLimitObserver? rateLimitObserver = null,
+    // Where each call is attributed. The headers say how much of a budget is
+    // gone; only this says what took it, which is the question four fixes in five
+    // days failed to ask before moving load from one budget to the other.
+    IGitHubApiCallObserver? apiCallObserver = null,
+    // Absent means "no conditional requests": every read is unconditional and
+    // charged, which is what the adapter did before 2026-09-06. The host injects
+    // the singleton so validators survive between ticks - a per-tick cache would
+    // never revalidate anything.
+    GitHubConditionalRequestCache? conditionalRequests = null) : ITrackerClient, IGitHubTrackerClient
 {
     // Field selection for the by-ids fallback, which is the only issue read still
     // served by GraphQL - and only when the caller cannot name the issue number
@@ -337,7 +346,7 @@ public sealed partial class GitHubTrackerClient(
                 labels = labelPage
             });
 
-        using var response = await SendAsync(request, cancellationToken);
+        using var response = await SendAsync(request, GitHubGraphQlCallSites.IssueStatesByIds, cancellationToken);
         using var document = await ParseGraphQlDocumentAsync(response, cancellationToken);
 
         var dataElement = GetRequiredObject(document.RootElement, "data");
@@ -464,7 +473,7 @@ public sealed partial class GitHubTrackerClient(
                     after
                 });
 
-            using var response = await SendAsync(request, cancellationToken);
+            using var response = await SendAsync(request, GitHubGraphQlCallSites.IssueCommentMarker, cancellationToken);
             using var document = await ParseGraphQlDocumentAsync(response, cancellationToken);
 
             var dataElement = GetRequiredObject(document.RootElement, "data");
@@ -538,7 +547,7 @@ public sealed partial class GitHubTrackerClient(
                 body
             });
 
-        using var response = await SendAsync(request, cancellationToken);
+        using var response = await SendAsync(request, GitHubGraphQlCallSites.Mutation, cancellationToken);
         using var document = await ParseGraphQlDocumentAsync(response, cancellationToken);
 
         var dataElement = GetRequiredObject(document.RootElement, "data");
@@ -625,7 +634,7 @@ public sealed partial class GitHubTrackerClient(
                     after
                 });
 
-            using var response = await SendAsync(request, cancellationToken);
+            using var response = await SendAsync(request, GitHubGraphQlCallSites.IssueComments, cancellationToken);
             using var document = await ParseGraphQlDocumentAsync(response, cancellationToken);
 
             var dataElement = GetRequiredObject(document.RootElement, "data");
@@ -802,7 +811,7 @@ public sealed partial class GitHubTrackerClient(
                 includePullRequests = query.IncludePullRequests
             });
 
-        using var response = await SendAsync(request, cancellationToken);
+        using var response = await SendAsync(request, GitHubGraphQlCallSites.IssuesByIds, cancellationToken);
         using var document = await ParseGraphQlDocumentAsync(response, cancellationToken);
 
         var issuesById = new Dictionary<string, FetchedIssue>(StringComparer.OrdinalIgnoreCase);
@@ -911,7 +920,7 @@ public sealed partial class GitHubTrackerClient(
                    query.ApiKey,
                    GraphQlPullRequestIdQuery,
                    new { owner = query.Owner, repo = query.Repo, number = pullRequestNumber }))
-        using (var idResponse = await SendAsync(idRequest, cancellationToken))
+        using (var idResponse = await SendAsync(idRequest, GitHubGraphQlCallSites.Mutation, cancellationToken))
         using (var idDocument = await ParseGraphQlDocumentAsync(idResponse, cancellationToken))
         {
             var dataElement = GetRequiredObject(idDocument.RootElement, "data");
@@ -946,7 +955,7 @@ public sealed partial class GitHubTrackerClient(
                 GraphQlMergePullRequestMutation,
                 new { pullRequestId, expectedHeadOid = expectedHeadSha, method = graphQlMethod });
 
-            using var response = await SendAsync(request, cancellationToken);
+            using var response = await SendAsync(request, GitHubGraphQlCallSites.Mutation, cancellationToken);
             using var document = await ParseGraphQlDocumentAsync(response, cancellationToken);
 
             var dataElement = GetRequiredObject(document.RootElement, "data");
@@ -1000,7 +1009,7 @@ public sealed partial class GitHubTrackerClient(
                    query.ApiKey,
                    GraphQlRepositoryLabelsQuery,
                    new { owner = query.Owner, repo = query.Repo }))
-        using (var labelsResponse = await SendAsync(labelsRequest, cancellationToken))
+        using (var labelsResponse = await SendAsync(labelsRequest, GitHubGraphQlCallSites.Mutation, cancellationToken))
         using (var labelsDocument = await ParseGraphQlDocumentAsync(labelsResponse, cancellationToken))
         {
             var dataElement = GetRequiredObject(labelsDocument.RootElement, "data");
@@ -1039,7 +1048,7 @@ public sealed partial class GitHubTrackerClient(
             GraphQlRemoveLabelsMutation,
             new { labelableId = issueId, labelIds });
 
-        using var response = await SendAsync(request, cancellationToken);
+        using var response = await SendAsync(request, GitHubGraphQlCallSites.Mutation, cancellationToken);
         using var document = await ParseGraphQlDocumentAsync(response, cancellationToken);
         GetRequiredObject(document.RootElement, "data");
     }
@@ -1060,7 +1069,7 @@ public sealed partial class GitHubTrackerClient(
                 issueId
             });
 
-        using var response = await SendAsync(request, cancellationToken);
+        using var response = await SendAsync(request, GitHubGraphQlCallSites.Mutation, cancellationToken);
         using var document = await ParseGraphQlDocumentAsync(response, cancellationToken);
 
         var dataElement = GetRequiredObject(document.RootElement, "data");
@@ -1146,7 +1155,7 @@ public sealed partial class GitHubTrackerClient(
             // only on the plane's own calls under-reports exactly when the agents
             // are busiest. Taken before either return so a refused call - the
             // reading worth having - is recorded too.
-            RecordRateLimit(response);
+            ObserveGraphQlResponse(response, GitHubGraphQlCallSites.AgentExtension);
 
             var payloadJson = await response.Content.ReadAsStringAsync(cancellationToken);
             if (!response.IsSuccessStatusCode)
@@ -1558,6 +1567,7 @@ public sealed partial class GitHubTrackerClient(
 
     private async Task<HttpResponseMessage> SendAsync(
         HttpRequestMessage request,
+        string callSite,
         CancellationToken cancellationToken)
     {
         try
@@ -1565,10 +1575,11 @@ public sealed partial class GitHubTrackerClient(
             var response = await httpClient.SendAsync(request, cancellationToken);
 
             // Recorded before the refusal path below disposes the response. The
-            // GraphQL budget is the one that runs out, and its exhaustion is
-            // reported in these headers - X-Ratelimit-Used: 5011 against a 5000
-            // limit on 2026-09-05 - while `gh api rate_limit` said 5000 remaining.
-            RecordRateLimit(response);
+            // GraphQL budget is separate from the REST core budget, and its
+            // exhaustion is reported in these headers - X-Ratelimit-Used: 5011
+            // against a 5000 limit on 2026-09-05 - while `gh api rate_limit` said
+            // 5000 remaining for core.
+            ObserveGraphQlResponse(response, callSite);
 
             if (!response.IsSuccessStatusCode)
             {

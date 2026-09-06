@@ -25,6 +25,7 @@ public sealed partial class OrchestrationTickService
     private readonly PhaseOrchestrator phaseOrchestrator;
     private readonly EventLogRetentionService eventLogRetentionService;
     private readonly TrackerReachability trackerReachability;
+    private readonly GitHubTrackerPollCadence gitHubPollCadence;
     private readonly OrchestrationOptions orchestrationOptions;
     private readonly TimeProvider timeProvider;
     private readonly ILogger<OrchestrationTickService> logger;
@@ -91,10 +92,8 @@ public sealed partial class OrchestrationTickService
     // times a minute spends the budget this change exists to protect. The
     // dashboard is no staler for it - the scan beside it already moves at 60s.
     private static readonly TimeSpan TrackedIssueRefreshInterval = TrackerReadCadence.TrackedIssueRefresh;
-    private DateTimeOffset nextTrackedIssueRefreshUtc = DateTimeOffset.MinValue;
 
     private static readonly TimeSpan OpenPullRequestPollInterval = TrackerReadCadence.OpenPullRequestPoll;
-    private DateTimeOffset nextOpenPullRequestPollUtc = DateTimeOffset.MinValue;
 
     public OrchestrationTickService(
         IWorkflowDefinitionProvider workflowDefinitionProvider,
@@ -108,6 +107,7 @@ public sealed partial class OrchestrationTickService
         PhaseOrchestrator phaseOrchestrator,
         EventLogRetentionService eventLogRetentionService,
         TrackerReachability trackerReachability,
+        GitHubTrackerPollCadence gitHubPollCadence,
         IOptions<OrchestrationOptions> orchestrationOptions,
         TimeProvider timeProvider,
         ILogger<OrchestrationTickService> logger)
@@ -123,6 +123,7 @@ public sealed partial class OrchestrationTickService
         this.phaseOrchestrator = phaseOrchestrator;
         this.eventLogRetentionService = eventLogRetentionService;
         this.trackerReachability = trackerReachability;
+        this.gitHubPollCadence = gitHubPollCadence;
         this.orchestrationOptions = orchestrationOptions.Value;
         this.timeProvider = timeProvider;
         this.logger = logger;
@@ -287,7 +288,8 @@ public sealed partial class OrchestrationTickService
         string apiKey,
         CancellationToken cancellationToken)
     {
-        if (timeProvider.GetUtcNow() < nextOpenPullRequestPollUtc)
+        var now = timeProvider.GetUtcNow();
+        if (!gitHubPollCadence.TryEnter("open_pull_requests", now, OpenPullRequestPollInterval))
         {
             return;
         }
@@ -306,9 +308,6 @@ public sealed partial class OrchestrationTickService
                     cancellationToken));
             }
 
-            var now = timeProvider.GetUtcNow();
-            nextOpenPullRequestPollUtc = now + OpenPullRequestPollInterval;
-
             dbContext.EventLog.Add(new EventLogEntity
             {
                 EventName = OpenPullRequestsEventName,
@@ -324,8 +323,8 @@ public sealed partial class OrchestrationTickService
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
         {
-            // Back off on failure too, so a broken token does not retry every tick.
-            nextOpenPullRequestPollUtc = timeProvider.GetUtcNow() + OpenPullRequestPollInterval;
+            // TryEnter already advanced the process-wide gate, so a broken token
+            // does not retry every tick.
             logger.LogWarning(exception, "Could not read open pull requests; the status page will show the previous snapshot.");
         }
     }

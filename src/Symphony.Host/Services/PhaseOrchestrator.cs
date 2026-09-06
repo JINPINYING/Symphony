@@ -1,5 +1,6 @@
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
+using Symphony.Core.Configuration;
 using Symphony.Core.Models;
 using Symphony.Infrastructure.Persistence.Sqlite;
 using Symphony.Infrastructure.Persistence.Sqlite.Entities;
@@ -53,6 +54,7 @@ public static class PhaseStages
 public sealed class PhaseOrchestrator(
     SymphonyDbContext dbContext,
     IGitHubTrackerClient trackerClient,
+    GitHubTrackerPollCadence gitHubPollCadence,
     TimeProvider timeProvider,
     ILogger<PhaseOrchestrator> logger)
 {
@@ -142,6 +144,7 @@ public sealed class PhaseOrchestrator(
     /// cannot happen again.
     /// </summary>
     public static readonly TimeSpan ParkedRunReconcileDelay = StuckStageTimeout;
+    private static readonly TimeSpan ParkedRunSweepInterval = TrackerReadCadence.ParkedRunSweep;
 
     private static string Humanise(TimeSpan span) =>
         span.TotalMinutes < 60 ? $"{(int)span.TotalMinutes} minutes"
@@ -670,6 +673,12 @@ public sealed class PhaseOrchestrator(
         TrackerQuerySet queries,
         CancellationToken cancellationToken)
     {
+        var now = timeProvider.GetUtcNow();
+        if (!gitHubPollCadence.TryEnter("parked_run_sweep", now, ParkedRunSweepInterval))
+        {
+            return false;
+        }
+
         var parked = await dbContext.Runs
             .Where(run => run.Status == RunStatusNames.NeedsCommandCenter)
             .ToListAsync(cancellationToken);
@@ -687,7 +696,6 @@ public sealed class PhaseOrchestrator(
                 .ToListAsync(cancellationToken))
             .ToHashSet(StringComparer.Ordinal);
 
-        var now = timeProvider.GetUtcNow();
         var candidates = parked
             .Where(run => !ledgeredIssueIds.Contains(run.IssueId))
             .Where(run => now - ParkedSince(run) >= ParkedRunReconcileDelay)
@@ -1053,8 +1061,18 @@ public sealed class PhaseOrchestrator(
 
         foreach (var ledger in activeLedgers)
         {
+            var shouldMarkPoll = false;
+            var pollStartedAtUtc = timeProvider.GetUtcNow();
+            var polledStage = ledger.Stage;
+            var polledUpdatedAtUtc = ledger.UpdatedAtUtc;
             try
             {
+                if (!gitHubPollCadence.ShouldPollPhaseLedger(ledger, pollStartedAtUtc))
+                {
+                    continue;
+                }
+
+                shouldMarkPoll = true;
                 await AdvanceOneAsync(
                     workflowDefinition,
                     queries.For(ledger.Repository),
@@ -1073,6 +1091,17 @@ public sealed class PhaseOrchestrator(
                     "Phase advance failed for {IssueIdentifier} (stage {Stage}); will retry next tick.",
                     ledger.IssueIdentifier,
                     ledger.Stage);
+            }
+            finally
+            {
+                if (shouldMarkPoll && !cancellationToken.IsCancellationRequested)
+                {
+                    gitHubPollCadence.MarkPhaseLedgerPolled(
+                        ledger,
+                        polledStage,
+                        polledUpdatedAtUtc,
+                        pollStartedAtUtc);
+                }
             }
         }
     }

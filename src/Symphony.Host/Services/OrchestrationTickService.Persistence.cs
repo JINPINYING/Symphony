@@ -269,7 +269,7 @@ public sealed partial class OrchestrationTickService
         CancellationToken cancellationToken)
     {
         var nowUtc = timeProvider.GetUtcNow();
-        if (nowUtc < nextTrackedIssueRefreshUtc)
+        if (!gitHubPollCadence.TryEnter("tracked_issue_refresh", nowUtc, TrackedIssueRefreshInterval))
         {
             return;
         }
@@ -279,8 +279,6 @@ public sealed partial class OrchestrationTickService
         {
             return;
         }
-
-        nextTrackedIssueRefreshUtc = nowUtc + TrackedIssueRefreshInterval;
 
         var refreshedStates = await TryFetchIssueStatesByIdsAsync(
             workflowDefinition,
@@ -678,15 +676,17 @@ public sealed partial class OrchestrationTickService
             return;
         }
 
-        if (state is null || state.ResumeAtUtc <= now || state.ResumeAtUtc <= nextCandidateScanUtc)
+        if (state is null || state.ResumeAtUtc <= now)
         {
             return;
         }
 
-        nextCandidateScanUtc = state.ResumeAtUtc;
-        logger.LogWarning(
-            "Resuming a candidate-scan pause recorded before this process started; scanning stays paused until {ResumeAtUtc:u}.",
-            nextCandidateScanUtc);
+        if (gitHubPollCadence.SetNextIfLater("candidate_scan", state.ResumeAtUtc))
+        {
+            logger.LogWarning(
+                "Resuming a candidate-scan pause recorded before this process started; scanning stays paused until {ResumeAtUtc:u}.",
+                state.ResumeAtUtc);
+        }
     }
 
     private sealed record CandidateScanPauseState(DateTimeOffset ResumeAtUtc);

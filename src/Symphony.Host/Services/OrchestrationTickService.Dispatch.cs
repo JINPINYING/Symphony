@@ -62,7 +62,7 @@ public sealed partial class OrchestrationTickService
         // expensive part, and now the only part slowed.
         var now = timeProvider.GetUtcNow();
         await RestoreCandidateScanPauseAsync(now, cancellationToken);
-        var dueForScan = now >= nextCandidateScanUtc;
+        var dueForScan = gitHubPollCadence.IsDue("candidate_scan", now);
 
         var issues = new List<NormalizedIssue>();
         var reachedAnyRepository = false;
@@ -126,7 +126,7 @@ public sealed partial class OrchestrationTickService
         else if (reachedAnyRepository)
         {
             trackerReachability.RecordSuccess();
-            nextCandidateScanUtc = now + CandidateScanInterval;
+            gitHubPollCadence.SetNext("candidate_scan", now + CandidateScanInterval);
             candidateScanRateLimitStreak = 0;
 
             // The scan is REST and succeeded; the GraphQL-only fields on some of
@@ -150,12 +150,13 @@ public sealed partial class OrchestrationTickService
             {
                 candidateScanRateLimitStreak++;
                 var backoff = ResolveRateLimitBackoff(rateLimitRetryAfter, candidateScanRateLimitStreak);
-                nextCandidateScanUtc = now + backoff;
+                var resumeAtUtc = now + backoff;
+                gitHubPollCadence.SetNext("candidate_scan", resumeAtUtc);
                 logger.LogWarning(
                     "GitHub rate limit reached ({Streak} consecutive); candidate scanning pauses for {Backoff} until {ResumeAtUtc:u}.",
                     candidateScanRateLimitStreak,
                     backoff,
-                    nextCandidateScanUtc);
+                    resumeAtUtc);
 
                 // Record the pause durably. The field above is in-memory and starts at
                 // MinValue, so without this a restart cancels the wait and the next
@@ -167,7 +168,7 @@ public sealed partial class OrchestrationTickService
                 // is precisely when it will say so. The limit is on the token, not on
                 // the process, so restarting cannot help and the plane should not
                 // behave as though it might.
-                RecordCandidateScanPause(nextCandidateScanUtc, lastFailureCause);
+                RecordCandidateScanPause(resumeAtUtc, lastFailureCause);
                 await dbContext.SaveChangesAsync(cancellationToken);
             }
 

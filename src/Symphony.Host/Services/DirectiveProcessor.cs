@@ -1,5 +1,6 @@
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
+using Symphony.Core.Configuration;
 using Symphony.Core.Models;
 using Symphony.Infrastructure.Persistence.Sqlite;
 using Symphony.Infrastructure.Persistence.Sqlite.Entities;
@@ -33,6 +34,7 @@ public sealed record DirectiveDispatchContext(
 public sealed class DirectiveProcessor(
     SymphonyDbContext dbContext,
     IGitHubTrackerClient trackerClient,
+    GitHubTrackerPollCadence gitHubPollCadence,
     TimeProvider timeProvider,
     ILogger<DirectiveProcessor> logger)
 {
@@ -221,6 +223,13 @@ public sealed class DirectiveProcessor(
         // issue - asks GitHub about this issue by number or by node id, and both
         // answers depend on which repository is asked.
         var query = queries.For(LatestRun(stuckRuns).Repository);
+        if (!gitHubPollCadence.TryEnter(
+                $"escalated_issue_directive:{query.Owner}/{query.Repo}:{issueId}",
+                timeProvider.GetUtcNow(),
+                TrackerReadCadence.EscalatedIssueDirectivePoll))
+        {
+            return;
+        }
 
         var comments = await trackerClient.FetchIssueCommentsAsync(query, issueId, issueIdentifier, cancellationToken);
         if (comments.Count == 0)

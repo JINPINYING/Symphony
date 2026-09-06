@@ -1,6 +1,8 @@
 using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using Symphony.Core.Metadata;
@@ -11,13 +13,11 @@ namespace Symphony.Infrastructure.Tracker.GitHub;
 /// <summary>
 /// The tracker's READ transport.
 ///
-/// WHY THIS EXISTS. Every read used to be a GraphQL call, and GraphQL is the
-/// budget this token exhausts: on 2026-09-03 the tracker went blind twice on
-/// "API rate limit already exceeded" while the REST budget sat at 4999/5000 all
-/// day, untouched. The component whose failure stops every dispatch was the one
-/// most exposed to the limit that keeps being hit, and its retries were
-/// themselves GraphQL calls - once throttled it spent its recovery budget
-/// confirming it was throttled.
+/// WHY THIS EXISTS. Every read used to be a GraphQL call, and the tracker went
+/// blind twice on 2026-09-03 on "API rate limit already exceeded" while the REST
+/// budget sat at 4999/5000 all day, untouched. The lesson is not that only one
+/// budget matters: exhausting either core or GraphQL blinds the plane. Reads that
+/// REST can express stay on REST and both resources are measured separately.
 ///
 /// So the reads that decide whether the plane can work at all - the candidate
 /// scan, issue state, pull requests, checks and comments - are answered from
@@ -32,6 +32,8 @@ public sealed partial class GitHubTrackerClient
     private const string RestAcceptHeader = "application/vnd.github+json";
     private const string RestApiVersionHeaderName = "X-GitHub-Api-Version";
     private const string RestApiVersion = "2022-11-28";
+    private readonly object rateLimitHeaderGate = new();
+    private readonly Dictionary<string, int> lastUsedByResource = new(StringComparer.Ordinal);
 
     // Upper bound on pages walked for one listing. At 100 records per page this is
     // five thousand, far beyond any repository Symphony tracks; it exists so a
@@ -91,11 +93,24 @@ public sealed partial class GitHubTrackerClient
     /// Sends a REST read and maps a refusal onto the same exception vocabulary the
     /// GraphQL path uses, so callers need not know which transport answered. A rate
     /// limit is named as one and carries the wait GitHub asked for.
+    ///
+    /// A GET whose previous answer is still remembered is sent conditionally. If
+    /// GitHub answers 304 the stored body is replayed as though it had just been
+    /// sent - because that is exactly what GitHub is asserting - and the call is
+    /// recorded as costing nothing, which is how REST's primary budget treats it.
     /// </summary>
     private async Task<HttpResponseMessage> SendRestAsync(
         HttpRequestMessage request,
+        string callSite,
         CancellationToken cancellationToken)
     {
+        var cacheKey = ConditionalCacheKey(request);
+        var cached = cacheKey is null ? null : conditionalRequests!.Get(cacheKey);
+        if (cached is not null)
+        {
+            request.Headers.TryAddWithoutValidation("If-None-Match", cached.ETag);
+        }
+
         HttpResponseMessage response;
         try
         {
@@ -115,11 +130,19 @@ public sealed partial class GitHubTrackerClient
         // the most valuable one there is - it is the only one that says how the
         // budget was spent - and a record taken only on success would lose exactly
         // the readings worth having.
-        RecordRateLimit(response);
+        ObserveResponse(response, callSite, notModified: response.StatusCode == HttpStatusCode.NotModified);
+
+        if (response.StatusCode == HttpStatusCode.NotModified && cached is not null)
+        {
+            response.Dispose();
+            return ReplayCached(cached);
+        }
 
         if (response.IsSuccessStatusCode)
         {
-            return response;
+            return cacheKey is null
+                ? response
+                : await StoreConditionalAsync(cacheKey, response, cancellationToken);
         }
 
         // Read the body BEFORE disposing. GitHub says "API rate limit exceeded" and
@@ -183,7 +206,104 @@ public sealed partial class GitHubTrackerClient
     }
 
     /// <summary>
-    /// Records what GitHub said about the budget on this response.
+    /// The cache key for a conditional GET, or null when this request cannot be
+    /// one: no cache wired, or a method whose answer is not a representation to
+    /// revalidate.
+    ///
+    /// Keyed by token as well as URL. Two tokens can see different answers to the
+    /// same URL - a private repository, a different permission set - and a
+    /// validator minted for one must never be offered on behalf of the other. The
+    /// token is reduced to a fingerprint on the way in: this key is held in
+    /// memory, and a secret held anywhere it was not needed is a secret waiting to
+    /// be printed by something.
+    /// </summary>
+    private string? ConditionalCacheKey(HttpRequestMessage request)
+    {
+        if (conditionalRequests is null ||
+            request.Method != HttpMethod.Get ||
+            request.RequestUri is null)
+        {
+            return null;
+        }
+
+        return $"{TokenFingerprint(request.Headers.Authorization?.Parameter)}\n{request.RequestUri}";
+    }
+
+    private static string TokenFingerprint(string? token)
+    {
+        if (string.IsNullOrWhiteSpace(token))
+        {
+            return "anonymous";
+        }
+
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(token)))[..16];
+    }
+
+    /// <summary>
+    /// Replays a stored answer after GitHub said it is still current.
+    ///
+    /// Presented as a 200 because that is what it is: GitHub was asked whether
+    /// this representation had changed and said no, so the stored body is the live
+    /// body. The <c>Link</c> header is rebuilt from the stored next-page URL
+    /// because a 304 need not repeat it and a page walk that lost its link would
+    /// silently stop early - reporting one page of a listing as all of it.
+    /// </summary>
+    private static HttpResponseMessage ReplayCached(GitHubConditionalRequestCache.Entry cached)
+    {
+        var replay = new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new StringContent(cached.Body, Encoding.UTF8, RestAcceptHeader)
+        };
+
+        if (!string.IsNullOrWhiteSpace(cached.NextPageUrl))
+        {
+            replay.Headers.TryAddWithoutValidation("Link", $"<{cached.NextPageUrl}>; rel=\"next\"");
+        }
+
+        return replay;
+    }
+
+    /// <summary>
+    /// Keeps this answer so the next read of the same URL can be conditional.
+    ///
+    /// A response with no <c>ETag</c> is returned untouched: there is nothing to
+    /// revalidate against, and storing a body that can only ever be re-fetched
+    /// unconditionally would spend memory to save nothing.
+    /// </summary>
+    private async Task<HttpResponseMessage> StoreConditionalAsync(
+        string cacheKey,
+        HttpResponseMessage response,
+        CancellationToken cancellationToken)
+    {
+        var etag = response.Headers.ETag?.ToString();
+        if (string.IsNullOrWhiteSpace(etag))
+        {
+            return response;
+        }
+
+        var body = await response.Content.ReadAsStringAsync(cancellationToken);
+        conditionalRequests!.Store(cacheKey, new GitHubConditionalRequestCache.Entry(
+            etag,
+            body,
+            ReadNextPageUrl(response)));
+
+        // Handed back as a fresh buffer rather than the consumed one, so the
+        // caller's parse reads from a stream at position zero whatever the
+        // transport did with the original.
+        response.Content.Dispose();
+        response.Content = new StringContent(body, Encoding.UTF8, RestAcceptHeader);
+        return response;
+    }
+
+    /// <summary>
+    /// Records what GitHub said about the budget on this response, and attributes
+    /// the call that produced it.
+    ///
+    /// The two are recorded together because they are two halves of one question
+    /// and only ever having the first half is what let four consecutive fixes move
+    /// load onto an unmeasured budget. The headers say how much of which budget is
+    /// gone. The call record says which read spent it, and whether it was charged
+    /// at all - a 304 is a call the plane made and a point it did not spend.
     ///
     /// WHY IT IS TAKEN HERE. The plane exhausted the 5,000-point hourly GraphQL
     /// budget on 2026-09-05 and the first sign of it was the candidate scan going
@@ -196,40 +316,134 @@ public sealed partial class GitHubTrackerClient
     /// is not a reason to fail a read, and an invented reading is worse than none
     /// because the panel it feeds would present it as measurement.
     /// </summary>
-    private void RecordRateLimit(HttpResponseMessage response)
+    private void ObserveResponse(HttpResponseMessage response, string callSite, bool notModified)
+    {
+        var observedAt = DateTimeOffset.UtcNow;
+        var rateLimit = ReadRateLimitHeaders(response);
+        var charged = DetermineCharged(rateLimit, notModified);
+
+        // Attribution first, and unconditionally. A response whose budget headers
+        // were stripped still spent a point somewhere, and the call it belongs to
+        // is knowable even when the resource is not - so the call is recorded with
+        // the resource named unknown rather than dropped for want of a header.
+        if (apiCallObserver is not null)
+        {
+            try
+            {
+                apiCallObserver.Record(new GitHubApiCall(
+                    callSite,
+                    rateLimit.Resource,
+                    Charged: charged,
+                    observedAt));
+            }
+            catch (Exception)
+            {
+                // Telemetry taken on the way past a real read. Losing the telemetry
+                // must never lose the read.
+            }
+        }
+
+        RecordRateLimit(rateLimit, observedAt);
+    }
+
+    private void ObserveGraphQlResponse(HttpResponseMessage response, string callSite)
+    {
+        var observedAt = DateTimeOffset.UtcNow;
+        var rateLimit = ReadRateLimitHeaders(response);
+
+        if (apiCallObserver is not null)
+        {
+            try
+            {
+                apiCallObserver.Record(new GitHubApiCall(
+                    callSite,
+                    rateLimit.Resource,
+                    Charged: true,
+                    observedAt));
+            }
+            catch (Exception)
+            {
+                // Telemetry taken on the way past a real read. Losing the telemetry
+                // must never lose the read.
+            }
+        }
+
+        RecordRateLimit(rateLimit, observedAt);
+    }
+
+    private void RecordRateLimit(RateLimitHeaders rateLimit, DateTimeOffset observedAt)
     {
         if (rateLimitObserver is null)
         {
             return;
         }
 
-        var limit = ReadHeaderInt(response, "x-ratelimit-limit");
-        var used = ReadHeaderInt(response, "x-ratelimit-used");
-        var remaining = ReadHeaderInt(response, "x-ratelimit-remaining");
-        if (limit is null || used is null || remaining is null)
+        if (rateLimit.Limit is null || rateLimit.Used is null || rateLimit.Remaining is null)
         {
             return;
         }
 
-        var resource = ReadHeaderString(response, "x-ratelimit-resource");
-        var reset = ReadHeaderLong(response, "x-ratelimit-reset");
-
         try
         {
             rateLimitObserver.Record(new GitHubRateLimitReading(
-                string.IsNullOrWhiteSpace(resource) ? "unknown" : resource.Trim().ToLowerInvariant(),
-                limit.Value,
-                used.Value,
-                remaining.Value,
-                reset is null ? null : DateTimeOffset.FromUnixTimeSeconds(reset.Value),
-                DateTimeOffset.UtcNow));
+                rateLimit.Resource,
+                rateLimit.Limit.Value,
+                rateLimit.Used.Value,
+                rateLimit.Remaining.Value,
+                rateLimit.Reset,
+                observedAt));
         }
         catch (Exception)
         {
-            // Telemetry taken on the way past a real read. Losing the telemetry
-            // must never lose the read.
+            // Observability is best-effort. The tracker read has already succeeded
+            // or failed on its own merits; never turn a missing metric into a
+            // tracker outage.
         }
     }
+
+    private bool DetermineCharged(RateLimitHeaders rateLimit, bool notModified)
+    {
+        if (rateLimit.Used is null)
+        {
+            return true;
+        }
+
+        lock (rateLimitHeaderGate)
+        {
+            var hasPrevious = lastUsedByResource.TryGetValue(rateLimit.Resource, out var previousUsed);
+            lastUsedByResource[rateLimit.Resource] = rateLimit.Used.Value;
+
+            if (!notModified)
+            {
+                return true;
+            }
+
+            return !hasPrevious || previousUsed != rateLimit.Used.Value;
+        }
+    }
+
+    private static RateLimitHeaders ReadRateLimitHeaders(HttpResponseMessage response)
+    {
+        var resource = ReadHeaderString(response, "x-ratelimit-resource");
+        var normalisedResource = string.IsNullOrWhiteSpace(resource)
+            ? GitHubApiCall.UnknownResource
+            : resource.Trim().ToLowerInvariant();
+        var reset = ReadHeaderLong(response, "x-ratelimit-reset");
+
+        return new RateLimitHeaders(
+            normalisedResource,
+            ReadHeaderInt(response, "x-ratelimit-limit"),
+            ReadHeaderInt(response, "x-ratelimit-used"),
+            ReadHeaderInt(response, "x-ratelimit-remaining"),
+            reset is null ? null : DateTimeOffset.FromUnixTimeSeconds(reset.Value));
+    }
+
+    private sealed record RateLimitHeaders(
+        string Resource,
+        int? Limit,
+        int? Used,
+        int? Remaining,
+        DateTimeOffset? Reset);
 
     private static string? ReadHeaderString(HttpResponseMessage response, string name) =>
         response.Headers.TryGetValues(name, out var values) ? values.FirstOrDefault() : null;
@@ -368,6 +582,7 @@ public sealed partial class GitHubTrackerClient
     private async Task ReadRestListAsync(
         TrackerQuery query,
         string firstPageUrl,
+        string callSite,
         Action<JsonElement> onElement,
         CancellationToken cancellationToken)
     {
@@ -375,7 +590,7 @@ public sealed partial class GitHubTrackerClient
         for (var page = 0; page < MaxRestPages && url is not null; page++)
         {
             using var request = BuildRestRequest(HttpMethod.Get, url, query.ApiKey);
-            using var response = await SendRestAsync(request, cancellationToken);
+            using var response = await SendRestAsync(request, callSite, cancellationToken);
             var next = ReadNextPageUrl(response);
             using var document = await ParseRestDocumentAsync(response, cancellationToken);
 
@@ -403,13 +618,14 @@ public sealed partial class GitHubTrackerClient
     private async Task<JsonDocument?> ReadRestObjectAsync(
         TrackerQuery query,
         string url,
+        string callSite,
         CancellationToken cancellationToken)
     {
         using var request = BuildRestRequest(HttpMethod.Get, url, query.ApiKey);
         HttpResponseMessage response;
         try
         {
-            response = await SendRestAsync(request, cancellationToken);
+            response = await SendRestAsync(request, callSite, cancellationToken);
         }
         catch (GitHubTrackerException ex) when (ex.StatusCode == (int)HttpStatusCode.NotFound)
         {
@@ -460,6 +676,7 @@ public sealed partial class GitHubTrackerClient
         await ReadRestListAsync(
             query,
             $"{RepositoryUrl(query)}/issues?{string.Join('&', parameters)}",
+            GitHubRestCallSites.CandidateScan,
             element =>
             {
                 if (element.ValueKind != JsonValueKind.Object)
@@ -609,6 +826,7 @@ public sealed partial class GitHubTrackerClient
         using var document = await ReadRestObjectAsync(
             query,
             $"{RepositoryUrl(query)}/issues/{number.ToString(CultureInfo.InvariantCulture)}",
+            GitHubRestCallSites.IssueByNumber,
             cancellationToken);
         if (document is null || document.RootElement.ValueKind != JsonValueKind.Object)
         {
@@ -647,7 +865,7 @@ public sealed partial class GitHubTrackerClient
         for (var page = 0; page < MaxRestPages && url is not null && found.Count < wanted.Count; page++)
         {
             using var request = BuildRestRequest(HttpMethod.Get, url, query.ApiKey);
-            using var response = await SendRestAsync(request, cancellationToken);
+            using var response = await SendRestAsync(request, GitHubRestCallSites.IssueStateListing, cancellationToken);
             var next = ReadNextPageUrl(response);
             using var document = await ParseRestDocumentAsync(response, cancellationToken);
 
@@ -692,6 +910,7 @@ public sealed partial class GitHubTrackerClient
         using var document = await ReadRestObjectAsync(
             query,
             $"{RepositoryUrl(query)}/issues/{number.ToString(CultureInfo.InvariantCulture)}",
+            GitHubRestCallSites.IssueByNumber,
             cancellationToken);
         if (document is null || document.RootElement.ValueKind != JsonValueKind.Object)
         {
@@ -728,6 +947,7 @@ public sealed partial class GitHubTrackerClient
         await ReadRestListAsync(
             query,
             $"{RepositoryUrl(query)}/issues/{number.ToString(CultureInfo.InvariantCulture)}/comments?per_page=100",
+            GitHubRestCallSites.IssueComments,
             element =>
             {
                 if (element.ValueKind != JsonValueKind.Object)
@@ -774,6 +994,7 @@ public sealed partial class GitHubTrackerClient
         using (var document = await ReadRestObjectAsync(
                    query,
                    $"{RepositoryUrl(query)}/issues/{number.ToString(CultureInfo.InvariantCulture)}",
+                   GitHubRestCallSites.IssueCommentMarker,
                    cancellationToken))
         {
             if (document is null || document.RootElement.ValueKind != JsonValueKind.Object)
@@ -789,6 +1010,7 @@ public sealed partial class GitHubTrackerClient
         await ReadRestListAsync(
             query,
             $"{RepositoryUrl(query)}/issues/{number.ToString(CultureInfo.InvariantCulture)}/comments?per_page=100",
+            GitHubRestCallSites.IssueCommentMarker,
             element =>
             {
                 if (found || element.ValueKind != JsonValueKind.Object)
@@ -819,6 +1041,7 @@ public sealed partial class GitHubTrackerClient
         using var document = await ReadRestObjectAsync(
             query,
             $"{RepositoryUrl(query)}/pulls/{pullRequestNumber.ToString(CultureInfo.InvariantCulture)}",
+            GitHubRestCallSites.PullRequestByNumber,
             cancellationToken);
         if (document is null || document.RootElement.ValueKind != JsonValueKind.Object)
         {
@@ -909,6 +1132,7 @@ public sealed partial class GitHubTrackerClient
         using (var statusDocument = await ReadRestObjectAsync(
                    query,
                    $"{RepositoryUrl(query)}/commits/{Uri.EscapeDataString(headSha)}/status",
+                   GitHubRestCallSites.CommitStatus,
                    cancellationToken))
         {
             if (statusDocument is not null && statusDocument.RootElement.ValueKind == JsonValueKind.Object)
@@ -934,6 +1158,7 @@ public sealed partial class GitHubTrackerClient
         using (var checkRunsDocument = await ReadRestObjectAsync(
                    query,
                    $"{RepositoryUrl(query)}/commits/{Uri.EscapeDataString(headSha)}/check-runs?per_page=100",
+                   GitHubRestCallSites.CommitCheckRuns,
                    cancellationToken))
         {
             if (checkRunsDocument is not null &&
@@ -998,7 +1223,7 @@ public sealed partial class GitHubTrackerClient
 
         JsonElement? newest = null;
         using var request = BuildRestRequest(HttpMethod.Get, url, query.ApiKey);
-        using var response = await SendRestAsync(request, cancellationToken);
+        using var response = await SendRestAsync(request, GitHubRestCallSites.PullRequestByHeadBranch, cancellationToken);
         using var document = await ParseRestDocumentAsync(response, cancellationToken);
 
         if (document.RootElement.ValueKind != JsonValueKind.Array)
@@ -1033,7 +1258,7 @@ public sealed partial class GitHubTrackerClient
 
         var nodes = new List<JsonElement>();
         using var request = BuildRestRequest(HttpMethod.Get, url, query.ApiKey);
-        using var response = await SendRestAsync(request, cancellationToken);
+        using var response = await SendRestAsync(request, GitHubRestCallSites.OpenPullRequests, cancellationToken);
         using var document = await ParseRestDocumentAsync(response, cancellationToken);
 
         if (document.RootElement.ValueKind != JsonValueKind.Array)
@@ -1093,6 +1318,7 @@ public sealed partial class GitHubTrackerClient
         await ReadRestListAsync(
             query,
             $"{RepositoryUrl(query)}/pulls/{pullRequestNumber.ToString(CultureInfo.InvariantCulture)}/files?per_page=100",
+            GitHubRestCallSites.PullRequestFiles,
             element =>
             {
                 if (element.ValueKind != JsonValueKind.Object)
