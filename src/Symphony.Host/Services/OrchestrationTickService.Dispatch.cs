@@ -666,6 +666,18 @@ public sealed partial class OrchestrationTickService
             return false;
         }
 
+        // WHO owns this issue, if anyone. The refusal above is the same either way;
+        // the report is not, and reporting them as one thing is what made a
+        // scheduling gap read as an owner decision (#94).
+        //
+        // A LIVE ledger never gets here - the candidate loop skips a phase-owned
+        // issue before this guard is consulted - so what this distinguishes is a
+        // parked phase from no phase at all. That is the distinction that matters:
+        // the first is an escalation to answer, the second is a gap the plane closes
+        // itself by entering the pull request into the pipeline.
+        var owningLedger = await dbContext.PhaseLedger
+            .FirstOrDefaultAsync(entry => entry.IssueId == issue.Id, cancellationToken);
+
         // The first refusal for this run is also the clock the escape runs on:
         // one durable timestamp, written where the block is already recorded,
         // rather than a second piece of state to keep in step with it.
@@ -700,7 +712,8 @@ public sealed partial class OrchestrationTickService
                 BuildRedispatchDeadlockReason(
                     issue,
                     blockMessage,
-                    timeProvider.GetUtcNow() - blockedSinceUtc.Value),
+                    timeProvider.GetUtcNow() - blockedSinceUtc.Value,
+                    owningLedger),
                 cancellationToken);
 
             // Still blocked. Escalating says why nothing is moving; it does not
@@ -724,7 +737,8 @@ public sealed partial class OrchestrationTickService
     private static string BuildRedispatchDeadlockReason(
         NormalizedIssue issue,
         string blockMessage,
-        TimeSpan blockedFor)
+        TimeSpan blockedFor,
+        PhaseLedgerEntity? owningLedger)
     {
         var openPullRequest = issue.PullRequests
             .Where(pullRequest => pullRequest.Number.HasValue &&
@@ -739,11 +753,21 @@ public sealed partial class OrchestrationTickService
             ? "close or merge the pull request this implementation produced"
             : $"close or merge PR #{openPullRequest}";
 
+        // WHICH phase owns it, or that none does - a parked phase and no phase at
+        // all need different things done to them, and used to read identically.
+        var ownership = owningLedger is null
+            ? "No phase owns this issue: nothing has entered its pull request into verify, review or repair, and the " +
+              "automatic recovery that adopts an unowned pull request could not find or confirm one to adopt."
+            : PhaseStages.IsTerminal(owningLedger.Stage)
+                ? $"The phase machine finished with PR #{owningLedger.PrNumber} at stage '{owningLedger.Stage}', so " +
+                  "nothing owns the pull request this implementation produced."
+                : $"The phase machine owns this issue and is parked: PR #{owningLedger.PrNumber} is at stage " +
+                  $"'{owningLedger.Stage}'. That escalation is the thing to answer, not this refusal.";
+
         return
             $"Issue {issue.Identifier} has been refused dispatch for {minutes} minutes and no phase is advancing it. " +
-            $"Cause: {blockMessage} " +
-            "Nothing in the plane will move this on its own - no verify, review or repair phase owns the issue, so " +
-            "the pull request blocks the issue and the issue cannot reach the pull request. " +
+            $"Cause: {blockMessage} {ownership} " +
+            "So the pull request blocks the issue and the issue cannot reach the pull request. " +
             $"To clear it, either {pullRequestRemedy} so the issue becomes dispatchable again, or post a " +
             "command-center directive dispatching an explicit repair/review phase against the existing pull request.";
     }

@@ -32,6 +32,14 @@ public static class PhaseStages
     public const string Merged = "merged";
     public const string Escalated = "escalated";
     public const string Closed = "closed";
+
+    /// <summary>
+    /// A ledger at one of these stages has finished with its pull request. It is
+    /// history, not work in progress, so it must not block a later cycle.
+    /// </summary>
+    public static bool IsTerminal(string? stage) =>
+        string.Equals(stage, Merged, StringComparison.Ordinal) ||
+        string.Equals(stage, Closed, StringComparison.Ordinal);
 }
 
 // M4 phase orchestration — the routine loop as separate recorded phases:
@@ -146,6 +154,49 @@ public sealed class PhaseOrchestrator(
     public static readonly TimeSpan ParkedRunReconcileDelay = StuckStageTimeout;
     private static readonly TimeSpan ParkedRunSweepInterval = TrackerReadCadence.ParkedRunSweep;
 
+    /// <summary>
+    /// The event an open pull request that no phase owned being entered into the
+    /// pipeline is recorded under.
+    ///
+    /// Durable and load-bearing twice, exactly like
+    /// <see cref="ParkedRunReconciledEventName"/>: it is what the panel shows as
+    /// the reason an item went away on its own, and its count at a given head is
+    /// the bound. Renaming it silently resets every bound to zero.
+    /// </summary>
+    public const string UnownedPullRequestAdoptedEventName = "phase_unowned_pull_request_adopted";
+
+    /// <summary>
+    /// The event an escalated ledger returning to review on a head that moved
+    /// after the escalation is recorded under. Counted against the same bound as
+    /// adoption: both are the plane putting one head back into review by itself.
+    /// </summary>
+    public const string EscalationRearmedEventName = "phase_escalation_rearmed";
+
+    /// <summary>
+    /// The event that says the bounded automatic re-dispatches for one head are
+    /// spent, and the issue is now genuinely a person's.
+    /// </summary>
+    public const string AutomaticReviewRedispatchExhaustedEventName = "phase_automatic_review_redispatch_exhausted";
+
+    /// <summary>
+    /// How many times the plane may put ONE pull request head back into review on
+    /// its own evidence before the issue stops being the plane's problem.
+    ///
+    /// The recovery is right when nothing owns an issue: there is exactly one
+    /// correct action and no decision to make, so waiting for a person to type it
+    /// is the deadlock rather than the safeguard (#94). But nothing external has
+    /// to change for it to reach the same verdict again, so unbounded it would
+    /// re-dispatch a genuinely broken pull request for ever and the owner would
+    /// never see it at all.
+    ///
+    /// Bounded PER HEAD, not per issue, because a head that moves is new work and
+    /// deserves its own attempts; a head that does not is the same question being
+    /// asked twice. Two: one recovery, then one retry in case the first was lost
+    /// to a slot, a quota window or a restart. The third time the same commit
+    /// comes back it is a person's, and the escalation says so with the count.
+    /// </summary>
+    public const int MaxAutomaticReviewDispatchesPerHead = 2;
+
     private static string Humanise(TimeSpan span) =>
         span.TotalMinutes < 60 ? $"{(int)span.TotalMinutes} minutes"
         : span.TotalHours < 24 ? $"{(int)span.TotalHours} hours"
@@ -179,6 +230,13 @@ public sealed class PhaseOrchestrator(
         try
         {
             await SeedLedgersForCompletedImplementationsAsync(queries, cancellationToken);
+
+            // Before advancing, take ownership of anything that has none. An open
+            // pull request with no phase behind it is a review that was never
+            // dispatched, not a decision - and it has to be entered into the ledger
+            // BEFORE AdvanceLedgersAsync runs, so the review it is owed goes out on
+            // this tick rather than the next one.
+            await AdoptUnownedPullRequestsAsync(queries, cancellationToken);
             await AdvanceLedgersAsync(workflowDefinition, queries, dispatchAsync, cancellationToken);
             await ReconcileEscalatedLedgersAsync(workflowDefinition, queries, cancellationToken);
         }
@@ -462,6 +520,436 @@ public sealed class PhaseOrchestrator(
             .FirstOrDefault();
     }
 
+    /// <summary>
+    /// Enters an open pull request that NO phase owns into the pipeline, at the
+    /// review it is owed.
+    /// </summary>
+    /// <remarks>
+    /// The deadlock this closes (#94): implementation produces a pull request, the
+    /// review phase never takes ownership - the runner was out of quota, its row
+    /// was taken over, or the redispatch guard escalated the succeeded run and so
+    /// removed the very evidence <see cref="SeedLedgersForCompletedImplementationsAsync"/>
+    /// keys on - and now nothing owns the issue. The open pull request correctly
+    /// blocks re-dispatch, and nothing re-dispatches the review, because owning the
+    /// issue is what a phase would have to do first. Ten of ten queued items sat in
+    /// exactly that state, each needing a hand-typed comment to escape.
+    ///
+    /// <see cref="HandleReviewVerdictAsync"/> already recovers the sibling case - a
+    /// ledger whose review run is missing is re-dispatched rather than waited on
+    /// for ever (<c>phase_review_redispatch</c>). This is the same recovery reached
+    /// from a different starting state: the one where the ledger that branch
+    /// consults was never written at all.
+    ///
+    /// There is exactly one correct action here and no decision to make, so the
+    /// plane takes it. What it does NOT do is act on absence: a pull request is
+    /// adopted only when one is positively found, and the head it is seeded against
+    /// is read fresh from GitHub, because the ledger row is durable state and the
+    /// snapshot behind it is a stale single page.
+    /// </remarks>
+    private async Task AdoptUnownedPullRequestsAsync(
+        TrackerQuerySet queries,
+        CancellationToken cancellationToken)
+    {
+        var snapshot = await ReadOpenPullRequestSnapshotAsync(cancellationToken);
+        if (snapshot.Count == 0)
+        {
+            return;
+        }
+
+        // ANY ledger row, at any stage. A live one means the phase machine already
+        // owns the issue; an escalated one belongs to the reconciler below, which
+        // re-arms it when its head moves; a settled one is re-entered by the seeder
+        // when the issue is implemented again. This sweep is only for issues none
+        // of them can see.
+        var ledgeredIssueIds = (await dbContext.PhaseLedger
+                .Select(entry => entry.IssueId)
+                .ToListAsync(cancellationToken))
+            .ToHashSet(StringComparer.Ordinal);
+
+        var runs = await dbContext.Runs
+            .Where(run => run.Status != RunStatusNames.ResolvedByDirective &&
+                          run.Status != RunStatusNames.ResolvedByPhaseClear &&
+                          run.Status != RunStatusNames.AbandonedUnreadableIssue &&
+                          run.Status != RunStatusNames.CanceledByReconciliation &&
+                          run.Status != RunStatusNames.ReleasedIneligible)
+            .ToListAsync(cancellationToken);
+
+        // A run that is actually executing IS a live phase, whatever the ledger
+        // says. Nothing here may take an issue out from under one.
+        var runningIssueIds = runs
+            .Where(run => string.Equals(run.Status, RunStatusNames.Running, StringComparison.OrdinalIgnoreCase))
+            .Select(run => run.IssueId)
+            .ToHashSet(StringComparer.Ordinal);
+
+        var candidates = runs
+            .Where(run => !ledgeredIssueIds.Contains(run.IssueId))
+            .Where(run => !runningIssueIds.Contains(run.IssueId))
+            .GroupBy(run => run.IssueId, StringComparer.Ordinal)
+            .Select(group => group.OrderByDescending(run => run.StartedAtUtc).First())
+            .ToList();
+        if (candidates.Count == 0)
+        {
+            return;
+        }
+
+        var candidateIssueIds = candidates.Select(run => run.IssueId).ToList();
+        var branchByIssueId = (await dbContext.WorkspaceRecords
+                .Where(record => candidateIssueIds.Contains(record.IssueId))
+                .Select(record => new { record.IssueId, record.BranchName })
+                .ToListAsync(cancellationToken))
+            .Where(record => !string.IsNullOrWhiteSpace(record.BranchName))
+            .ToDictionary(record => record.IssueId, record => record.BranchName!, StringComparer.Ordinal);
+
+        // The gate goes here, after every free check has already refused, because
+        // what it exists to bound is the confirming GitHub read below - not the
+        // local queries above, which answer "is there anything to confirm" for
+        // nothing. Taken earlier it would burn the slot on ticks that found no
+        // work, and then refuse the tick that did.
+        //
+        // Same clock as the parked-run sweep, and for the same reason: work this
+        // recovers has been stopped for a while by the time it is visible, so a
+        // five-minute cadence cannot make it late by anything that matters.
+        if (!gitHubPollCadence.TryEnter("unowned_pull_request_adoption", timeProvider.GetUtcNow(), ParkedRunSweepInterval))
+        {
+            return;
+        }
+
+        // Rows written before multi-repository tracking carry an empty repository
+        // and all belong to whichever repository was the only one at the time,
+        // which is the primary - the same fallback TrackerQuerySet.For makes.
+        var primaryRepositoryKey = TrackerQuerySet.KeyOf(queries.Primary);
+
+        foreach (var run in candidates)
+        {
+            var query = queries.For(run.Repository);
+            var repositoryKey = TrackerQuerySet.KeyOf(query);
+            var families = BranchFamiliesFor(
+                branchByIssueId.TryGetValue(run.IssueId, out var branchName) ? branchName : null,
+                run.IssueIdentifier);
+            if (families.Count == 0)
+            {
+                // No branch of its own and no issue number to derive one from:
+                // nothing here can tell this issue's pull request from anyone
+                // else's, and adopting the wrong one would review the wrong work.
+                continue;
+            }
+
+            var listedForRepository = snapshot
+                .Where(pullRequest => SnapshotBelongsTo(pullRequest.Repository, repositoryKey, primaryRepositoryKey))
+                .ToList();
+            var listed = FindOpenPullRequestForIssue(listedForRepository, families);
+            if (listed is null)
+            {
+                continue;
+            }
+
+            await TryAdoptUnownedPullRequestAsync(
+                query,
+                run,
+                listed.Number,
+                listed.HeadSha,
+                confirmed: null,
+                cancellationToken);
+        }
+    }
+
+    private static bool SnapshotBelongsTo(string? snapshotRepository, string repositoryKey, string primaryRepositoryKey) =>
+        string.IsNullOrWhiteSpace(snapshotRepository)
+            ? string.Equals(repositoryKey, primaryRepositoryKey, StringComparison.OrdinalIgnoreCase)
+            : string.Equals(snapshotRepository, repositoryKey, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Seeds a ledger at <see cref="PhaseStages.AwaitingReview"/> for a pull
+    /// request nothing owns, against its CURRENT head.
+    /// </summary>
+    /// <remarks>
+    /// The order is the point. The pull request is confirmed open at a specific
+    /// commit FIRST, and only then is the ledger written - a ledger row is durable
+    /// state that suppresses every other recovery for this issue, so writing one
+    /// against a pull request that has since been closed, or against a head that is
+    /// no longer current, would replace one silent stall with another.
+    /// </remarks>
+    /// <param name="confirmed">
+    /// A pull request status already read head-scoped from GitHub on this pass.
+    /// Supplied by the parked-run sweep, which has just asked by branch name; null
+    /// everywhere else, and then the confirming read is made here.
+    /// </param>
+    /// <returns>True when a ledger row was written.</returns>
+    private async Task<bool> TryAdoptUnownedPullRequestAsync(
+        TrackerQuery query,
+        RunEntity run,
+        int prNumber,
+        string? listedHeadSha,
+        PullRequestStatus? confirmed,
+        CancellationToken cancellationToken)
+    {
+        // Cheap refusal first. A head whose bounded attempts are already spent must
+        // not buy a GitHub read every sweep for ever; the confirming read below is
+        // only worth paying for when there is an attempt left to make.
+        if (confirmed is null &&
+            !string.IsNullOrWhiteSpace(listedHeadSha) &&
+            await IsAutomaticReviewRedispatchExhaustedAtHeadAsync(run.IssueId, listedHeadSha!, cancellationToken))
+        {
+            return false;
+        }
+
+        var pullRequest = confirmed;
+        if (pullRequest is null)
+        {
+            try
+            {
+                pullRequest = await trackerClient.FetchPullRequestStatusAsync(query, prNumber, cancellationToken);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                // A read that did not answer is UNKNOWN, not an answer. Ask again on
+                // the next sweep rather than seeding a ledger against a guess.
+                logger.LogWarning(
+                    ex,
+                    "Could not confirm PR #{PrNumber} before entering it into the pipeline for {IssueIdentifier}; leaving it unowned this sweep.",
+                    prNumber,
+                    run.IssueIdentifier);
+                return false;
+            }
+        }
+
+        if (pullRequest is null ||
+            IsTerminalPullRequestState(pullRequest.State) ||
+            string.IsNullOrWhiteSpace(pullRequest.HeadSha))
+        {
+            return false;
+        }
+
+        var headSha = pullRequest.HeadSha!;
+        var attempts = await CountAutomaticReviewDispatchesAtHeadAsync(run.IssueId, headSha, cancellationToken);
+        if (attempts >= MaxAutomaticReviewDispatchesPerHead)
+        {
+            await ReportAutomaticReviewRedispatchExhaustedAsync(
+                run.IssueId,
+                run.IssueIdentifier,
+                prNumber,
+                headSha,
+                attempts,
+                cancellationToken);
+            return false;
+        }
+
+        var nowUtc = timeProvider.GetUtcNow();
+
+        // The vendor that IMPLEMENTED, which is not necessarily the vendor of the
+        // newest run: a review run carries the reviewer's runner, and recording
+        // that as the implementer would send the re-dispatched review straight back
+        // to the vendor that wrote the code (ADR-006).
+        var implementationRuns = await dbContext.Runs
+            .Where(entry => entry.IssueId == run.IssueId && entry.Phase == RunPhaseNames.Implementation)
+            .ToListAsync(cancellationToken);
+        var implementer = implementationRuns
+            .OrderByDescending(entry => entry.CompletedAtUtc ?? entry.StartedAtUtc)
+            .Select(entry => entry.Runner)
+            .FirstOrDefault(AgentRunnerNames.IsKnown) ?? AgentRunnerNames.Codex;
+
+        // A draft is the author saying this is not ready to be read, so it enters at
+        // verify rather than at review - which is where the pipeline already waits
+        // for a draft to be marked ready, and where the stuck-stage backstop reports
+        // one that never is. Adopting it straight to review would spend a
+        // cross-vendor turn on work nobody has offered yet.
+        var stage = pullRequest.IsDraft ? PhaseStages.AwaitingVerify : PhaseStages.AwaitingReview;
+
+        dbContext.PhaseLedger.Add(new PhaseLedgerEntity
+        {
+            IssueId = run.IssueId,
+            IssueIdentifier = run.IssueIdentifier,
+            Repository = run.Repository,
+            Stage = stage,
+            PrNumber = prNumber,
+            HeadSha = headSha,
+            ImplementerRunner = implementer,
+            CreatedAtUtc = nowUtc,
+            UpdatedAtUtc = nowUtc
+        });
+
+        // The runs parked for the command center were parked because nothing owned
+        // the issue. Something owns it now, so the ask is answered - and until it
+        // is, the redispatch guard goes on refusing this issue and the attention
+        // panel goes on reporting a decision nobody has to make.
+        var parkedRuns = await dbContext.Runs
+            .Where(entry => entry.IssueId == run.IssueId && entry.Status == RunStatusNames.NeedsCommandCenter)
+            .ToListAsync(cancellationToken);
+        foreach (var parked in parkedRuns)
+        {
+            parked.Status = RunStatusNames.ResolvedByPhaseClear;
+            parked.CompletedAtUtc = nowUtc;
+        }
+
+        AddPhaseEvent(run.IssueId, run.IssueIdentifier, UnownedPullRequestAdoptedEventName,
+            $"PR #{prNumber} was open with no phase owning it, which is a review that was never dispatched rather " +
+            $"than a decision. Seeded at '{stage}' against its current head {Short(headSha)} " +
+            $"(attempt {attempts + 1} of {MaxAutomaticReviewDispatchesPerHead} at this head)." +
+            (parkedRuns.Count > 0
+                ? $" Also resolved {parkedRuns.Count} parked run{(parkedRuns.Count == 1 ? string.Empty : "s")}."
+                : string.Empty),
+            SerializeRedispatchState(prNumber, headSha));
+
+        await dbContext.SaveChangesAsync(cancellationToken);
+
+        logger.LogInformation(
+            "Entered unowned PR #{PrNumber} for {IssueIdentifier} into the phase pipeline at head {HeadSha}.",
+            prNumber,
+            run.IssueIdentifier,
+            headSha);
+        return true;
+    }
+
+    /// <summary>
+    /// How many times the plane has already put THIS head back into review by
+    /// itself, whichever recovery did it.
+    /// </summary>
+    /// <remarks>
+    /// One count over both events on purpose. Adopting an unowned pull request and
+    /// re-arming an escalated ledger are the same act from different starting
+    /// states, and counting them separately would let one issue alternate between
+    /// them and never exhaust either bound.
+    /// </remarks>
+    private async Task<int> CountAutomaticReviewDispatchesAtHeadAsync(
+        string issueId,
+        string headSha,
+        CancellationToken cancellationToken)
+    {
+        var recorded = await dbContext.EventLog
+            .AsNoTracking()
+            .Where(entry => entry.IssueId == issueId &&
+                            (entry.EventName == UnownedPullRequestAdoptedEventName ||
+                             entry.EventName == EscalationRearmedEventName))
+            .Select(entry => entry.DataJson)
+            .ToListAsync(cancellationToken);
+
+        return recorded.Count(json => HeadsMatch(headSha, ReadRedispatchHead(json)));
+    }
+
+    private async Task<bool> IsAutomaticReviewRedispatchExhaustedAtHeadAsync(
+        string issueId,
+        string headSha,
+        CancellationToken cancellationToken)
+    {
+        var recorded = await dbContext.EventLog
+            .AsNoTracking()
+            .Where(entry => entry.IssueId == issueId &&
+                            entry.EventName == AutomaticReviewRedispatchExhaustedEventName)
+            .Select(entry => entry.DataJson)
+            .ToListAsync(cancellationToken);
+
+        return recorded.Any(json => HeadsMatch(headSha, ReadRedispatchHead(json)));
+    }
+
+    /// <summary>
+    /// Says the automatic route is spent for this head, and hands the issue to a
+    /// person - once per head, not once per sweep.
+    /// </summary>
+    private async Task ReportAutomaticReviewRedispatchExhaustedAsync(
+        string issueId,
+        string issueIdentifier,
+        int prNumber,
+        string headSha,
+        int attempts,
+        CancellationToken cancellationToken)
+    {
+        if (await IsAutomaticReviewRedispatchExhaustedAtHeadAsync(issueId, headSha, cancellationToken))
+        {
+            return;
+        }
+
+        AddPhaseEvent(issueId, issueIdentifier, AutomaticReviewRedispatchExhaustedEventName,
+            $"PR #{prNumber} has been put back into review automatically {attempts} times at head {Short(headSha)} " +
+            "and has not got past it. The automatic route is spent for this commit.",
+            SerializeRedispatchState(prNumber, headSha));
+
+        await EscalateRunAsync(
+            issueId,
+            issueIdentifier,
+            $"PR #{prNumber} for {issueIdentifier} has been re-entered into review automatically {attempts} times at " +
+            $"head {Short(headSha)} - the bound for one commit - and no phase is advancing it even so. Re-dispatching " +
+            "it again would only repeat the same attempt. Close or merge the pull request, or post a command-center " +
+            "directive naming the phase to run against it.",
+            cancellationToken);
+    }
+
+    /// <summary>
+    /// The machine-readable body carried by every automatic review re-dispatch
+    /// event, and the thing the per-head bound is counted from.
+    ///
+    /// Public because it is a durable format rather than an implementation detail:
+    /// anything that has to recognise, count or seed one of these rows has to
+    /// produce the same shape, and a second hand-written copy of it is how a bound
+    /// silently starts counting nothing.
+    /// </summary>
+    public static string ReviewRedispatchStateJson(int prNumber, string headSha) =>
+        JsonSerializer.Serialize(new ReviewRedispatchState(prNumber, headSha));
+
+    private static string SerializeRedispatchState(int prNumber, string headSha) =>
+        ReviewRedispatchStateJson(prNumber, headSha);
+
+    private static string? ReadRedispatchHead(string? dataJson)
+    {
+        if (string.IsNullOrWhiteSpace(dataJson))
+        {
+            return null;
+        }
+
+        try
+        {
+            return JsonSerializer.Deserialize<ReviewRedispatchState>(dataJson)?.HeadSha;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Is this head a commit that arrived after every judgement the ledger carries?
+    /// </summary>
+    /// <remarks>
+    /// All three heads, not just the newest. A verdict is a fact about one commit,
+    /// and so is a rejection and so is a passed verify; a head matching ANY of them
+    /// is a commit the pipeline has already had its say about, and re-reviewing it
+    /// would ask a reviewer to repeat itself. A head matching none of them is work
+    /// that arrived after the escalation - which is what a bounded repair produces.
+    ///
+    /// A ledger carrying NO head at all answers no, and that guard is the whole
+    /// difference between a recovery and a loop. <c>string.Equals(head, null)</c> is
+    /// false, so without it a ledger that escalated before any head was recorded -
+    /// a verify that failed at the first stage, which is the commonest escalation
+    /// there is - reads as "the head moved" against every commit for ever, and
+    /// re-arms itself on the same tick that parked it. The same false comparison
+    /// waved a repair through onto unchanged rejected code once already; see
+    /// HandleWaitForRepairAsync.
+    /// </remarks>
+    private static bool HeadMovedPastEveryJudgement(PhaseLedgerEntity ledger, string? headSha)
+    {
+        if (string.IsNullOrWhiteSpace(headSha))
+        {
+            return false;
+        }
+
+        var judged = new[] { ledger.HeadSha, ledger.LastVerdictHeadSha, ledger.RejectedHeadSha }
+            .Where(head => !string.IsNullOrWhiteSpace(head))
+            .ToList();
+
+        return judged.Count > 0 && !judged.Any(head => HeadsMatch(headSha, head));
+    }
+
+    private static bool HeadsMatch(string? left, string? right) =>
+        !string.IsNullOrWhiteSpace(left) &&
+        !string.IsNullOrWhiteSpace(right) &&
+        string.Equals(left, right, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>The head one automatic review re-dispatch was made against.</summary>
+    private sealed record ReviewRedispatchState(int PrNumber, string HeadSha);
+
     // An escalated ledger is deliberately parked: the phase machine must not resume
     // it, because a person or a directive has to resolve it. But "parked" had been
     // implemented as "never looked at again", so once the PR it referred to was
@@ -513,12 +1001,37 @@ public sealed class PhaseOrchestrator(
             return;
         }
 
-        var openPullRequestNumbers = await ReadOpenPullRequestNumbersAsync(cancellationToken);
+        var openPullRequestSnapshot = await ReadOpenPullRequestSnapshotAsync(cancellationToken);
+        var openPullRequestNumbers = openPullRequestSnapshot.Select(pullRequest => pullRequest.Number).ToHashSet();
+        var primaryRepositoryKey = TrackerQuerySet.KeyOf(queries.Primary);
 
         foreach (var ledger in escalated)
         {
+            var query = queries.For(ledger.Repository);
+
             if (openPullRequestNumbers.Contains(ledger.PrNumber))
             {
+                // Still open, so the escalation is not resolved by events - unless
+                // the branch has moved since it was raised, which is a repair
+                // landing rather than a decision arriving.
+                //
+                // The snapshot's head decides only whether to ASK, never what the
+                // answer is: it is up to two minutes old, so it triggers the
+                // authoritative read below and is never acted on itself. Without a
+                // trigger, every escalated ledger would re-read its pull request on
+                // every tick to learn nothing had changed, which is three REST calls
+                // per ledger per fifteen seconds.
+                var listed = openPullRequestSnapshot.FirstOrDefault(pullRequest =>
+                    pullRequest.Number == ledger.PrNumber &&
+                    SnapshotBelongsTo(pullRequest.Repository, TrackerQuerySet.KeyOf(query), primaryRepositoryKey));
+
+                if (listed is not null &&
+                    HeadMovedPastEveryJudgement(ledger, listed.HeadSha) &&
+                    await TryRearmEscalatedLedgerAsync(query, ledger, confirmed: null, cancellationToken))
+                {
+                    cleared = true;
+                }
+
                 continue;
             }
 
@@ -526,7 +1039,7 @@ public sealed class PhaseOrchestrator(
             try
             {
                 pullRequest = await trackerClient.FetchPullRequestStatusAsync(
-                    queries.For(ledger.Repository),
+                    query,
                     ledger.PrNumber,
                     cancellationToken);
             }
@@ -546,8 +1059,25 @@ public sealed class PhaseOrchestrator(
 
             // Fail closed. Clearing an alarm we could not verify is worse than
             // leaving one up a little longer.
-            if (pullRequest is null || !IsTerminalPullRequestState(pullRequest.State))
+            if (pullRequest is null)
             {
+                continue;
+            }
+
+            if (!IsTerminalPullRequestState(pullRequest.State))
+            {
+                // Open after all - the snapshot is one page and did not reach it.
+                // The head test is free here, because the read it needs has just
+                // been made for a different question.
+                if (await TryRearmEscalatedLedgerAsync(
+                        query,
+                        ledger,
+                        confirmed: pullRequest,
+                        cancellationToken))
+                {
+                    cleared = true;
+                }
+
                 continue;
             }
 
@@ -587,6 +1117,134 @@ public sealed class PhaseOrchestrator(
         {
             await dbContext.SaveChangesAsync(cancellationToken);
         }
+    }
+
+    /// <summary>
+    /// Returns an escalated ledger to the pipeline when its pull request has moved
+    /// past the commit the escalation was about.
+    /// </summary>
+    /// <remarks>
+    /// A verdict is only ever a fact about one commit, and so is an escalation. The
+    /// bounded repair exists precisely to move the head, and half the deadlocked
+    /// items on 2026-09-06 arrived by a repair producing a new commit and then not
+    /// re-entering review - the ledger stayed parked at a judgement about a commit
+    /// that is no longer what would be merged.
+    ///
+    /// So a head that matches nothing the ledger has judged - not the head it
+    /// verified, not the head a verdict was given at, not the head that was
+    /// rejected - is a review that is owed, not a decision that is pending. It goes
+    /// back to verify, which is what re-establishes the exact-head chain before the
+    /// review runs again.
+    ///
+    /// Bounded on the same per-head count as adoption: a head that keeps coming
+    /// back is the same question, and asking a reviewer twice about a commit it has
+    /// already refused is not a recovery.
+    /// </remarks>
+    /// <param name="confirmed">
+    /// A pull request status already read this tick, or null to read one. The
+    /// caller only passes null once the snapshot has said the head looks moved, so
+    /// this read is triggered by evidence rather than taken on a clock.
+    /// </param>
+    private async Task<bool> TryRearmEscalatedLedgerAsync(
+        TrackerQuery query,
+        PhaseLedgerEntity ledger,
+        PullRequestStatus? confirmed,
+        CancellationToken cancellationToken)
+    {
+        var pullRequest = confirmed;
+        if (pullRequest is null)
+        {
+            // The snapshot is a page up to two minutes old. It is enough to decide
+            // that this is worth asking about; it is not enough to re-arm a phase
+            // on, so the head that gets acted on is read fresh.
+            try
+            {
+                pullRequest = await trackerClient.FetchPullRequestStatusAsync(query, ledger.PrNumber, cancellationToken);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(
+                    ex,
+                    "Could not check whether PR #{PrNumber} for {IssueIdentifier} has moved past its escalated head; leaving the escalation up.",
+                    ledger.PrNumber,
+                    ledger.IssueIdentifier);
+                return false;
+            }
+        }
+
+        // Fail closed. An escalation is a real ask of a person, and clearing one on
+        // a read that did not answer is worse than leaving it up a little longer.
+        if (pullRequest is null ||
+            IsTerminalPullRequestState(pullRequest.State) ||
+            string.IsNullOrWhiteSpace(pullRequest.HeadSha))
+        {
+            return false;
+        }
+
+        var headSha = pullRequest.HeadSha!;
+        if (!HeadMovedPastEveryJudgement(ledger, headSha))
+        {
+            // The escalation is about this exact commit. Nothing has changed, so it
+            // is still a decision and still a person's.
+            return false;
+        }
+
+        var attempts = await CountAutomaticReviewDispatchesAtHeadAsync(ledger.IssueId, headSha, cancellationToken);
+        if (attempts >= MaxAutomaticReviewDispatchesPerHead)
+        {
+            await ReportAutomaticReviewRedispatchExhaustedAsync(
+                ledger.IssueId,
+                ledger.IssueIdentifier,
+                ledger.PrNumber,
+                headSha,
+                attempts,
+                cancellationToken);
+            return false;
+        }
+
+        var judgedHead = ledger.RejectedHeadSha ?? ledger.LastVerdictHeadSha ?? ledger.HeadSha;
+        var nowUtc = timeProvider.GetUtcNow();
+
+        ledger.Stage = PhaseStages.AwaitingVerify;
+        ledger.UpdatedAtUtc = nowUtc;
+
+        // The ledger has stopped waiting, and nobody has seen a runner work: a push
+        // from outside the plane is no evidence at all about a vendor account's
+        // credit, so the hold is dropped without recording a recovery.
+        DropRunnerHold(ledger);
+
+        // Clear the RUN as well as the ledger. The owner attention panel is built
+        // from runs, so a ledger that quietly resumes while its run still reads
+        // needs_command_center leaves the page asking for a decision on work that
+        // is moving again.
+        var parkedRuns = await dbContext.Runs
+            .Where(run => run.IssueId == ledger.IssueId && run.Status == RunStatusNames.NeedsCommandCenter)
+            .ToListAsync(cancellationToken);
+        foreach (var parked in parkedRuns)
+        {
+            parked.Status = RunStatusNames.ResolvedByPhaseClear;
+            parked.CompletedAtUtc = nowUtc;
+        }
+
+        AddPhaseEvent(ledger.IssueId, ledger.IssueIdentifier, EscalationRearmedEventName,
+            $"PR #{ledger.PrNumber} has moved to {Short(headSha)} since it was escalated at {Short(judgedHead)}. " +
+            "A head that no verdict covers is a review that is owed, not a decision that is pending: re-verifying " +
+            $"before the review (attempt {attempts + 1} of {MaxAutomaticReviewDispatchesPerHead} at this head)." +
+            (parkedRuns.Count > 0
+                ? $" Also resolved {parkedRuns.Count} parked run{(parkedRuns.Count == 1 ? string.Empty : "s")}."
+                : string.Empty),
+            SerializeRedispatchState(ledger.PrNumber, headSha));
+
+        logger.LogInformation(
+            "Re-armed the phase pipeline for {IssueIdentifier}: PR #{PrNumber} moved to {HeadSha} after its escalation.",
+            ledger.IssueIdentifier,
+            ledger.PrNumber,
+            headSha);
+        return true;
     }
 
     /// <summary>
@@ -820,23 +1478,37 @@ public sealed class PhaseOrchestrator(
                         continue;
                     }
 
-                    if (FindOpenPullRequestForIssue(openPullRequests, families) is not null)
+                    var listed = FindOpenPullRequestForIssue(openPullRequests, families);
+                    if (listed is not null)
                     {
-                        // There IS something to close, which is the route that
-                        // already works. Leave it to the person or to the escalated
-                        // ledger reconciler once a ledger exists.
+                        // There IS a pull request, and no ledger row means no phase
+                        // owns it. That is the deadlock, not a decision: closing it
+                        // by hand used to be the only way out, every time (#94). Put
+                        // it into the pipeline at the review it is owed instead.
+                        if (await TryAdoptUnownedPullRequestAsync(
+                                query,
+                                run,
+                                listed.Number,
+                                listed.HeadSha,
+                                confirmed: null,
+                                cancellationToken))
+                        {
+                            repaired = true;
+                        }
+
                         continue;
                     }
 
-                    // Absence from that page is now the whole decision, so it has to
-                    // be confirmed rather than assumed. Ask the tracker for each of
-                    // this issue's branches by name - a head-scoped query, complete
-                    // by construction, and the same lookup ResolvePullRequestNumberAsync
-                    // trusts as definitive.
-                    bool confirmedAbsent;
+                    // Absence from that page decides two things now - whether to
+                    // un-park, and whether there is a pull request to adopt - so it
+                    // has to be confirmed rather than assumed. Ask the tracker for
+                    // each of this issue's branches by name: a head-scoped query,
+                    // complete by construction, and the same lookup
+                    // ResolvePullRequestNumberAsync trusts as definitive.
+                    PullRequestStatus? byBranch;
                     try
                     {
-                        confirmedAbsent = await HasNoOpenPullRequestOnAnyBranchAsync(
+                        byBranch = await FindOpenPullRequestOnAnyBranchAsync(
                             query,
                             families,
                             cancellationToken);
@@ -856,8 +1528,22 @@ public sealed class PhaseOrchestrator(
                         continue;
                     }
 
-                    if (!confirmedAbsent)
+                    if (byBranch is not null)
                     {
+                        // A pull request the scan did not list is still a pull
+                        // request, and this one was read head-scoped moments ago, so
+                        // it needs no second confirming read.
+                        if (await TryAdoptUnownedPullRequestAsync(
+                                query,
+                                run,
+                                byBranch.Number,
+                                byBranch.HeadSha,
+                                confirmed: byBranch,
+                                cancellationToken))
+                        {
+                            repaired = true;
+                        }
+
                         continue;
                     }
 
@@ -955,15 +1641,19 @@ public sealed class PhaseOrchestrator(
     }
 
     /// <summary>
-    /// True when the tracker confirms there is no open pull request on ANY of
-    /// these branches.
+    /// The open pull request on one of these branches, or null when the tracker
+    /// confirms there is none.
     ///
     /// Head-scoped, one query per branch, so the answer is complete for the name
     /// asked about rather than "whatever the first page happened to hold". Any
     /// failure propagates: the caller has to be able to tell "no pull request"
     /// apart from "could not ask".
+    ///
+    /// It returns the pull request rather than a bool because the caller now has
+    /// two things to do with the answer - leave a parked run up, or adopt the pull
+    /// request it names - and a bool could only express the first.
     /// </summary>
-    private async Task<bool> HasNoOpenPullRequestOnAnyBranchAsync(
+    private async Task<PullRequestStatus?> FindOpenPullRequestOnAnyBranchAsync(
         TrackerQuery query,
         IReadOnlyList<string> families,
         CancellationToken cancellationToken)
@@ -976,11 +1666,11 @@ public sealed class PhaseOrchestrator(
                 cancellationToken);
             if (pullRequest is not null)
             {
-                return false;
+                return pullRequest;
             }
         }
 
-        return true;
+        return null;
     }
 
     private static bool TryReadIssueNumber(string issueIdentifier, out string number)
@@ -1009,7 +1699,21 @@ public sealed class PhaseOrchestrator(
             (IssueStateMatcher.IsClosedState(terminalState) && IssueStateMatcher.IsClosedState(state)));
     }
 
-    private async Task<HashSet<int>> ReadOpenPullRequestNumbersAsync(CancellationToken cancellationToken)
+    /// <summary>
+    /// The newest open-pull-request snapshot the tick writes for the status page,
+    /// read back from the event log.
+    /// </summary>
+    /// <remarks>
+    /// Free - it costs no GitHub call, because the fetch has already happened -
+    /// and it names each pull request's number, repository, head branch and head
+    /// commit.
+    ///
+    /// It is ONE page per repository with no cursor behind it, and up to two
+    /// minutes old. So it is a POSITIVE signal only: every caller here decides on
+    /// a pull request being LISTED, never on one being absent, and confirms the
+    /// head against GitHub before writing anything durable against it.
+    /// </remarks>
+    private async Task<IReadOnlyList<OpenPullRequest>> ReadOpenPullRequestSnapshotAsync(CancellationToken cancellationToken)
     {
         var json = (await dbContext.EventLog
                 .AsNoTracking()
@@ -1026,8 +1730,7 @@ public sealed class PhaseOrchestrator(
 
         try
         {
-            var openPullRequests = JsonSerializer.Deserialize<List<OpenPullRequest>>(json);
-            return openPullRequests is null ? [] : [.. openPullRequests.Select(pr => pr.Number)];
+            return JsonSerializer.Deserialize<List<OpenPullRequest>>(json) ?? [];
         }
         catch (JsonException)
         {
@@ -1037,11 +1740,7 @@ public sealed class PhaseOrchestrator(
         }
     }
 
-    // A ledger at one of these stages has finished with its pull request. It is
-    // history, not work in progress, so it must not block a later cycle.
-    private static bool IsTerminalStage(string? stage) =>
-        string.Equals(stage, PhaseStages.Closed, StringComparison.Ordinal) ||
-        string.Equals(stage, PhaseStages.Merged, StringComparison.Ordinal);
+    private static bool IsTerminalStage(string? stage) => PhaseStages.IsTerminal(stage);
 
     private static bool IsTerminalPullRequestState(string? state) =>
         string.Equals(state, "MERGED", StringComparison.OrdinalIgnoreCase) ||
