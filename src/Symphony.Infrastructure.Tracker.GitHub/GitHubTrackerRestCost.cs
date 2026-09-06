@@ -125,6 +125,30 @@ public static class GitHubTrackerRestCost
                 $"{load.ParkedSweepBranchLookupsPerRepository} branch lookup(s) per repository per parked-run sweep"));
         }
 
+        // Both halves of the no-phase-owns-this recovery confirm a pull request at a
+        // specific head before writing anything durable against it (#94): entering
+        // an unowned pull request into the pipeline, and re-arming an escalated
+        // ledger whose head has moved. Neither is a poll - the first is bounded per
+        // head and stops once a ledger exists, and the second is triggered by the
+        // open-pull-request snapshot showing a head that no judgement covers. One
+        // such confirmation per repository per sweep is the pessimistic shape, not
+        // the expected one.
+        reads.Add(new RestReadCost(
+            GitHubRestCallSites.PullRequestByNumber,
+            RequestsPerCall: 1,
+            parkedSweeps,
+            $"one unowned/re-armed pull request confirmation per repository, modelled every {TrackerReadCadence.ParkedRunSweep.TotalSeconds:0}s"));
+        reads.Add(new RestReadCost(
+            GitHubRestCallSites.CommitStatus,
+            RequestsPerCall: 1,
+            parkedSweeps,
+            "commit status on the unowned/re-armed pull request confirmation"));
+        reads.Add(new RestReadCost(
+            GitHubRestCallSites.CommitCheckRuns,
+            RequestsPerCall: 1,
+            parkedSweeps,
+            "check runs on the unowned/re-armed pull request confirmation"));
+
         reads.Add(new RestReadCost(
             GitHubRestCallSites.PullRequestFiles,
             RequestsPerCall: 1,

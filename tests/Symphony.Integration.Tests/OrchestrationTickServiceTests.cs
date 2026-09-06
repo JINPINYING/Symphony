@@ -1603,18 +1603,20 @@ public sealed class OrchestrationTickServiceTests
         Assert.Equal(RunStatusNames.ResolvedByPhaseClear, run.Status);
     }
 
-    // With a pull request open on the issue's own branch there IS something for a
-    // person to close, and closing it is the route that already works. Clearing the
-    // run here would un-park an issue whose work is still in flight.
+    // A pull request open on the issue's own branch with no ledger row behind it is
+    // the deadlock, not a decision: the pull request blocks the issue and the issue
+    // cannot reach the pull request, and closing it by hand used to be the only way
+    // out. The sweep now enters it into the pipeline at the review it is owed (#94).
     [Fact]
-    public async Task RunTickAsync_ShouldLeaveAParkedRunAloneWhileItsBranchHasAnOpenPullRequest()
+    public async Task RunTickAsync_ShouldEnterAParkedIssuesUnownedPullRequestIntoThePipeline()
     {
         var tracker = new FakeTrackerClient([], new Dictionary<string, string> { ["issue-45"] = "Open" });
         tracker.OpenPullRequests =
         [
             new OpenPullRequest(146, "the work", "https://example.invalid/pull/146", "codex", false,
-                "SUCCESS", "MERGEABLE", DateTimeOffset.UtcNow, "", "symphony/45")
+                "SUCCESS", "MERGEABLE", DateTimeOffset.UtcNow, "", "symphony/45", "sha-146")
         ];
+        tracker.PullRequestStatusByNumber[146] = new PullRequestStatus(146, "OPEN", false, "sha-146", "SUCCESS", "MERGEABLE");
         await using var harness = await TestHarness.CreateAsync(
             BuildWorkflowDefinition(maxConcurrentAgents: 1),
             tracker,
@@ -1624,6 +1626,44 @@ public sealed class OrchestrationTickServiceTests
 
         await harness.Service.RunTickAsync(CancellationToken.None);
 
+        var ledger = Assert.Single(await harness.DbContext.PhaseLedger.ToListAsync());
+        Assert.Equal(PhaseStages.AwaitingReview, ledger.Stage);
+        Assert.Equal(146, ledger.PrNumber);
+        Assert.Equal("sha-146", ledger.HeadSha);
+
+        // The ask is answered: something owns the issue now, so the panel must stop
+        // reporting a decision nobody has to make.
+        var run = Assert.Single(await harness.DbContext.Runs.ToListAsync());
+        Assert.Equal(RunStatusNames.ResolvedByPhaseClear, run.Status);
+        Assert.Contains(
+            await harness.DbContext.EventLog.ToListAsync(),
+            entry => entry.EventName == PhaseOrchestrator.UnownedPullRequestAdoptedEventName);
+    }
+
+    // A pull request the plane cannot confirm is a pull request it must not seed a
+    // ledger against: a ledger row suppresses every other recovery for the issue, so
+    // one written on a stale page would replace one silent stall with another.
+    [Fact]
+    public async Task RunTickAsync_ShouldNotAdoptAnUnownedPullRequestItCannotConfirm()
+    {
+        var tracker = new FakeTrackerClient([], new Dictionary<string, string> { ["issue-45"] = "Open" });
+        tracker.OpenPullRequests =
+        [
+            new OpenPullRequest(146, "the work", "https://example.invalid/pull/146", "codex", false,
+                "SUCCESS", "MERGEABLE", DateTimeOffset.UtcNow, "", "symphony/45", "sha-146")
+        ];
+        // Closed between the page being taken and this read.
+        tracker.PullRequestStatusByNumber[146] = new PullRequestStatus(146, "CLOSED", false, "sha-146", "SUCCESS", "MERGEABLE");
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await SeedParkedRunWithNoLedgerAsync(harness);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Empty(await harness.DbContext.PhaseLedger.ToListAsync());
         var run = Assert.Single(await harness.DbContext.Runs.ToListAsync());
         Assert.Equal(RunStatusNames.NeedsCommandCenter, run.Status);
     }
@@ -1758,10 +1798,11 @@ public sealed class OrchestrationTickServiceTests
     }
 
     // A pull request the scan did not list is still a pull request. The head-scoped
-    // lookup is complete for the name it asks about, which is why the un-park is
-    // decided on that answer rather than on absence from a page.
+    // lookup is complete for the name it asks about, which is why both decisions -
+    // whether to un-park, and whether there is a pull request to adopt - are taken
+    // on that answer rather than on absence from a page.
     [Fact]
-    public async Task RunTickAsync_ShouldLeaveALedgerlessParkedRunUpWhenABranchLookupFindsAPullRequestTheScanMissed()
+    public async Task RunTickAsync_ShouldAdoptAPullRequestTheScanMissedButABranchLookupFound()
     {
         var tracker = new FakeTrackerClient([], new Dictionary<string, string> { ["issue-45"] = "Open" });
         tracker.PullRequestStatusByNumber[146] = new PullRequestStatus(146, "OPEN", false, "sha-146", "SUCCESS", "MERGEABLE");
@@ -1775,8 +1816,13 @@ public sealed class OrchestrationTickServiceTests
 
         await harness.Service.RunTickAsync(CancellationToken.None);
 
+        var ledger = Assert.Single(await harness.DbContext.PhaseLedger.ToListAsync());
+        Assert.Equal(PhaseStages.AwaitingReview, ledger.Stage);
+        Assert.Equal(146, ledger.PrNumber);
+        Assert.Equal("sha-146", ledger.HeadSha);
+
         var run = Assert.Single(await harness.DbContext.Runs.ToListAsync());
-        Assert.Equal(RunStatusNames.NeedsCommandCenter, run.Status);
+        Assert.Equal(RunStatusNames.ResolvedByPhaseClear, run.Status);
     }
 
     // A rate limit or a timeout is UNKNOWN, not "absent". Clearing an alarm we
@@ -1802,6 +1848,237 @@ public sealed class OrchestrationTickServiceTests
         Assert.DoesNotContain(
             await harness.DbContext.EventLog.ToListAsync(),
             entry => entry.EventName == PhaseOrchestrator.ParkedRunReconciledEventName);
+    }
+
+    // THE deadlock (#94). An issue with an open pull request, no phase ledger row
+    // and no running phase: the pull request correctly blocks re-dispatch, and
+    // nothing re-dispatches the review, because owning the issue is what a phase
+    // would have to do first. Ten of ten queued items sat in this state at once,
+    // each needing a hand-typed comment to escape.
+    //
+    // Deliberately parked for less than the parked-run sweep's two hours, so the
+    // only route open here is the one under test: the sweep that notices nothing
+    // owns an open pull request.
+    [Fact]
+    public async Task RunTickAsync_ShouldDispatchTheReviewForAnOpenPullRequestNoPhaseOwns()
+    {
+        var tracker = new FakeTrackerClient([], new Dictionary<string, string> { ["issue-45"] = "Open" });
+        tracker.OpenPullRequests =
+        [
+            new OpenPullRequest(146, "the work", "https://example.invalid/pull/146", "codex", false,
+                "SUCCESS", "MERGEABLE", DateTimeOffset.UtcNow, "", "symphony/45", "sha-146")
+        ];
+        tracker.PullRequestStatusByNumber[146] = new PullRequestStatus(146, "OPEN", false, "sha-146", "SUCCESS", "MERGEABLE");
+        tracker.IssuesById["issue-45"] = BuildIssue("issue-45", "#45", "Open", null);
+
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await SeedParkedRunWithNoLedgerAsync(harness, parkedAgo: TimeSpan.FromMinutes(20));
+
+        // The open-pull-request snapshot is written at the END of a tick, so the
+        // first tick is the one that makes the evidence and the second is the one
+        // that acts on it. No directive, no comment, no person.
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        Assert.Empty(await harness.DbContext.PhaseLedger.ToListAsync());
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var ledger = Assert.Single(await harness.DbContext.PhaseLedger.ToListAsync());
+        Assert.Equal(PhaseStages.Reviewing, ledger.Stage);
+        Assert.Equal(146, ledger.PrNumber);
+        Assert.Equal("sha-146", ledger.HeadSha);
+
+        // The cross-vendor rule holds: codex implemented, so claude reviews, at the
+        // exact head the ledger was seeded against.
+        var request = Assert.Single(harness.Coordinator.StartRequests);
+        Assert.Equal("claude", request.RunnerOverride);
+        Assert.NotNull(request.PromptOverride);
+        Assert.Contains(PhaseOrchestrator.ReviewVerdictMarker(146, "sha-146"), request.PromptOverride);
+
+        var adopted = Assert.Single(
+            await harness.DbContext.EventLog.ToListAsync(),
+            entry => entry.EventName == PhaseOrchestrator.UnownedPullRequestAdoptedEventName);
+        Assert.Equal(PhaseOrchestrator.ReviewRedispatchStateJson(146, "sha-146"), adopted.DataJson);
+    }
+
+    // A pull request whose head has moved past every judgement the ledger carries is
+    // a review that is owed, not a decision that is pending. That is what a bounded
+    // repair produces, and half the deadlocked items arrived by a repair moving the
+    // head and then nothing re-entering review.
+    [Fact]
+    public async Task RunTickAsync_ShouldReenterReviewWhenARepairMovesTheHeadOfAnEscalatedPullRequest()
+    {
+        var tracker = new FakeTrackerClient([]);
+        tracker.PullRequestStatusByNumber[112] = new PullRequestStatus(112, "OPEN", false, "eee999", "SUCCESS", "MERGEABLE");
+        tracker.IssuesById["issue-1"] = BuildIssue("issue-1", "#111", "Open", null);
+
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await SeedEscalatedLedgerAsync(harness, prNumber: 112);
+        var ledgerRow = await harness.DbContext.PhaseLedger.SingleAsync();
+        ledgerRow.LastVerdict = ReviewVerdicts.ChangesRequired;
+        ledgerRow.RejectedHeadSha = "dbbbae5c";
+        ledgerRow.RepairCount = 1;
+        harness.DbContext.Runs.Add(new RunEntity
+        {
+            Id = Guid.NewGuid().ToString("N"),
+            IssueId = "issue-1",
+            IssueIdentifier = "#111",
+            Phase = RunPhaseNames.Implementation,
+            Runner = "codex",
+            Status = RunStatusNames.NeedsCommandCenter,
+            EscalationPostedAtUtc = DateTimeOffset.UtcNow.AddMinutes(-30),
+            StartedAtUtc = DateTimeOffset.UtcNow.AddHours(-1),
+            CompletedAtUtc = DateTimeOffset.UtcNow.AddMinutes(-30),
+        });
+        await harness.DbContext.SaveChangesAsync();
+
+        await harness.Service.RunTickAsync(CancellationToken.None); // re-arm at the moved head
+        await harness.Service.RunTickAsync(CancellationToken.None); // verify the new head
+        await harness.Service.RunTickAsync(CancellationToken.None); // dispatch the review
+
+        var ledger = await harness.DbContext.PhaseLedger.SingleAsync();
+        Assert.Equal(PhaseStages.Reviewing, ledger.Stage);
+        Assert.Equal("eee999", ledger.HeadSha);
+
+        var request = Assert.Single(harness.Coordinator.StartRequests);
+        Assert.Contains(PhaseOrchestrator.ReviewVerdictMarker(112, "eee999"), request.PromptOverride);
+
+        Assert.Contains(
+            await harness.DbContext.EventLog.ToListAsync(),
+            entry => entry.EventName == PhaseOrchestrator.EscalationRearmedEventName);
+
+        // The escalation is over, so the panel that reads runs has to say so too.
+        var run = Assert.Single(await harness.DbContext.Runs.ToListAsync(), entity => entity.Phase == RunPhaseNames.Implementation);
+        Assert.Equal(RunStatusNames.ResolvedByPhaseClear, run.Status);
+    }
+
+    // An escalation about the commit that is still the head is a decision, and
+    // decisions are the owner's. Re-arming here would turn every merge-gate refusal
+    // into a silent retry of the same question.
+    [Fact]
+    public async Task RunTickAsync_ShouldNotReenterReviewWhileTheEscalatedHeadIsStillTheHead()
+    {
+        var tracker = new FakeTrackerClient([]);
+        tracker.PullRequestStatusByNumber[112] = new PullRequestStatus(112, "OPEN", false, "dbbbae5c", "SUCCESS", "MERGEABLE");
+
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await SeedEscalatedLedgerAsync(harness, prNumber: 112);
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var ledger = await harness.DbContext.PhaseLedger.SingleAsync();
+        Assert.Equal(PhaseStages.Escalated, ledger.Stage);
+        Assert.DoesNotContain(
+            await harness.DbContext.EventLog.ToListAsync(),
+            entry => entry.EventName == PhaseOrchestrator.EscalationRearmedEventName);
+    }
+
+    // The commonest escalation there is - verify failing at the first stage - leaves
+    // a ledger with no head recorded anywhere on it. string.Equals(head, null) is
+    // false, so an unguarded "has the head moved past every judgement" test answers
+    // yes against every commit, and the reconciler would re-arm the ledger on the
+    // same tick that parked it, for ever. The same false comparison once waved a
+    // repair through onto unchanged rejected code.
+    [Fact]
+    public async Task RunTickAsync_ShouldNotReenterReviewForAnEscalatedLedgerThatRecordsNoHeadAtAll()
+    {
+        var tracker = new FakeTrackerClient([]);
+        tracker.PullRequestStatusByNumber[112] = new PullRequestStatus(112, "OPEN", false, "ccc333", "SUCCESS", "MERGEABLE");
+
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        harness.DbContext.PhaseLedger.Add(new PhaseLedgerEntity
+        {
+            IssueId = "issue-1",
+            IssueIdentifier = "#111",
+            Stage = PhaseStages.Escalated,
+            PrNumber = 112,
+            HeadSha = null,
+            LastVerdictHeadSha = null,
+            RejectedHeadSha = null,
+            ImplementerRunner = "codex",
+            CreatedAtUtc = DateTimeOffset.UtcNow,
+            UpdatedAtUtc = DateTimeOffset.UtcNow,
+        });
+        await harness.DbContext.SaveChangesAsync();
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var ledger = await harness.DbContext.PhaseLedger.SingleAsync();
+        Assert.Equal(PhaseStages.Escalated, ledger.Stage);
+        Assert.DoesNotContain(
+            await harness.DbContext.EventLog.ToListAsync(),
+            entry => entry.EventName == PhaseOrchestrator.EscalationRearmedEventName);
+    }
+
+    // Nothing external has to change for the recovery to reach the same verdict
+    // again, so unbounded it would re-dispatch a genuinely broken pull request for
+    // ever and the owner would never see it. The bound is per head, and exhausting
+    // it escalates with the count rather than going quiet.
+    [Fact]
+    public async Task RunTickAsync_ShouldEscalateWithTheCountWhenTheAutomaticReviewRedispatchBoundIsSpent()
+    {
+        var tracker = new FakeTrackerClient([], new Dictionary<string, string> { ["issue-45"] = "Open" });
+        tracker.OpenPullRequests =
+        [
+            new OpenPullRequest(146, "the work", "https://example.invalid/pull/146", "codex", false,
+                "SUCCESS", "MERGEABLE", DateTimeOffset.UtcNow, "", "symphony/45", "sha-146")
+        ];
+        tracker.PullRequestStatusByNumber[146] = new PullRequestStatus(146, "OPEN", false, "sha-146", "SUCCESS", "MERGEABLE");
+
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker,
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await SeedParkedRunWithNoLedgerAsync(harness);
+
+        for (var attempt = 0; attempt < PhaseOrchestrator.MaxAutomaticReviewDispatchesPerHead; attempt++)
+        {
+            harness.DbContext.EventLog.Add(new EventLogEntity
+            {
+                IssueId = "issue-45",
+                IssueIdentifier = "#45",
+                EventName = PhaseOrchestrator.UnownedPullRequestAdoptedEventName,
+                Level = LogLevel.Information.ToString(),
+                Message = "already recovered once at this head",
+                DataJson = PhaseOrchestrator.ReviewRedispatchStateJson(146, "sha-146"),
+                OccurredAtUtc = DateTimeOffset.UtcNow.AddHours(-1)
+            });
+        }
+
+        await harness.DbContext.SaveChangesAsync();
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        Assert.Empty(await harness.DbContext.PhaseLedger.ToListAsync());
+
+        var events = await harness.DbContext.EventLog.ToListAsync();
+        var exhausted = Assert.Single(
+            events,
+            entry => entry.EventName == PhaseOrchestrator.AutomaticReviewRedispatchExhaustedEventName);
+        Assert.Contains($"{PhaseOrchestrator.MaxAutomaticReviewDispatchesPerHead} times", exhausted.Message);
+
+        var escalation = Assert.Single(events, entry => entry.EventName == PhaseOrchestrator.EscalationEventName);
+        Assert.Contains($"{PhaseOrchestrator.MaxAutomaticReviewDispatchesPerHead} times", escalation.Message);
+
+        var run = Assert.Single(await harness.DbContext.Runs.ToListAsync());
+        Assert.Equal(RunStatusNames.NeedsCommandCenter, run.Status);
     }
 
     private static async Task SeedParkedRunWithNoLedgerAsync(TestHarness harness, TimeSpan? parkedAgo = null)
@@ -3443,6 +3720,72 @@ public sealed class OrchestrationTickServiceTests
         Assert.Contains("close or merge PR #89", escalation.Message);
         Assert.Contains("command-center directive", escalation.Message);
         Assert.Contains("no phase is advancing it", escalation.Message);
+
+        // And it says WHICH: nothing owns this one, which is a different thing to
+        // tell a person than "a phase owns it and is stuck" (#94).
+        Assert.Contains("No phase owns this issue", escalation.Message);
+    }
+
+    // The same refusal with a phase behind it is a different report. An escalated
+    // ledger is a decision waiting on a person; saying only "no phase is advancing
+    // it" left the owner to work out which of the two they were looking at.
+    [Fact]
+    public async Task RunTickAsync_ShouldNameThePhaseThatOwnsTheIssueWhenRedispatchStaysBlocked()
+    {
+        var issueWithOpenPr = BuildIssue(
+            "issue-1",
+            "#1",
+            "Open",
+            null,
+            pullRequests: [new PullRequestRef("pr-1", 89, "OPEN", null, null, null)]);
+
+        await using var harness = await TestHarness.CreateAsync(
+            BuildWorkflowDefinition(maxConcurrentAgents: 1),
+            tracker: new FakeTrackerClient([issueWithOpenPr]),
+            coordinator: new FakeIssueExecutionCoordinator(FakeDispatchOutcome.LeaveRunning));
+
+        await harness.InsertRunAsync(
+            "issue-1",
+            "#1",
+            "Open",
+            "instance-1",
+            status: RunStatusNames.Succeeded,
+            completedAtUtc: DateTimeOffset.UtcNow.AddMinutes(-5));
+
+        harness.DbContext.PhaseLedger.Add(new PhaseLedgerEntity
+        {
+            IssueId = "issue-1",
+            IssueIdentifier = "#1",
+            Stage = PhaseStages.Escalated,
+            PrNumber = 89,
+            HeadSha = "aaa111",
+            ImplementerRunner = "codex",
+            CreatedAtUtc = DateTimeOffset.UtcNow.AddHours(-3),
+            UpdatedAtUtc = DateTimeOffset.UtcNow.AddHours(-3),
+        });
+        // The guard's clock is the first refusal recorded against THIS run, so the
+        // aged block has to carry the run id or it is not the same clock.
+        var blockedRun = await harness.DbContext.Runs.SingleAsync();
+        harness.DbContext.EventLog.Add(new EventLogEntity
+        {
+            IssueId = "issue-1",
+            IssueIdentifier = "#1",
+            RunId = blockedRun.Id,
+            EventName = "implementation_redispatch_blocked",
+            Level = LogLevel.Warning.ToString(),
+            Message = "blocked earlier",
+            OccurredAtUtc =
+                DateTimeOffset.UtcNow - OrchestrationTickService.RedispatchBlockTimeout - TimeSpan.FromMinutes(10)
+        });
+        await harness.DbContext.SaveChangesAsync();
+
+        await harness.Service.RunTickAsync(CancellationToken.None);
+
+        var escalation = Assert.Single(
+            await harness.DbContext.EventLog.ToListAsync(),
+            entry => entry.EventName == "needs_command_center");
+        Assert.Contains($"PR #89 is at stage '{PhaseStages.Escalated}'", escalation.Message);
+        Assert.DoesNotContain("No phase owns this issue", escalation.Message);
     }
 
     [Fact]
