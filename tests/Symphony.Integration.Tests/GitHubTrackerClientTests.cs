@@ -1022,12 +1022,13 @@ public sealed class GitHubTrackerClientTests
     public async Task TheBudgetHeadersAreRecordedForTheRawGraphQlTool(HttpStatusCode statusCode, string payload)
     {
         var observer = new RecordingRateLimitObserver();
+        var apiCalls = new RecordingApiCallObserver();
         using var httpClient = new HttpClient(new BudgetHeaderHandler(statusCode, payload))
         {
             BaseAddress = new Uri("https://api.github.com/graphql")
         };
 
-        var result = await new GitHubTrackerClient(httpClient, observer).ExecuteGitHubGraphQlAsync(
+        var result = await new GitHubTrackerClient(httpClient, observer, apiCalls).ExecuteGitHubGraphQlAsync(
             new TrackerQuery(
                 Endpoint: "https://api.github.com/graphql",
                 ApiKey: "token",
@@ -1046,6 +1047,11 @@ public sealed class GitHubTrackerClientTests
         Assert.Equal(5000, reading.Limit);
         Assert.Equal(5011, reading.Used);
         Assert.Equal(0, reading.Remaining);
+
+        var call = Assert.Single(apiCalls.Calls);
+        Assert.Equal(GitHubGraphQlCallSites.AgentExtension, call.CallSite);
+        Assert.Equal("graphql", call.Resource);
+        Assert.True(call.Charged);
     }
 
     private static string EnrichmentPayload(int blockerTotal, int blockerCount)
@@ -1105,7 +1111,12 @@ public sealed class GitHubTrackerClientTests
                 values.Contains("\"issues-v1\"", StringComparer.Ordinal))
             {
                 SecondRequestWasConditional = true;
-                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotModified));
+                var notModified = new HttpResponseMessage(HttpStatusCode.NotModified);
+                notModified.Headers.TryAddWithoutValidation("x-ratelimit-resource", "core");
+                notModified.Headers.TryAddWithoutValidation("x-ratelimit-limit", "5000");
+                notModified.Headers.TryAddWithoutValidation("x-ratelimit-used", "1");
+                notModified.Headers.TryAddWithoutValidation("x-ratelimit-remaining", "4999");
+                return Task.FromResult(notModified);
             }
 
             var response = new HttpResponseMessage(HttpStatusCode.OK)

@@ -27,9 +27,9 @@ namespace Symphony.Core.Models;
 /// unknown, and unknown must not be silently filed under either one.
 /// </param>
 /// <param name="Charged">
-/// False when GitHub answered <c>304 Not Modified</c> to a conditional request.
-/// GitHub does not charge a 304 against the primary rate limit, and the ledger
-/// this feeds proves that from the headers rather than trusting it.
+/// False when a conditional <c>304 Not Modified</c> response carried the same
+/// <c>x-ratelimit-used</c> value as the previous response for that resource.
+/// Without that header evidence, the attribution records the call as charged.
 /// </param>
 /// <param name="ObservedAtUtc">When the response arrived, so a rate can be computed across calls.</param>
 public sealed record GitHubApiCall(

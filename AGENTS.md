@@ -57,9 +57,10 @@ Locked on 2026-03-05:
 4. GitHub integration:
 - Configure the GraphQL endpoint (`https://api.github.com/graphql` by default); the REST
   root is derived from it.
-- Read over REST (`/repos/...`). The candidate scan, issue state, comments, pull requests
-  and checks all use the primary REST budget, because a rate-limited tracker blinds the
-  whole plane and GraphQL is the budget that runs out.
+- Read over REST (`/repos/...`) for fields REST can express. The candidate scan,
+  issue state, comments, pull requests and checks all use the primary REST budget,
+  which must be modelled and observed separately from GraphQL because exhausting
+  either budget blinds the tracker.
 - Use GraphQL only for writes and for the fields REST cannot express (`linkedBranches`,
   `blockedBy`, `closedByPullRequestsReferences`). Those are enrichment: they must degrade
   without stopping a dispatch.
@@ -71,9 +72,10 @@ Locked on 2026-03-05:
   - Page sizes are query variables, so the narrow first pass and the wide re-read are
     the same query text.
   - Cadences live in `TrackerReadCadence`, beside the arithmetic that decides whether
-    they are affordable. `GitHubTrackerGraphQlCost` models the steady-state hourly
-    cost from the query constants, and a test fails the build above
-    `TrackerReadCadence.ModelledHourlyCeiling`.
+    they are affordable. `GitHubTrackerGraphQlCost` and `GitHubTrackerRestCost`
+    model the steady-state hourly cost from the query constants, and tests fail
+    the build above `TrackerReadCadence.ModelledGraphQlHourlyCeiling` or
+    `TrackerReadCadence.ModelledCoreHourlyCeiling`.
   - Budget observation comes from the `x-ratelimit-*` headers on calls already being
     made, not from `/rate_limit` - whose top-level `rate` block is the core budget,
     not the GraphQL one that runs out.

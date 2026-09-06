@@ -54,6 +54,7 @@ public static class PhaseStages
 public sealed class PhaseOrchestrator(
     SymphonyDbContext dbContext,
     IGitHubTrackerClient trackerClient,
+    GitHubTrackerPollCadence gitHubPollCadence,
     TimeProvider timeProvider,
     ILogger<PhaseOrchestrator> logger)
 {
@@ -144,7 +145,6 @@ public sealed class PhaseOrchestrator(
     /// </summary>
     public static readonly TimeSpan ParkedRunReconcileDelay = StuckStageTimeout;
     private static readonly TimeSpan ParkedRunSweepInterval = TrackerReadCadence.ParkedRunSweep;
-    private DateTimeOffset nextParkedRunSweepUtc = DateTimeOffset.MinValue;
 
     private static string Humanise(TimeSpan span) =>
         span.TotalMinutes < 60 ? $"{(int)span.TotalMinutes} minutes"
@@ -674,12 +674,10 @@ public sealed class PhaseOrchestrator(
         CancellationToken cancellationToken)
     {
         var now = timeProvider.GetUtcNow();
-        if (now < nextParkedRunSweepUtc)
+        if (!gitHubPollCadence.TryEnter("parked_run_sweep", now, ParkedRunSweepInterval))
         {
             return false;
         }
-
-        nextParkedRunSweepUtc = now + ParkedRunSweepInterval;
 
         var parked = await dbContext.Runs
             .Where(run => run.Status == RunStatusNames.NeedsCommandCenter)
@@ -1063,8 +1061,18 @@ public sealed class PhaseOrchestrator(
 
         foreach (var ledger in activeLedgers)
         {
+            var shouldMarkPoll = false;
+            var pollStartedAtUtc = timeProvider.GetUtcNow();
+            var polledStage = ledger.Stage;
+            var polledUpdatedAtUtc = ledger.UpdatedAtUtc;
             try
             {
+                if (!gitHubPollCadence.ShouldPollPhaseLedger(ledger, pollStartedAtUtc))
+                {
+                    continue;
+                }
+
+                shouldMarkPoll = true;
                 await AdvanceOneAsync(
                     workflowDefinition,
                     queries.For(ledger.Repository),
@@ -1083,6 +1091,17 @@ public sealed class PhaseOrchestrator(
                     "Phase advance failed for {IssueIdentifier} (stage {Stage}); will retry next tick.",
                     ledger.IssueIdentifier,
                     ledger.Stage);
+            }
+            finally
+            {
+                if (shouldMarkPoll && !cancellationToken.IsCancellationRequested)
+                {
+                    gitHubPollCadence.MarkPhaseLedgerPolled(
+                        ledger,
+                        polledStage,
+                        polledUpdatedAtUtc,
+                        pollStartedAtUtc);
+                }
             }
         }
     }

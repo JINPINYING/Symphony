@@ -31,14 +31,15 @@ public static class TrackerReadCadence
     /// status and a check-run listing. Four ledgers at 15 seconds is 2,880 core
     /// points an hour on its own, over half the budget, for a question whose
     /// answer is "still waiting" nearly every time. Nothing in the phase machine
-    /// moves faster than a minute: its own backstop is two hours, the candidate
-    /// scan beside it is 60 seconds, and CI takes minutes.
+    /// waits on GitHub evidence that moves faster than a couple of minutes: its
+    /// own backstop is two hours, the candidate scan beside it is 60 seconds, and
+    /// CI takes minutes.
     ///
     /// The interval is a floor on POLLING, not on progress: a ledger whose row
     /// has changed since its last read is re-read at once, so a stage transition
     /// is never made to wait for a clock.
     /// </summary>
-    public static readonly TimeSpan PhaseLedgerPoll = TimeSpan.FromSeconds(60);
+    public static readonly TimeSpan PhaseLedgerPoll = TimeSpan.FromMinutes(2);
 
     /// <summary>
     /// How often one escalated issue's comments are re-read looking for a

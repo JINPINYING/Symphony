@@ -88,8 +88,8 @@ public sealed class GitHubApiCallBudget(TimeProvider timeProvider) : IGitHubApiC
     private static GitHubApiCallBudgetSnapshot Describe(string callSite, string resource, Window window)
     {
         var elapsed = window.LastObservedAtUtc - window.FirstObservedAtUtc;
-        var pointsPerHour = elapsed >= TimeSpan.FromMinutes(1) && window.ChargedCalls > 0
-            ? window.ChargedCalls * TimeSpan.FromHours(1).TotalSeconds / elapsed.TotalSeconds
+        var pointsPerHour = elapsed >= TimeSpan.FromMinutes(1) && window.ChargedCalls > 1
+            ? (window.ChargedCalls - 1) * TimeSpan.FromHours(1).TotalSeconds / elapsed.TotalSeconds
             : (double?)null;
 
         return new GitHubApiCallBudgetSnapshot(

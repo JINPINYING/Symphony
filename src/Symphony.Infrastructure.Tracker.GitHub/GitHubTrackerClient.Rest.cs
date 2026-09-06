@@ -13,13 +13,11 @@ namespace Symphony.Infrastructure.Tracker.GitHub;
 /// <summary>
 /// The tracker's READ transport.
 ///
-/// WHY THIS EXISTS. Every read used to be a GraphQL call, and GraphQL is the
-/// budget this token exhausts: on 2026-09-03 the tracker went blind twice on
-/// "API rate limit already exceeded" while the REST budget sat at 4999/5000 all
-/// day, untouched. The component whose failure stops every dispatch was the one
-/// most exposed to the limit that keeps being hit, and its retries were
-/// themselves GraphQL calls - once throttled it spent its recovery budget
-/// confirming it was throttled.
+/// WHY THIS EXISTS. Every read used to be a GraphQL call, and the tracker went
+/// blind twice on 2026-09-03 on "API rate limit already exceeded" while the REST
+/// budget sat at 4999/5000 all day, untouched. The lesson is not that only one
+/// budget matters: exhausting either core or GraphQL blinds the plane. Reads that
+/// REST can express stay on REST and both resources are measured separately.
 ///
 /// So the reads that decide whether the plane can work at all - the candidate
 /// scan, issue state, pull requests, checks and comments - are answered from
@@ -34,6 +32,8 @@ public sealed partial class GitHubTrackerClient
     private const string RestAcceptHeader = "application/vnd.github+json";
     private const string RestApiVersionHeaderName = "X-GitHub-Api-Version";
     private const string RestApiVersion = "2022-11-28";
+    private readonly object rateLimitHeaderGate = new();
+    private readonly Dictionary<string, int> lastUsedByResource = new(StringComparer.Ordinal);
 
     // Upper bound on pages walked for one listing. At 100 records per page this is
     // five thousand, far beyond any repository Symphony tracks; it exists so a
@@ -319,10 +319,8 @@ public sealed partial class GitHubTrackerClient
     private void ObserveResponse(HttpResponseMessage response, string callSite, bool notModified)
     {
         var observedAt = DateTimeOffset.UtcNow;
-        var resource = ReadHeaderString(response, "x-ratelimit-resource");
-        var normalisedResource = string.IsNullOrWhiteSpace(resource)
-            ? GitHubApiCall.UnknownResource
-            : resource.Trim().ToLowerInvariant();
+        var rateLimit = ReadRateLimitHeaders(response);
+        var charged = DetermineCharged(rateLimit, notModified);
 
         // Attribution first, and unconditionally. A response whose budget headers
         // were stripped still spent a point somewhere, and the call it belongs to
@@ -334,8 +332,8 @@ public sealed partial class GitHubTrackerClient
             {
                 apiCallObserver.Record(new GitHubApiCall(
                     callSite,
-                    normalisedResource,
-                    Charged: !notModified,
+                    rateLimit.Resource,
+                    Charged: charged,
                     observedAt));
             }
             catch (Exception)
@@ -345,74 +343,54 @@ public sealed partial class GitHubTrackerClient
             }
         }
 
-        if (rateLimitObserver is null)
-        {
-            return;
-        }
-
-        var limit = ReadHeaderInt(response, "x-ratelimit-limit");
-        var used = ReadHeaderInt(response, "x-ratelimit-used");
-        var remaining = ReadHeaderInt(response, "x-ratelimit-remaining");
-        if (limit is null || used is null || remaining is null)
-        {
-            return;
-        }
-
-        var reset = ReadHeaderLong(response, "x-ratelimit-reset");
-
-        try
-        {
-            rateLimitObserver.Record(new GitHubRateLimitReading(
-                normalisedResource,
-                limit.Value,
-                used.Value,
-                remaining.Value,
-                reset is null ? null : DateTimeOffset.FromUnixTimeSeconds(reset.Value),
-                observedAt));
-        }
-        catch (Exception)
-        {
-            // Telemetry taken on the way past a real read. Losing the telemetry
-            // must never lose the read.
-        }
+        RecordRateLimit(rateLimit, observedAt);
     }
 
-    private void RecordRateLimit(HttpResponseMessage response)
+    private void ObserveGraphQlResponse(HttpResponseMessage response, string callSite)
     {
         var observedAt = DateTimeOffset.UtcNow;
-        var resource = ReadHeaderString(response, "x-ratelimit-resource");
-        var normalisedResource = string.IsNullOrWhiteSpace(resource)
-            ? GitHubApiCall.UnknownResource
-            : resource.Trim().ToLowerInvariant();
+        var rateLimit = ReadRateLimitHeaders(response);
 
-        RecordRateLimit(response, normalisedResource, observedAt);
+        if (apiCallObserver is not null)
+        {
+            try
+            {
+                apiCallObserver.Record(new GitHubApiCall(
+                    callSite,
+                    rateLimit.Resource,
+                    Charged: true,
+                    observedAt));
+            }
+            catch (Exception)
+            {
+                // Telemetry taken on the way past a real read. Losing the telemetry
+                // must never lose the read.
+            }
+        }
+
+        RecordRateLimit(rateLimit, observedAt);
     }
 
-    private void RecordRateLimit(HttpResponseMessage response, string normalisedResource, DateTimeOffset observedAt)
+    private void RecordRateLimit(RateLimitHeaders rateLimit, DateTimeOffset observedAt)
     {
         if (rateLimitObserver is null)
         {
             return;
         }
 
-        var limit = ReadHeaderLong(response, "x-ratelimit-limit");
-        var used = ReadHeaderLong(response, "x-ratelimit-used");
-        var remaining = ReadHeaderLong(response, "x-ratelimit-remaining");
-        if (limit is null || used is null || remaining is null)
+        if (rateLimit.Limit is null || rateLimit.Used is null || rateLimit.Remaining is null)
         {
             return;
         }
 
-        var reset = ReadHeaderLong(response, "x-ratelimit-reset");
-
         try
         {
             rateLimitObserver.Record(new GitHubRateLimitReading(
-                normalisedResource,
-                checked((int)limit.Value),
-                checked((int)used.Value),
-                checked((int)remaining.Value),
-                reset is null ? null : DateTimeOffset.FromUnixTimeSeconds(reset.Value),
+                rateLimit.Resource,
+                rateLimit.Limit.Value,
+                rateLimit.Used.Value,
+                rateLimit.Remaining.Value,
+                rateLimit.Reset,
                 observedAt));
         }
         catch (Exception)
@@ -422,6 +400,50 @@ public sealed partial class GitHubTrackerClient
             // tracker outage.
         }
     }
+
+    private bool DetermineCharged(RateLimitHeaders rateLimit, bool notModified)
+    {
+        if (rateLimit.Used is null)
+        {
+            return true;
+        }
+
+        lock (rateLimitHeaderGate)
+        {
+            var hasPrevious = lastUsedByResource.TryGetValue(rateLimit.Resource, out var previousUsed);
+            lastUsedByResource[rateLimit.Resource] = rateLimit.Used.Value;
+
+            if (!notModified)
+            {
+                return true;
+            }
+
+            return !hasPrevious || previousUsed != rateLimit.Used.Value;
+        }
+    }
+
+    private static RateLimitHeaders ReadRateLimitHeaders(HttpResponseMessage response)
+    {
+        var resource = ReadHeaderString(response, "x-ratelimit-resource");
+        var normalisedResource = string.IsNullOrWhiteSpace(resource)
+            ? GitHubApiCall.UnknownResource
+            : resource.Trim().ToLowerInvariant();
+        var reset = ReadHeaderLong(response, "x-ratelimit-reset");
+
+        return new RateLimitHeaders(
+            normalisedResource,
+            ReadHeaderInt(response, "x-ratelimit-limit"),
+            ReadHeaderInt(response, "x-ratelimit-used"),
+            ReadHeaderInt(response, "x-ratelimit-remaining"),
+            reset is null ? null : DateTimeOffset.FromUnixTimeSeconds(reset.Value));
+    }
+
+    private sealed record RateLimitHeaders(
+        string Resource,
+        int? Limit,
+        int? Used,
+        int? Remaining,
+        DateTimeOffset? Reset);
 
     private static string? ReadHeaderString(HttpResponseMessage response, string name) =>
         response.Headers.TryGetValues(name, out var values) ? values.FirstOrDefault() : null;

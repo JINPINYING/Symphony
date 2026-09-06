@@ -149,6 +149,7 @@ internal static class SymphonyHostApplication
         services.AddSingleton<GitHubApiCallBudget>();
         services.AddSingleton<IGitHubApiCallObserver>(
             provider => provider.GetRequiredService<GitHubApiCallBudget>());
+        services.AddSingleton<GitHubTrackerPollCadence>();
         services.AddScoped<EscalationPublisher>();
         services.AddScoped<DirectiveProcessor>();
         services.AddScoped<PhaseOrchestrator>();

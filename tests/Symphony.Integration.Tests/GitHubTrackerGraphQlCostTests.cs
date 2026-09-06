@@ -52,7 +52,7 @@ public sealed class GitHubTrackerGraphQlCostTests
         Assert.Equal(TimeSpan.FromSeconds(60), TrackerReadCadence.CandidateScan);
         Assert.Equal(60d, TrackerReadCadence.CallsPerHour(TrackerReadCadence.CandidateScan));
         Assert.Equal(30d, TrackerReadCadence.CallsPerHour(TrackerReadCadence.OpenPullRequestPoll));
-        Assert.Equal(60d, TrackerReadCadence.CallsPerHour(TrackerReadCadence.PhaseLedgerPoll));
+        Assert.Equal(30d, TrackerReadCadence.CallsPerHour(TrackerReadCadence.PhaseLedgerPoll));
         Assert.Equal(60d, TrackerReadCadence.CallsPerHour(TrackerReadCadence.EscalatedIssueDirectivePoll));
         Assert.Equal(12d, TrackerReadCadence.CallsPerHour(TrackerReadCadence.ParkedRunSweep));
     }

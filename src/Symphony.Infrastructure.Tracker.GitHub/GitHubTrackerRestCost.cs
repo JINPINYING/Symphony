@@ -84,6 +84,11 @@ public static class GitHubTrackerRestCost
                 RequestsPerCall: 1,
                 phasePolls * load.ActivePhaseLedgers,
                 $"{load.ActivePhaseLedgers} active phase ledgers, check runs every {TrackerReadCadence.PhaseLedgerPoll.TotalSeconds:0}s"));
+            reads.Add(new RestReadCost(
+                GitHubRestCallSites.IssueComments,
+                RequestsPerCall: 2,
+                phasePolls * load.ActivePhaseLedgers,
+                $"{load.ActivePhaseLedgers} active phase ledgers may wait on review or repair comments every {TrackerReadCadence.PhaseLedgerPoll.TotalSeconds:0}s"));
         }
 
         if (load.EscalatedIssues > 0)
@@ -95,9 +100,9 @@ public static class GitHubTrackerRestCost
                 $"{load.EscalatedIssues} escalated issue(s), comments may walk two pages every {TrackerReadCadence.EscalatedIssueDirectivePoll.TotalSeconds:0}s"));
             reads.Add(new RestReadCost(
                 GitHubRestCallSites.IssueCommentMarker,
-                RequestsPerCall: 1,
+                RequestsPerCall: 2,
                 directivePolls * load.EscalatedIssues,
-                $"{load.EscalatedIssues} pending escalation marker probe(s) per directive poll"));
+                $"{load.EscalatedIssues} pending escalation marker probe(s) read the issue plus comment pages per directive poll"));
         }
 
         reads.Add(new RestReadCost(

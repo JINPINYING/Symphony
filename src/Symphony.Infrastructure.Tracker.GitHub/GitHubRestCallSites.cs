@@ -80,6 +80,12 @@ public static class GitHubGraphQlCallSites
     /// <summary>The three issue fields REST cannot express, fetched per scan.</summary>
     public const string Enrichment = "graphql:issue_enrichment";
 
+    /// <summary>An issue's comments, when REST cannot address the issue by number.</summary>
+    public const string IssueComments = "graphql:issue_comments";
+
+    /// <summary>The comment-marker probe, when REST cannot address the issue by number.</summary>
+    public const string IssueCommentMarker = "graphql:issue_comment_marker";
+
     /// <summary>Issue state for ids whose issue number the caller could not name.</summary>
     public const string IssueStatesByIds = "graphql:issue_states_by_ids";
 
@@ -91,4 +97,15 @@ public static class GitHubGraphQlCallSites
 
     /// <summary>A GraphQL document an agent asked the plane to execute for it.</summary>
     public const string AgentExtension = "graphql:agent_extension";
+
+    public static IReadOnlyList<string> All { get; } =
+    [
+        Enrichment,
+        IssueComments,
+        IssueCommentMarker,
+        IssueStatesByIds,
+        IssuesByIds,
+        Mutation,
+        AgentExtension
+    ];
 }

@@ -192,7 +192,7 @@ public sealed class GitHubRateLimitBudgetTests
         Assert.Equal("core", snapshot.Resource);
         Assert.Equal(2, snapshot.ChargedCalls);
         Assert.Equal(1, snapshot.NotModifiedCalls);
-        Assert.Equal(4d, snapshot.PointsPerHour!.Value, 3);
+        Assert.Equal(2d, snapshot.PointsPerHour!.Value, 3);
     }
 
     /// <summary>
