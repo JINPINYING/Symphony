@@ -981,6 +981,34 @@ public sealed class GitHubTrackerClientTests
         Assert.Equal(100.2, latest.UsedPercent);
     }
 
+    [Fact]
+    public async Task ConditionalRestReadsReplayTheCachedBodyAndRecordAnUnchargedCall()
+    {
+        var observer = new RecordingApiCallObserver();
+        var handler = new ConditionalRestHandler(OneRestIssue, EnrichmentPayload(blockerTotal: 0, blockerCount: 0));
+        using var httpClient = new HttpClient(handler);
+        var client = new GitHubTrackerClient(
+            httpClient,
+            rateLimitObserver: null,
+            apiCallObserver: observer,
+            conditionalRequests: new GitHubConditionalRequestCache());
+
+        var first = await client.FetchCandidateIssuesAsync(OneRepositoryQuery());
+        var second = await client.FetchCandidateIssuesAsync(OneRepositoryQuery());
+
+        Assert.Equal("#101", Assert.Single(first).Identifier);
+        Assert.Equal("#101", Assert.Single(second).Identifier);
+        Assert.Equal(2, handler.RestRequests.Count);
+        Assert.True(handler.SecondRequestWasConditional);
+
+        var restCalls = observer.Calls
+            .Where(call => call.CallSite == GitHubRestCallSites.CandidateScan)
+            .ToList();
+        Assert.Equal(2, restCalls.Count);
+        Assert.True(restCalls[0].Charged);
+        Assert.False(restCalls[1].Charged);
+    }
+
     /// <summary>
     /// The raw <c>github_graphql</c> tool spends from the same 5,000-point hourly
     /// budget as every scan, and it is the one path that cannot go through the
@@ -1046,6 +1074,51 @@ public sealed class GitHubTrackerClientTests
         public List<GitHubRateLimitReading> Readings { get; } = [];
 
         public void Record(GitHubRateLimitReading reading) => Readings.Add(reading);
+    }
+
+    private sealed class RecordingApiCallObserver : Symphony.Core.Abstractions.IGitHubApiCallObserver
+    {
+        public List<GitHubApiCall> Calls { get; } = [];
+
+        public void Record(GitHubApiCall call) => Calls.Add(call);
+    }
+
+    private sealed class ConditionalRestHandler(string restJson, string graphQlJson) : HttpMessageHandler
+    {
+        public List<string> RestRequests { get; } = [];
+        public bool SecondRequestWasConditional { get; private set; }
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            var url = request.RequestUri!.ToString();
+            if (url.EndsWith("/graphql", StringComparison.OrdinalIgnoreCase))
+            {
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(graphQlJson, Encoding.UTF8, "application/json")
+                });
+            }
+
+            RestRequests.Add(url);
+            if (RestRequests.Count == 2 &&
+                request.Headers.TryGetValues("If-None-Match", out var values) &&
+                values.Contains("\"issues-v1\"", StringComparer.Ordinal))
+            {
+                SecondRequestWasConditional = true;
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotModified));
+            }
+
+            var response = new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(restJson, Encoding.UTF8, "application/json")
+            };
+            response.Headers.TryAddWithoutValidation("ETag", "\"issues-v1\"");
+            response.Headers.TryAddWithoutValidation("x-ratelimit-resource", "core");
+            response.Headers.TryAddWithoutValidation("x-ratelimit-limit", "5000");
+            response.Headers.TryAddWithoutValidation("x-ratelimit-used", RestRequests.Count.ToString());
+            response.Headers.TryAddWithoutValidation("x-ratelimit-remaining", (5000 - RestRequests.Count).ToString());
+            return Task.FromResult(response);
+        }
     }
 
     /// <summary>

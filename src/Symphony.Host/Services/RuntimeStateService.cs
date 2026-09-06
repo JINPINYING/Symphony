@@ -13,6 +13,7 @@ public sealed class RuntimeStateService(
     IWatchedTaskReader watchedTaskReader,
     TrackerReachability trackerReachability,
     GitHubRateLimitBudget gitHubRateLimitBudget,
+    GitHubApiCallBudget gitHubApiCallBudget,
     TimeProvider timeProvider)
 {
     // A malformed or older snapshot must never take the page down. An empty list
@@ -592,6 +593,16 @@ public sealed class RuntimeStateService(
                 burn_points_per_hour = budget.BurnPointsPerHour,
                 projected_exhaustion_at = budget.ProjectedExhaustionUtc?.ToString("o"),
                 attention = budget.UsedPercent >= GitHubRateLimitBudget.AttentionPercent
+            }),
+            github_api_calls = gitHubApiCallBudget.Current.Select(call => new
+            {
+                call_site = call.CallSite,
+                resource = call.Resource,
+                charged_calls = call.ChargedCalls,
+                not_modified_calls = call.NotModifiedCalls,
+                first_observed_at = call.FirstObservedAtUtc.ToString("o"),
+                last_observed_at = call.LastObservedAtUtc.ToString("o"),
+                points_per_hour = call.PointsPerHour
             }),
             watched_tasks = watchedTasks.Select(task => new
             {

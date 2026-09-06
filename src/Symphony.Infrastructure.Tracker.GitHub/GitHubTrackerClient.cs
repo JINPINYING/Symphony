@@ -15,7 +15,16 @@ public sealed partial class GitHubTrackerClient(
     // every test does that - while the host injects the singleton that keeps the
     // readings. The adapter reads the budget headers because it is the only thing
     // holding the response; it does not decide what they mean.
-    IGitHubRateLimitObserver? rateLimitObserver = null) : ITrackerClient, IGitHubTrackerClient
+    IGitHubRateLimitObserver? rateLimitObserver = null,
+    // Where each call is attributed. The headers say how much of a budget is
+    // gone; only this says what took it, which is the question four fixes in five
+    // days failed to ask before moving load from one budget to the other.
+    IGitHubApiCallObserver? apiCallObserver = null,
+    // Absent means "no conditional requests": every read is unconditional and
+    // charged, which is what the adapter did before 2026-09-06. The host injects
+    // the singleton so validators survive between ticks - a per-tick cache would
+    // never revalidate anything.
+    GitHubConditionalRequestCache? conditionalRequests = null) : ITrackerClient, IGitHubTrackerClient
 {
     // Field selection for the by-ids fallback, which is the only issue read still
     // served by GraphQL - and only when the caller cannot name the issue number

@@ -1,5 +1,6 @@
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
+using Symphony.Core.Configuration;
 using Symphony.Core.Models;
 using Symphony.Infrastructure.Persistence.Sqlite;
 using Symphony.Infrastructure.Persistence.Sqlite.Entities;
@@ -142,6 +143,8 @@ public sealed class PhaseOrchestrator(
     /// cannot happen again.
     /// </summary>
     public static readonly TimeSpan ParkedRunReconcileDelay = StuckStageTimeout;
+    private static readonly TimeSpan ParkedRunSweepInterval = TrackerReadCadence.ParkedRunSweep;
+    private DateTimeOffset nextParkedRunSweepUtc = DateTimeOffset.MinValue;
 
     private static string Humanise(TimeSpan span) =>
         span.TotalMinutes < 60 ? $"{(int)span.TotalMinutes} minutes"
@@ -670,6 +673,14 @@ public sealed class PhaseOrchestrator(
         TrackerQuerySet queries,
         CancellationToken cancellationToken)
     {
+        var now = timeProvider.GetUtcNow();
+        if (now < nextParkedRunSweepUtc)
+        {
+            return false;
+        }
+
+        nextParkedRunSweepUtc = now + ParkedRunSweepInterval;
+
         var parked = await dbContext.Runs
             .Where(run => run.Status == RunStatusNames.NeedsCommandCenter)
             .ToListAsync(cancellationToken);
@@ -687,7 +698,6 @@ public sealed class PhaseOrchestrator(
                 .ToListAsync(cancellationToken))
             .ToHashSet(StringComparer.Ordinal);
 
-        var now = timeProvider.GetUtcNow();
         var candidates = parked
             .Where(run => !ledgeredIssueIds.Contains(run.IssueId))
             .Where(run => now - ParkedSince(run) >= ParkedRunReconcileDelay)

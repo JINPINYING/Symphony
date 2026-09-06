@@ -176,6 +176,25 @@ public sealed class GitHubRateLimitBudgetTests
         Assert.Null(Assert.Single(slow.Current).ProjectedExhaustionUtc);
     }
 
+    [Fact]
+    public void ApiCallBudgetAttributesChargedCallsBySiteAndResource()
+    {
+        var clock = new MovableClock(Start);
+        var budget = new GitHubApiCallBudget(clock);
+
+        budget.Record(new GitHubApiCall("rest:candidate_scan", "core", Charged: true, Start));
+        clock.Advance(TimeSpan.FromMinutes(30));
+        budget.Record(new GitHubApiCall("rest:candidate_scan", "core", Charged: true, Start.AddMinutes(30)));
+        budget.Record(new GitHubApiCall("rest:candidate_scan", "core", Charged: false, Start.AddMinutes(30)));
+
+        var snapshot = Assert.Single(budget.Current);
+        Assert.Equal("rest:candidate_scan", snapshot.CallSite);
+        Assert.Equal("core", snapshot.Resource);
+        Assert.Equal(2, snapshot.ChargedCalls);
+        Assert.Equal(1, snapshot.NotModifiedCalls);
+        Assert.Equal(4d, snapshot.PointsPerHour!.Value, 3);
+    }
+
     /// <summary>
     /// The claim "recorded from every response" rests entirely on the tracker
     /// adapter being handed the singleton the status page reads. Asserted end to
@@ -190,6 +209,9 @@ public sealed class GitHubRateLimitBudgetTests
         services.AddSingleton<GitHubRateLimitBudget>();
         services.AddSingleton<IGitHubRateLimitObserver>(
             provider => provider.GetRequiredService<GitHubRateLimitBudget>());
+        services.AddSingleton<GitHubApiCallBudget>();
+        services.AddSingleton<IGitHubApiCallObserver>(
+            provider => provider.GetRequiredService<GitHubApiCallBudget>());
         services.AddSymphonyGitHubTrackerClient();
         services.AddHttpClient<GitHubTrackerClient>()
             .ConfigurePrimaryHttpMessageHandler(() => new BudgetHeaderHandler());
@@ -209,6 +231,11 @@ public sealed class GitHubRateLimitBudgetTests
         var snapshot = Assert.Single(provider.GetRequiredService<GitHubRateLimitBudget>().Current);
         Assert.Equal("core", snapshot.Resource);
         Assert.Equal(4321, snapshot.Used);
+
+        var call = Assert.Single(provider.GetRequiredService<GitHubApiCallBudget>().Current);
+        Assert.Equal(GitHubRestCallSites.CandidateScan, call.CallSite);
+        Assert.Equal("core", call.Resource);
+        Assert.Equal(1, call.ChargedCalls);
     }
 
     private sealed class BudgetHeaderHandler : HttpMessageHandler
